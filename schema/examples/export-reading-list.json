@@ -1,0 +1,55 @@
+{
+  "format": "factory-contract/v1",
+  "task_id": "export-reading-list",
+  "version": "2",
+  "goal": "Let the reader download their reading list as a JSON file, so they can keep a copy outside the browser.",
+  "inputs": [
+    "src/storage.ts persists books under the localStorage key reading-list:v1; that key must not change.",
+    "The filter-by-status task has merged; build on its result commit."
+  ],
+  "repository": "rNavarrete/factory-pilot-demo",
+  "base_commit": "6c6badb8f086b7c4a3eaf3ba43317854e87e9b96",
+  "permitted_paths": ["src/*.ts", "index.html", "src/style.css", "tests/export.test.ts"],
+  "permitted_actions": ["modify-files", "add-files", "add-tests"],
+  "risk_markers": ["user-data"],
+  "acceptance_criteria": [
+    {
+      "id": "ac1",
+      "statement": "exportBooks(books, now) returns JSON text holding every book and the export time taken from now.",
+      "evidence": {"type": "automated-check", "command": "npm test"},
+      "status": "ready"
+    },
+    {
+      "id": "ac2",
+      "statement": "An Export button downloads a file named reading-list-YYYY-MM-DD.json.",
+      "evidence": {
+        "type": "observable-behavior",
+        "steps": "Add two books and press Export.",
+        "expected": "The browser saves reading-list-<today>.json containing both books."
+      },
+      "status": "ready"
+    },
+    {
+      "id": "ac3",
+      "statement": "The export looks good.",
+      "evidence": {
+        "type": "human-review",
+        "reviewer": "rNavarrete",
+        "question": "Is the exported file laid out the way you want?"
+      },
+      "status": "needs-clarification",
+      "clarification": "'Looks good' is not testable. Say which fields the file must contain and whether it must be pretty-printed."
+    }
+  ],
+  "verification_commands": ["npm run typecheck", "npm test", "npm run build"],
+  "attempt_budget": 2,
+  "escalate_to": "rNavarrete",
+  "depends_on": [
+    {
+      "repository": "rNavarrete/factory-pilot-demo",
+      "commit": "6c6badb8f086b7c4a3eaf3ba43317854e87e9b96",
+      "reason": "Needs the filter control from the filter-by-status result. In this example the commit is illustrative; a real contract names that task's merge commit."
+    }
+  ],
+  "notes": "Example of a contract that is not approvable yet: ac3 needs clarification."
+}
