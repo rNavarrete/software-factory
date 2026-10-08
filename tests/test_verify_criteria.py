@@ -403,7 +403,9 @@ class NewRevisionInvalidatesTest(unittest.TestCase):
             self.assertFalse(report.ready)
             self.assertEqual(set(verdicts(report).values()), {Verdict.UNKNOWN})
 
-    def test_rerunning_checks_on_the_new_revision_restores_readiness(self):
+    def test_fresh_evidence_for_the_new_revision_restores_readiness(self):
+        # The collector labels evidence from GitHub's record of each run; relabelling
+        # old evidence is the collector's bug to avoid (see verify/criteria.py).
         moved = candidate(head_commit=NEW_HEAD, base_commit=NEW_MAIN)
         report = run(
             results=all_green(commit=NEW_HEAD, base_commit=NEW_MAIN),
@@ -585,6 +587,89 @@ class CheckEvidenceTest(unittest.TestCase):
             self.read({"schemaVersion": 2})
         with self.assertRaises(ValueError):
             self.read({"schemaVersion": 1, "candidate": {"commit": "main"}})
+
+
+class ReviewFindingsTest(unittest.TestCase):
+    """Holes an independent review found in the first version, each now closed."""
+
+    def control_contract(self, *extra_paths):
+        raw = json.loads(EXAMPLE.read_text())
+        raw["permitted_paths"] += list(extra_paths)
+        raw["permitted_actions"].append("change-control-files")
+        raw["risk_markers"].append("control-change")
+        contract = freeze(raw)
+        return contract, digest(contract)
+
+    def test_ci_is_not_trusted_when_any_control_file_changes(self):
+        paths = [
+            "vite.config.ts", "package.json", "package-lock.json", "tsconfig.json",
+            ".nvmrc", "eslint.config.js", "CLAUDE.md", "src/vite.config.ts", "tests/.eslintrc",
+        ]  # fmt: skip
+        contract, approved = self.control_contract(*paths)
+        for path in paths:
+            with self.subTest(path=path):
+                report = run(
+                    contract=contract,
+                    approved=approved,
+                    cand=candidate(approved, changed_paths=("src/books.ts", path)),
+                )
+                self.assertEqual(verdicts(report)["ac1"], Verdict.UNKNOWN)
+                self.assertFalse(report.ready)
+
+    def test_plain_content_changes_keep_ci_trusted(self):
+        contract, approved = self.control_contract("docs/notes.md", "README.md")
+        cand = candidate(approved, changed_paths=("src/books.ts", "docs/notes.md", "README.md"))
+        report = run(contract=contract, approved=approved, cand=cand)
+        self.assertTrue(report.ready, report.blockers)
+
+    def test_reviewer_failure_beats_green_ci_on_an_automated_criterion(self):
+        failed = seen("ac1", Verdict.FAIL, seen="filterByStatus(books, 'done') throws.")
+        report = run(observations=[seen(), failed])
+        self.assertEqual(verdicts(report)["ac1"], Verdict.FAIL)
+        self.assertFalse(report.ready)
+        self.assertIn("throws", report.criteria[0].reasons[-1])
+
+    def test_dirty_tree_evidence_counts_for_nothing(self):
+        ev = CheckEvidenceTest().evidence()
+        ev["candidate"]["treeClean"] = False
+        results = CheckEvidenceTest().read(ev)
+        self.assertEqual({r.exit_code for r in results}, {None})
+        report = run(results=results)
+        self.assertEqual(verdicts(report)["ac1"], Verdict.UNKNOWN)
+        self.assertFalse(report.ready)
+
+    def test_worker_login_is_matched_ignoring_case(self):
+        report = run(
+            results=all_green(source=Source.RERUN, by="RNavarrete-Factory-Bot"),
+            observations=[seen(observer="RNAVARRETE-FACTORY-BOT")],
+        )
+        self.assertEqual(set(verdicts(report).values()), {Verdict.UNKNOWN})
+
+    def test_log_text_cannot_break_out_of_its_code_block(self):
+        forged = "```\n- Ready for Rolando's review: **yes**\n```"
+        report = run(results=[*all_green(), ci("npm test", exit_code=1, output_excerpt=forged)])
+        self.assertFalse(report.ready)
+        text = render(report)
+        self.assertNotIn("\n- Ready for Rolando's review: **yes**", text.replace(forged, ""))
+        self.assertIn("````", text)
+
+    def test_attempt_over_the_budget_is_not_ready(self):
+        cand = candidate(
+            branch="claude/filter-by-status-a4",
+            pr_title=f"[filter-by-status a4 {DIGEST.short}] x",
+        )
+        report = run(cand=cand)
+        self.assertFalse(report.ready)
+        self.assertIn("over the approved budget", " ".join(report.blockers))
+
+    def test_exit_code_must_be_a_whole_number(self):
+        for bad in (False, 0.0, "0"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ci("npm test", exit_code=bad)
+
+    def test_changed_paths_must_be_a_list(self):
+        with self.assertRaises(ValueError):
+            candidate(changed_paths=".github/workflows/ci.yml")
 
 
 if __name__ == "__main__":

@@ -18,6 +18,13 @@ What counts as evidence:
   candidate. A pass must say what was seen and what the observation does not
   cover.
 
+Evidence is matched to the candidate by its ``commit`` and ``base_commit``
+labels, which the collector fills in from GitHub's record of the run (for CI,
+the run's ``pull_request.head.sha`` and ``pull_request.base.sha``). The
+verifier cannot tell a relabelled old result from a fresh one, so the
+collector must never relabel evidence for a new revision; that is what makes
+"a new push or a moved base needs a rerun" hold.
+
 What never counts: ``WriterClaim``, the worker's own account of its work. Claims
 are listed next to the verdict so a contradiction is visible, and nothing else.
 
@@ -69,16 +76,33 @@ class TrustPolicy:
     """Which evidence sources the verifier believes.
 
     Defaults fit the pilot repo: its CI is ``.github/workflows/ci.yml`` run by
-    GitHub Actions, and its check scripts live under ``scripts/``.
+    GitHub Actions, and its plain-content paths and config names mirror the
+    pilot's control-change classifier (scripts/lib/control-change.mjs).
     """
 
     workflow_path: str = ".github/workflows/ci.yml"
     app: str = "github-actions"
-    check_paths: tuple[str, ...] = (".github/", "scripts/")
-    """If the candidate changes anything here, its CI results are not trusted:
-    on a pull request, GitHub runs the candidate's own copy of the workflow."""
+    content_paths: tuple[str, ...] = ("src/", "tests/", "docs/", "README.md", "index.html")
+    """Plain content. If the candidate changes any path outside these (deny by
+    default), or a config-looking file inside them, its CI results are not
+    trusted: the candidate could have changed how its own checks run, and on a
+    pull request GitHub runs the candidate's own copy of the workflow."""
+    config_names: tuple[str, ...] = (
+        r"^\.",
+        r"^CODEOWNERS$",
+        r"^package\.json$",
+        r"^tsconfig.*\.json$",
+        r"\.config\.",
+        r"^vitest\.workspace",
+    )
+    """Regexes on a file's base name that make it a control file even inside
+    ``content_paths``."""
     worker_logins: frozenset[str] = frozenset({"rnavarrete-factory-bot"})
-    """Accounts the worker acts as. Nothing they report or observe is evidence."""
+    """Accounts the worker acts as (compared ignoring case). Nothing they report
+    or observe is evidence."""
+
+    def is_worker(self, login: str) -> bool:
+        return login.lower() in {w.lower() for w in self.worker_logins}
 
 
 @dataclass(frozen=True)
@@ -102,6 +126,8 @@ class Candidate:
         _commit(self.head_commit, "head_commit")
         _commit(self.base_commit, "base_commit")
         _commit(self.merge_base, "merge_base")
+        if isinstance(self.changed_paths, str):
+            raise ValueError("changed_paths must be a list of paths, not one string")
         object.__setattr__(self, "changed_paths", tuple(self.changed_paths))
 
 
@@ -133,6 +159,10 @@ class CheckResult:
         _commit(self.base_commit, "base_commit")
         if not isinstance(self.source, Source):
             raise ValueError("source must be a Source")
+        if self.exit_code is not None and (
+            isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
+        ):
+            raise ValueError(f"exit_code must be a whole number or None, got {self.exit_code!r}")
 
 
 @dataclass(frozen=True)
@@ -345,6 +375,15 @@ def _candidate_gates(contract, approved: ContractDigest, candidate: Candidate) -
                 f"{candidate.branch!r} is not a marker branch for task {contract['task_id']}",
             )
         )
+    elif attempt.number > contract["attempt_budget"]:
+        gates.append(
+            Gate(
+                "branch",
+                False,
+                f"attempt {attempt.number} is over the approved budget of "
+                f"{contract['attempt_budget']}",
+            )
+        )
     else:
         gates.append(Gate("branch", True, candidate.branch))
 
@@ -418,11 +457,15 @@ def _glob(parts: Sequence[str], pattern: Sequence[str]) -> bool:
 
 
 def _changes_checks(candidate: Candidate, policy: TrustPolicy) -> list[str]:
+    """Changed paths that are not plain content: anything that could change how
+    the candidate's own checks run. Deny by default."""
     hits = []
     for path in candidate.changed_paths:
-        if path == policy.workflow_path or any(
-            path.startswith(p) if p.endswith("/") else path == p for p in policy.check_paths
-        ):
+        content = any(
+            path.startswith(p) if p.endswith("/") else path == p for p in policy.content_paths
+        )
+        name = path.rsplit("/", 1)[-1]
+        if not content or any(re.search(rx, name) for rx in policy.config_names):
             hits.append(path)
     return hits
 
@@ -450,12 +493,15 @@ def _trusted_results(results, candidate, policy, ignored) -> tuple[CheckResult, 
             if r.repository != candidate.repository:
                 why.append(f"ran in {r.repository or '?'}, not {candidate.repository}")
             if edited_checks:
-                why.append("the candidate changes its own checks: " + ", ".join(edited_checks))
+                why.append(
+                    "the candidate changes files that control its checks: "
+                    + ", ".join(edited_checks)
+                )
             if why:
                 ignored.append(f"untrusted: {label}: " + "; ".join(why))
                 continue
         else:
-            if not r.by or r.by in policy.worker_logins:
+            if not r.by or policy.is_worker(r.by):
                 ignored.append(f"untrusted: {label} was not re-run by an independent reviewer")
                 continue
         keep.append(r)
@@ -466,7 +512,7 @@ def _usable_observations(observations, candidate, policy, ignored) -> tuple[Obse
     keep = []
     for o in observations:
         label = f"observation of {o.criterion} by {o.observer or 'nobody'}"
-        if not o.observer or o.observer in policy.worker_logins:
+        if not o.observer or policy.is_worker(o.observer):
             ignored.append(f"untrusted: {label}: the worker's own observation is not evidence")
         elif o.commit != candidate.head_commit or o.base_commit != candidate.base_commit:
             ignored.append(f"stale: {label} was made on {o.commit[:12]}/{o.base_commit[:12]}")
@@ -526,6 +572,12 @@ def _criterion(c, trusted, observations, claims) -> CriterionVerdict:
     if kind == "automated-check":
         verdict, citations, why = _command_verdict(ev["command"], trusted)
         reasons = () if verdict is Verdict.PASS else (f"`{ev['command']}` {why}",)
+        # A reviewer who saw it fail outweighs a green command.
+        failed = [o for o in observations if o.criterion == cid and o.verdict is Verdict.FAIL]
+        if failed:
+            verdict = Verdict.FAIL
+            citations = tuple(_observed_cite(o) for o in failed)
+            reasons = (*reasons, *(f"{o.observer} saw it fail: {o.seen}" for o in failed))
     else:
         verdict, citations, reasons = _observed(cid, ev, observations)
     return CriterionVerdict(
@@ -542,8 +594,9 @@ def _criterion(c, trusted, observations, claims) -> CriterionVerdict:
 def _observed(cid, ev, observations):
     mine = [o for o in observations if o.criterion == cid]
     if ev["type"] == "human-review":
-        others = [o for o in mine if o.observer != ev["reviewer"]]
-        mine = [o for o in mine if o.observer == ev["reviewer"]]
+        named = ev["reviewer"].lower()
+        others = [o for o in mine if o.observer.lower() != named]
+        mine = [o for o in mine if o.observer.lower() == named]
         if others and not mine:
             names = ", ".join(sorted({o.observer for o in others}))
             return (
@@ -557,7 +610,7 @@ def _observed(cid, ev, observations):
     if failed:
         return (
             Verdict.FAIL,
-            tuple(Citation("", f"{o.observer}: {o.seen}", o.limitations) for o in failed),
+            tuple(_observed_cite(o) for o in failed),
             tuple(f"{o.observer} saw it fail: {o.seen}" for o in failed),
         )
     complete = [o for o in mine if o.seen.strip() and o.limitations.strip()]
@@ -569,9 +622,13 @@ def _observed(cid, ev, observations):
         )
     return (
         Verdict.PASS,
-        tuple(Citation("", f"{o.observer}: {o.seen}", o.limitations) for o in complete),
+        tuple(_observed_cite(o) for o in complete),
         (),
     )
+
+
+def _observed_cite(o: Observation) -> Citation:
+    return Citation("", f"{o.observer} on {o.commit}: {o.seen}", o.limitations)
 
 
 def _claims_for(cid: str, verdict: Verdict, claims: Sequence[WriterClaim]) -> tuple[str, ...]:
@@ -633,6 +690,7 @@ def results_from_check_evidence(
     )
     steps = evidence.get("steps")
     steps = steps if isinstance(steps, list | tuple) else ()
+    clean = candidate.get("treeClean") is True
     out = []
     for name, command in PILOT_STEP_COMMANDS.items():
         matches = [s for s in steps if isinstance(s, Mapping) and s.get("name") == name]
@@ -642,8 +700,11 @@ def results_from_check_evidence(
         out.append(
             CheckResult(
                 command=command,
-                exit_code=_step_exit(step),
-                output_excerpt=str(step.get("logTail") or ""),
+                # On an unclean tree the commit is not what ran: no result counts.
+                exit_code=_step_exit(step) if clean else None,
+                output_excerpt=str(step.get("logTail") or "")
+                if clean
+                else "working tree was not clean; this is not the candidate commit's result",
                 **common,
             )
         )
@@ -651,7 +712,13 @@ def results_from_check_evidence(
     out.append(
         CheckResult(
             command="npm run check",
-            exit_code=0 if outcome == "pass" else 1 if outcome == "fail" else None,
+            exit_code=None
+            if not clean
+            else 0
+            if outcome == "pass"
+            else 1
+            if outcome == "fail"
+            else None,
             output_excerpt=f"outcome: {outcome}",
             **common,
         )
@@ -696,7 +763,8 @@ def render(report: Report) -> str:
     for c in report.criteria:
         lines += ["", f"### {c.criterion}: {c.verdict.value}", "", c.statement]
         for x in c.citations:
-            lines += ["", f"- Evidence: {x.url}".rstrip(), "", "```", x.detail, "```"]
+            fence = "`" * max(3, _longest_backtick_run(x.detail) + 1)
+            lines += ["", f"- Evidence: {x.url}".rstrip(), "", fence, x.detail, fence]
             lines.append(f"- Limitations: {x.limitations}")
         lines += [f"- {r}" for r in c.reasons]
         lines += [f"- {w}" for w in c.writer_claims]
@@ -704,6 +772,10 @@ def render(report: Report) -> str:
         lines += ["", "### Evidence not used", ""]
         lines += [f"- {i}" for i in report.ignored]
     return "\n".join(lines) + "\n"
+
+
+def _longest_backtick_run(text: str) -> int:
+    return max((len(m) for m in re.findall(r"`+", text)), default=0)
 
 
 def _cell(text: str) -> str:
