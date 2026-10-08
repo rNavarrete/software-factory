@@ -52,17 +52,21 @@ So nothing that reads ticket text, model output or GitHub data can forge Rolando
 
 What the service's user can still do is damage the files it owns, the ledger included, or leave links in that folder for Rolando's commands to write through. That can break or confuse the record, but it can't read the key or sign anything. The daily volume snapshots are the recovery.
 
-## Not built yet: a Todo move as the approval itself
+## A Todo move as the approval itself
 
-The ticket asks for a verified Todo move to replace the typed approval code for an in-policy ticket. That changes the approval rules, so it waits for Rolando's go. The proposed design:
+Rolando chose this on 2026-10-08: his own Todo move approves the task the factory drafts from that ticket, within the project's onboarding entry, with no code to type. This is how it works:
 
-- The signer gains one more request: "authorize this contract for this Todo move".
-- Before answering, the signer reads the move from Linear itself, with the same rules as above. It also checks that the contract is for that ticket and stays inside the project's onboarding entry: repository, routine, actions, checks and attempt budget.
-- It then signs a record of its own kind, `source-authorization`, that names the move, the ticket revision, the routine and the contract digest. It is never a typed `human-decision`, so it can't pass for one.
-- The record lasts at most one hour and covers attempt 1 only. It counts only for the service's routine. Repairs, re-fires and clearings still need Rolando's typed records.
-- Each Todo move can authorize only one contract.
+- When a queued ticket's contract has no approval in force, the service asks the signer to authorize that contract for that Todo move.
+- The signer trusts nothing the service sends. It reads the ticket from Linear itself, with its own copy of the Linear key, and applies the same rules as intake. The move must be the ticket's latest move into Todo, made by Rolando, settled, and unedited since. The ticket's text must still be the exact text the contract was drafted from, even if Linear never logged an edit. The signer also refuses while its Linear key acts as Rolando.
+- It asks only when no approval is in force for that contract. After Rolando rejects or revokes the contract, the service never asks again for it.
+- It reads the onboarding file from the image, which the service can't change, and refuses unless intake is switched on. The contract must be for that ticket and stay inside the project's limits: repository, routine, actions, checks and attempt budget.
+- Each Todo move can authorize one contract only. A changed task needs a new Todo move. The signer keeps that record in its own folder.
+- It then signs a record of its own kind, `source-authorization`. It is never a typed `human-decision`, so it can't pass for one. The record names the move, the ticket revision, the routine, the onboarding entry and the contract digest. It lasts 30 minutes, and the approval check accepts at most one hour. While a ticket waits for the lane, the service asks again when the record expires.
+- It counts only for the service's routine and only for attempt 1. A rejection or revocation withdraws it like any approval. Repairs, re-fires and clearings still need Rolando's typed records.
 
-Until then, a ticket accepted from Linear waits with "Waiting before starting: no approval" until Rolando approves its contract over `fly ssh console`.
+If the signer refuses for good (someone else moved the ticket, the contract is out of bounds, a different contract was already approved for that move), the queued ticket closes with the reason. If the problem is passing (Linear is down, intake is off), the ticket waits.
+
+Rolando's typed approval over `fly ssh console` still works and always counts.
 
 ## Before switching intake on
 

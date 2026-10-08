@@ -33,6 +33,18 @@ key (a bug, a future callback, a copied record) from creating or stretching a
 decision. It does not protect the records the gate itself writes (fire results,
 reservations); something able to forge those already controls the controller.
 
+A second way to approve attempt 1 (ENG-174, Rolando's choice on
+2026-10-08): a ``source-authorization`` record, signed by the separate signer
+process on the service host after it has checked with Linear itself that
+Rolando moved the ticket to Todo in the Linear app, on exactly the ticket text
+the contract was drafted from, and that the contract stays inside the
+project's onboarding entry. It is its own kind, never a ``human-decision``,
+so it can't pass for a typed approval. It counts only where ``Approvals`` is
+built with ``source_routine`` (the service's dispatcher) and only for that
+routine, lasts at most ``MAX_SOURCE_TTL``, and is withdrawn by a rejection or
+revocation like any approval. Repairs, re-fires and clearings still need
+Rolando's typed records.
+
 Approving a contract authorizes dispatch only. It never approves the PR, a
 merge or a release (ADR 0001 section 5 items 2 and 3); the release gate is the
 pilot repo's ``release`` environment (ENG-142, ENG-143).
@@ -85,6 +97,14 @@ APPROVED, REJECTED, REVOKED = "approved", "rejected", "revoked"
 DEFAULT_TTL = timedelta(days=3)
 MAX_TTL = timedelta(days=14)
 
+SOURCE_AUTHORIZATION = "source-authorization"
+"""Rolando's Todo move in Linear, checked and signed by the signer process
+(controller/signer). Authorizes attempt 1 of exactly one contract."""
+MAX_SOURCE_TTL = timedelta(hours=1)
+"""Short, so a ticket that leaves Todo stops counting soon even if nothing
+else notices. The service asks the signer for a fresh one whenever the
+contract has no approval in force."""
+
 KEYCHAIN_SERVICE = "software-factory-approval"
 
 _MAC_DOMAIN = b"software-factory/approval-mac/v1\n"
@@ -101,7 +121,23 @@ _SIGNED_FIELDS = {
     ev.REPAIR_AUTHORIZED: _COMMON,
     ev.REFIRE_AUTHORIZED: _COMMON,
     ev.ATTEMPT_CLEARED: (*_COMMON, "basis"),
+    SOURCE_AUTHORIZATION: (
+        *_COMMON,
+        "scope",
+        "decision",
+        "digest_type",
+        "expires_at",
+        "binding_sha256",
+        "event_id",
+        "issue_id",
+        "issue_key",
+        "revision",
+        "linear_actor_id",
+        "routine_id",
+        "policy_sha256",
+    ),
 }
+_APPROVAL_KINDS = (HUMAN_DECISION, SOURCE_AUTHORIZATION)
 _URL_BASES = (ev.ClearingBasis.COMPLETED, ev.ClearingBasis.TERMINATED)
 
 # Gate blocks that depend on Rolando's decisions; check() reports these, read
@@ -289,7 +325,7 @@ def _payload(
 def _sign(event: LedgerEvent, key: ApprovalKey) -> LedgerEvent:
     data = {**event.data, "key_id": key.key_id}
     data.setdefault("decision_id", secrets.token_hex(16))
-    if event.kind == HUMAN_DECISION:
+    if event.kind in _APPROVAL_KINDS:
         data["binding_sha256"] = _binding_sha256(data.get("binding"))
     payload = _payload(event.kind, event.task, event.attempt, event.run, data)
     assert payload is not None, "a signed field is missing"
@@ -315,7 +351,7 @@ def authentic(
             return False
         if _time(d.get("decided_at")) is None:
             return False
-        if event.kind == HUMAN_DECISION:
+        if event.kind in _APPROVAL_KINDS:
             binding = d.get("binding")
             if d.get("binding_sha256") != _binding_sha256(binding):
                 return False
@@ -335,6 +371,14 @@ def _verify(key: ApprovalKey, payload: bytes, mac: str) -> bool:
     if verify is not None:
         return bool(verify(payload, mac))
     return hmac.compare_digest(key.sign(payload), mac)
+
+
+def sign_source_authorization(event: LedgerEvent, key: ApprovalKey) -> LedgerEvent:
+    """Sign a ``source-authorization``. Only the signer process calls this,
+    after its own checks with Linear (controller/signer)."""
+    if event.kind != SOURCE_AUTHORIZATION:
+        raise ValueError("the signer signs source authorizations only")
+    return _sign(event, key)
 
 
 def _time(value: object) -> datetime | None:
@@ -383,6 +427,9 @@ class Approvals:
     is useless. ``confirm`` asks Rolando to type a code before anything is
     written.
     ``contracts`` (optional) keeps each approved contract's exact bytes.
+    ``source_routine`` (optional): count signed ``source-authorization``
+    records (Rolando's verified Todo move) for this routine. Left out, as on
+    the terminal, only typed approvals count.
     """
 
     def __init__(
@@ -396,6 +443,7 @@ class Approvals:
         approvers: frozenset[str] = frozenset({APPROVER}),
         retired_keys: Sequence[tuple[ApprovalKey, int]] = (),
         contracts: ContractStore | None = None,
+        source_routine: str | None = None,
     ) -> None:
         if identity not in approvers:
             raise ValueError(f"{identity!r} is not an approver")
@@ -409,6 +457,7 @@ class Approvals:
         self._os_user = os_user or getpass.getuser()
         self._approvers = approvers
         self._contracts = contracts
+        self._source_routine = source_routine
 
     # --- writing decisions ---
 
@@ -654,11 +703,19 @@ class Approvals:
         for item, signed in self._signed(stored):
             e = item.event
             d = e.data
-            if e.kind != HUMAN_DECISION or e.task != task or d.get("scope") != SCOPE:
+            if e.kind not in _APPROVAL_KINDS or e.task != task or d.get("scope") != SCOPE:
                 continue
             digest, decision = d.get("digest"), d.get("decision")
             if not isinstance(digest, str):
                 continue
+            max_ttl = MAX_TTL
+            if e.kind == SOURCE_AUTHORIZATION:
+                if decision != APPROVED:
+                    continue  # the signer only ever approves
+                if not signed or not self._source_ok(e):
+                    unsigned.add(digest)
+                    continue
+                max_ttl = MAX_SOURCE_TTL
             if decision in (REJECTED, REVOKED):
                 # Counted even if unsigned: a withdrawal can only stop dispatch.
                 # Only a signed one's own time counts, so an unsigned one can't
@@ -671,12 +728,23 @@ class Approvals:
                     not signed
                     or decided is None
                     or expires is None
-                    or not timedelta(0) < expires - decided <= MAX_TTL
+                    or not timedelta(0) < expires - decided <= max_ttl
                 ):
                     unsigned.add(digest)
                 else:
                     approvals.append((item.seq, digest, decided, expires))
         return approvals, withdrawals, unsigned
+
+    def _source_ok(self, e: LedgerEvent) -> bool:
+        """A signed Todo-move authorization counts only for this dispatcher's
+        routine, for its own task, never for a single attempt or run."""
+        d = e.data
+        if self._source_routine is None or d.get("routine_id") != self._source_routine:
+            return False
+        key = d.get("issue_key")
+        if not isinstance(key, str) or e.task is None:
+            return False
+        return key.lower() == e.task.value and e.attempt is None and e.run is None
 
     def _approval_block(
         self, stored: Sequence[StoredEvent], task: TaskId, digest: ContractDigest, now: datetime

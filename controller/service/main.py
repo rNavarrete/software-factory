@@ -169,6 +169,7 @@ def build(args: argparse.Namespace):
         confirm=never,
         os_user="factory-service",
         contracts=ContractStore(root / "contracts"),
+        source_routine=FACTORY_ROUTINE,
     )
     gh = HttpGhRunner(lambda: secrets.get("github-token"))
     recovery = Recovery(store, approvals, GhCliReader(run=gh), gate=gate, confirm=never)
@@ -221,6 +222,7 @@ def build(args: argparse.Namespace):
         reporter=fixtures.LogReporter(),
         reviewer=fixtures.RecordingReviewer(),
         repair=fixtures.NoRepair(),
+        authorizer=_authorizer(socket_path) if args.source == "linear" else None,
     )
     service = Service(
         store,
@@ -237,6 +239,16 @@ def build(args: argparse.Namespace):
     return service, store
 
 
+def _authorizer(socket_path: str | None):
+    if not socket_path:
+        raise SecretMissing(
+            f"--source linear needs the signer ({SIGNER_SOCKET_ENV}): the service never signs"
+        )
+    from controller.signer import SignerAuthorizer
+
+    return SignerAuthorizer(socket_path)
+
+
 def run_signer(args: argparse.Namespace) -> int:
     """Start as root: read the approval key, open the socket for the service's
     user, then become the signer's own user for good and answer requests."""
@@ -250,7 +262,18 @@ def run_signer(args: argparse.Namespace) -> int:
     secrets_dir = os.environ.get(SECRETS_DIR_ENV)
     if not secrets_dir:
         raise SecretMissing(f"set {SECRETS_DIR_ENV} to the folder holding the secret files")
-    key = StaticKey(approval_key_bytes(FileSecrets(secrets_dir)))
+    secrets = FileSecrets(secrets_dir)
+    key = StaticKey(approval_key_bytes(secrets))
+    extra = {}
+    if args.onboarding:
+        try:
+            linear_key = secrets.get("linear-key")
+        except SecretMissing:
+            # No Linear key yet: the signer only checks signatures, and no
+            # Todo move can be approved. Typed approvals work as before.
+            log.warning("no linear-key: Todo-move approval is off")
+        else:
+            extra["authorize"] = _todo_move_handler(args, key, linear_key)
     signer = pwd.getpwnam(args.user)
     client = pwd.getpwnam(args.client_user)
     group = grp.getgrgid(client.pw_gid).gr_gid
@@ -258,9 +281,13 @@ def run_signer(args: argparse.Namespace) -> int:
     path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
     os.chown(path.parent, signer.pw_uid, group)
     os.chmod(path.parent, 0o750)
-    server = SignerServer(key, path, allowed_uids={0, client.pw_uid})
+    server = SignerServer(key, path, allowed_uids={0, client.pw_uid}, extra=extra)
     server.listen()
     os.chown(path, signer.pw_uid, group)
+    if args.state:
+        state = Path(args.state)
+        state.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(state.parent, signer.pw_uid, signer.pw_gid)
     drop_privileges(args.user)
     stopping = False
 
@@ -276,6 +303,30 @@ def run_signer(args: argparse.Namespace) -> int:
     finally:
         server.close()
     return 0
+
+
+def _todo_move_handler(args: argparse.Namespace, key, linear_key: str):
+    """The signer's ``authorize`` request. The Linear key and onboarding path
+    are read here, as root, before the signer drops to its own user."""
+    from controller.dispatch.dispatch import FACTORY_ROUTINE
+    from controller.intake.linear import HttpTransport, LinearSource
+    from controller.recovery import PILOT_REPO
+    from controller.service import onboarding
+    from controller.signer import authorize_handler
+    from controller.signer.authorize import OneContractPerMove, TodoMoveAuthorizer
+
+    if not args.state:
+        raise SecretMissing("--onboarding needs --state for the signer's record of moves")
+    config_path = Path(args.onboarding)
+
+    def load():
+        return onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
+
+    reader = LinearSource(HttpTransport(lambda: linear_key), lambda: None)  # type: ignore[arg-type,return-value]
+    authorizer = TodoMoveAuthorizer(
+        key, load, reader.fetch, reader.viewer_id, OneContractPerMove(Path(args.state))
+    )
+    return authorize_handler(authorizer)
 
 
 def run_forever(
@@ -333,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--socket", required=True)
     s.add_argument("--user", default="factory-signer")
     s.add_argument("--client-user", default="factory")
+    s.add_argument("--onboarding", help="root-owned onboarding file; enables Todo-move approval")
+    s.add_argument("--state", help="the signer's record of which contract each move authorized")
     args = p.parse_args(sys.argv[1:] if argv is None else argv)
 
     if args.cmd == "install-secrets":

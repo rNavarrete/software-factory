@@ -17,6 +17,12 @@ one JSON request per connection:
 - ``{"op": "verify", "payload": <base64>, "mac": <hex>}``: whether ``mac``
   is the key's signature of ``payload``. It says yes or no and nothing else,
   so asking it can't produce a signature.
+- ``{"op": "authorize", "event_id", "issue_id", "revision", "contract"}``:
+  Rolando's Todo move as the approval of that contract, drafted from the
+  ticket text ``revision``. The signer checks the move and the text with
+  Linear itself and the contract against the onboarding file before it
+  signs anything (``authorize.py``). It answers with the signed
+  ``source-authorization`` record, or ``{"refused": reason, "final": bool}``.
 
 The kernel reports the caller's user id (``SO_PEERCRED``); only the allowed
 user ids are answered.
@@ -201,6 +207,55 @@ def call(path: Path, request: Mapping[str, object], timeout: float = 30) -> Mapp
     return answer
 
 
+def authorize_handler(authorizer: object) -> Handler:
+    """The ``authorize`` request, answered by a ``TodoMoveAuthorizer``."""
+    from controller.signer.authorize import Refused, event_to_json
+
+    def handle(req: Mapping[str, object], uid: int) -> Mapping[str, object]:
+        event_id, issue_id, revision = req.get("event_id"), req.get("issue_id"), req.get("revision")
+        if not all(isinstance(v, str) for v in (event_id, issue_id, revision)):
+            return {"error": "event_id, issue_id and revision must be text"}
+        try:
+            event = authorizer.authorize(event_id, issue_id, req.get("contract"), revision)  # type: ignore[attr-defined]
+        except Refused as e:
+            log.info("refused to authorize %s: %s", event_id, e.reason)
+            return {"refused": e.reason, "final": e.final}
+        log.info("authorized %s for %s", event_id, event.data.get("digest"))
+        return {"event": event_to_json(event)}
+
+    return handle
+
+
+class SignerAuthorizer:
+    """The service's side of ``authorize``: asks, never signs."""
+
+    def __init__(self, path: Path | str, transport: Callable[..., Mapping[str, object]] = call):
+        self._path = Path(path)
+        self._call = transport
+
+    def authorize(self, authorization: object, contract: Mapping[str, object]):
+        from controller.service.seams import AuthorizationRefused
+        from controller.signer.authorize import event_from_json
+
+        req = {
+            "op": "authorize",
+            "event_id": authorization.event_id,  # type: ignore[attr-defined]
+            "issue_id": authorization.issue_id,  # type: ignore[attr-defined]
+            "revision": authorization.revision,  # type: ignore[attr-defined]
+            "contract": json.loads(json.dumps(contract, default=_plain)),
+        }
+        answer = self._call(self._path, req)
+        if "refused" in answer:
+            raise AuthorizationRefused(str(answer["refused"]), final=answer.get("final") is True)
+        return event_from_json(answer["event"])  # type: ignore[arg-type]
+
+
+def _plain(value: object) -> object:
+    if isinstance(value, Mapping):
+        return dict(value)
+    raise TypeError(f"not JSON: {type(value).__name__}")
+
+
 class SignerKey:
     """The service's view of the approval key: it can check, never sign."""
 
@@ -241,7 +296,9 @@ class SignerKey:
 
 
 __all__ = [
+    "SignerAuthorizer",
     "SignerKey",
+    "authorize_handler",
     "SignerServer",
     "SignerUnavailable",
     "call",

@@ -66,7 +66,7 @@ Every 60 seconds (`controller/service/service.py`):
 
 Each step stands alone. If Linear or GitHub is down, only that step waits for the next round.
 
-The service never approves, merges or releases anything, and it never writes a decision. It fires only a contract Rolando has already approved. How a verified Todo move becomes that approval is ENG-174's to propose and Rolando's to sign off on. Until then, a queued ticket shows "Waiting before starting" with the reason.
+The service never approves, merges or releases anything, and it never signs a decision. It fires only a contract Rolando has approved: by typing the code, or, with `--source linear`, by his own Todo move as checked and signed by the signer process (docs/intake.md). Until then, a queued ticket shows "Waiting before starting" with the reason.
 
 ## Onboarding a Linear project
 
@@ -118,7 +118,7 @@ The service posts this on the ticket: "It is unclear whether worker … started"
 
 The worker itself sits behind the existing runtime boundary: `RuntimeAdapter` in `controller/interfaces.py`, which the service reaches only through the `adapter` factory `Dispatcher` takes. A worker pool (ENG-154) plugs in there. The first deployment keeps one worker at a time.
 
-ENG-174 also has to settle how a verified Todo move becomes a signed contract approval. That is a change to the approval rules, and it needs Rolando's sign-off.
+ENG-174 settled how a verified Todo move becomes the approval: Rolando chose it on 2026-10-08, and the signer process signs it after checking with Linear itself (docs/intake.md).
 
 ## Known limits
 

@@ -21,6 +21,7 @@ RUN useradd --system --no-create-home --shell /usr/sbin/nologin factory \
 WORKDIR /app
 COPY controller /app/controller
 COPY deploy/qualification /app/deploy/qualification
+COPY deploy/pilot /app/deploy/pilot
 COPY deploy/fly/entrypoint.sh /app/entrypoint.sh
 COPY --chmod=755 deploy/fly/factory /app/factory
 

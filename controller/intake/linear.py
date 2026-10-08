@@ -555,14 +555,18 @@ class LinearSource:
     now: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
     _viewer_ok: bool = field(default=False, init=False)
 
-    def check_identity(self) -> None:
-        if self._viewer_ok:
-            return
+    def viewer_id(self) -> str:
+        """Whose key this is, as Linear says."""
         data = self.transport(VIEWER_QUERY, {})
         viewer = data.get("viewer")
         if not isinstance(viewer, Mapping) or not viewer.get("id"):
             raise LinearUnavailable("Linear did not say whose key this is")
-        if str(viewer["id"]) == self.policy().approver_id:
+        return str(viewer["id"])
+
+    def check_identity(self) -> None:
+        if self._viewer_ok:
+            return
+        if self.viewer_id() == self.policy().approver_id:
             raise IntakeBlocked(
                 "the factory's Linear key acts as Rolando, so its own changes would look like"
                 " his. Intake reads nothing until the factory has its own Linear identity."

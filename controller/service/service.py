@@ -42,6 +42,7 @@ from pathlib import Path
 
 from controller import contract as contracts
 from controller.approval import ContractStore
+from controller.approval.approval import SOURCE_AUTHORIZATION
 from controller.attempts import AttemptGate
 from controller.attempts import events as gate_events
 from controller.attempts.policy import LedgerView
@@ -60,6 +61,7 @@ from controller.service import queue as q
 from controller.service.onboarding import Onboarding, OnboardingError
 from controller.service.seams import (
     Authorization,
+    AuthorizationRefused,
     Integrations,
     Prepared,
     PullRequestRef,
@@ -81,6 +83,11 @@ _WATCHED = frozenset(
 _FINAL_REFUSALS = frozenset(
     {"contract-invalid", "wrong-repository", "base-not-on-main", "contract-changed"}
 )
+
+# When the signer may stand in for a missing approval: nothing in force for
+# this contract. Never after Rolando rejected or revoked it.
+_ASK_SIGNER = frozenset({"approval-missing", "approval-expired", "approval-for-different-contract"})
+_NEVER_ASK_SIGNER = frozenset({"approval-rejected", "approval-revoked"})
 
 
 def never(summary: str, code: str) -> bool:
@@ -553,6 +560,8 @@ class Service:
         contract = self._contract(item, project.as_mapping(), project, r)
         if contract is None:
             return False
+        if not self._authorized(item, contract, r, now):
+            return False
         try:
             result = self._dispatcher.dispatch(contract)
         except Refused as e:
@@ -573,6 +582,47 @@ class Service:
             return False  # already dispatched; watched next round
         r.fired.append(str(result.run))
         self._notice(item, f"fired:{result.run}", _fired_text(result), now)
+        return True
+
+    def _authorized(
+        self, item: q.Item, contract: Mapping[str, object], r: TickReport, now: datetime
+    ) -> bool:
+        """Rolando's Todo move as the approval (his choice, 2026-10-08): if
+        the contract has no standing approval, ask the signer, which checks
+        the move with Linear itself and signs. The service only appends what
+        the signer signed; it can't sign anything."""
+        authorizer = self._x.authorizer
+        if authorizer is None:
+            return True
+        _, _, blocks = self._dispatcher.launcher.check(contract, now)
+        codes = {b.code for b in blocks}
+        if not codes & _ASK_SIGNER:
+            return True  # approved already, or blocked for another reason dispatch reports
+        if codes & _NEVER_ASK_SIGNER:
+            return True  # Rolando rejected or revoked it; dispatch reports that
+        try:
+            event = authorizer.authorize(item.authorization(), contract)
+        except AuthorizationRefused as e:
+            if e.final:
+                self._close(
+                    item,
+                    "authorization-refused",
+                    now,
+                    f"The factory can't count your Todo move as approval: {e.reason}.",
+                )
+                r.closed.append(item.issue_key)
+            else:
+                self._notice(item, "authorize-wait", f"Waiting before starting: {e.reason}.", now)
+            return False
+        d = event.data
+        if (
+            event.kind != SOURCE_AUTHORIZATION
+            or event.task != item.task
+            or d.get("event_id") != item.event_id
+            or d.get("digest") != contracts.digest(contract).value
+        ):
+            raise RuntimeError("the signer answered for a different move or contract")
+        self._append(event)
         return True
 
     def _contract(

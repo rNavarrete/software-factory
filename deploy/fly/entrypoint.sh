@@ -15,7 +15,11 @@ for name in APPROVAL_KEY ROUTINE_TOKEN GITHUB_TOKEN LINEAR_KEY; do
     unset "FACTORY_$name"
 done
 chown -R factory:factory "$HOME"
-python3 -s -m controller.service signer --socket /run/factory-signer/signer.sock &
+# The one onboarding file both read. It is in the image, owned by root, so
+# the service can't widen what the signer will approve.
+ONBOARDING=/app/deploy/qualification/onboarding.json
+python3 -s -m controller.service signer --socket /run/factory-signer/signer.sock \
+    --onboarding "$ONBOARDING" --state /data/signer/moves.json &
 signer=$!
 i=0
 until [ -S /run/factory-signer/signer.sock ]; do
@@ -32,7 +36,7 @@ env FACTORY_SECRETS_DIR=/run/factory-service-secrets \
     FACTORY_SIGNER_SOCKET=/run/factory-signer/signer.sock \
     python3 -s -m controller.service run --user factory \
     --fixtures /app/deploy/qualification \
-    --onboarding /app/deploy/qualification/onboarding.json &
+    --onboarding "$ONBOARDING" &
 service=$!
 # A stop request lets the service finish its round. If either process ends,
 # both stop and the machine exits, so Fly starts it again with both.

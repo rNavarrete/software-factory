@@ -257,6 +257,28 @@ class RepairAdvisor(Protocol):
         ...
 
 
+class AuthorizationRefused(Exception):
+    """The signer would not turn the Todo move into an approval."""
+
+    def __init__(self, reason: str, *, final: bool) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.final = final
+        """True: asking again can't help (the item closes). False: try later."""
+
+
+@runtime_checkable
+class Authorizer(Protocol):
+    """ENG-174. Rolando's Todo move as the approval of the drafted contract.
+    On the host this asks the signer process, which checks the move with
+    Linear itself and signs; the service never signs anything."""
+
+    def authorize(self, authorization: Authorization, contract: Mapping[str, object]):
+        """The signed ``source-authorization`` ledger event to append, or
+        raise AuthorizationRefused."""
+        ...
+
+
 @dataclass(frozen=True)
 class Integrations:
     source: AuthorizationSource
@@ -264,12 +286,16 @@ class Integrations:
     reporter: Reporter
     reviewer: ReviewStarter
     repair: RepairAdvisor
+    authorizer: Authorizer | None = None
+    """None: only Rolando's typed approvals count (the qualification run)."""
 
 
 __all__ = [
     "CONTROLS",
     "Authorization",
+    "AuthorizationRefused",
     "AuthorizationSource",
+    "Authorizer",
     "ContractPreparer",
     "Control",
     "IntakeBatch",
