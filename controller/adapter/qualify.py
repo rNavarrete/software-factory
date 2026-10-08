@@ -3,6 +3,7 @@
     python3 -m controller.adapter.qualify snapshot <session%> <weekly%> <credits>
     python3 -m controller.adapter.qualify approve <step>
     python3 -m controller.adapter.qualify fire <trig_id> <step>
+    python3 -m controller.adapter.qualify refire <trig_id> <step>
     python3 -m controller.adapter.qualify reconcile <step>
     python3 -m controller.adapter.qualify clear <step> <session_url>
     python3 -m controller.adapter.qualify status
@@ -40,9 +41,10 @@ from datetime import UTC, datetime
 
 from controller import contract as contract_format
 from controller.adapter import routine
-from controller.approval import Approvals
+from controller.approval import ApprovalRefused, Approvals
 from controller.attempts import AttemptGate, DispatchRefused
 from controller.attempts.events import ClearingBasis
+from controller.attempts.policy import LedgerView
 from controller.interfaces import (
     AttemptId,
     ContractDigest,
@@ -196,7 +198,24 @@ class Qualifier:
     def approve(self, step: str) -> None:
         self._approvals.approve(step_contract(step), self._now())
 
-    def fire(self, trig_id: str, step: str) -> LaunchResult:
+    def refire(self, trig_id: str, step: str) -> LaunchResult:
+        """Fire the step's attempt again after its last fire was definitely not
+        launched (a 401, say). Rolando signs the re-fire at the terminal first;
+        the gate still counts it and allows at most two fires per attempt."""
+        self._key(step, trig_id)  # a missing key fails here, before any record
+        contract = step_contract(step)
+        view = LedgerView.build(self._store.events())
+        state = view.attempts.get(_attempt(STEPS[step].task_id))
+        if state is None or state.last_fire is None:
+            raise QualifyRefused(f"{step} has never been fired; use fire")
+        prior = state.last_fire.run
+        try:
+            self._approvals.authorize_refire(contract, prior, self._now())
+        except ApprovalRefused as e:
+            raise QualifyRefused(str(e)) from None
+        return self.fire(trig_id, step, refire_of=prior)
+
+    def fire(self, trig_id: str, step: str, refire_of: RunId | None = None) -> LaunchResult:
         """One fire, in dispatch order: recover, check, prepare, reserve, send, record."""
         now = self._now()
         self._recovery.recover(now)
@@ -204,7 +223,7 @@ class Qualifier:
         digest = contract_format.digest(contract)
         task = TaskId(STEPS[step].task_id)
         blocks = list(self._recovery.blocks(now))
-        verdict = self._approvals.check(contract, now)
+        verdict = self._approvals.check(contract, now, refire_of=refire_of)
         blocks += verdict.blocks
         if blocks or verdict.run is None:
             raise QualifyRefused("; ".join(f"{b.code}: {b.detail}" for b in blocks))
@@ -214,7 +233,7 @@ class Qualifier:
         key = self._key(step, trig_id)
         adapter = self._adapter(trig_id, lambda _t: key)
         try:
-            run = self._gate.reserve(task, digest, now)
+            run = self._gate.reserve(task, digest, now, refire_of=refire_of)
         except DispatchRefused as e:
             raise QualifyRefused(
                 "; ".join(f"{b.code}: {b.detail}" for b in e.decision.blocks)
@@ -298,14 +317,22 @@ USAGE = __doc__
 
 def main(argv: list[str], make: Callable[[], Qualifier] = _real) -> int:
     args = argv[1:]
-    shapes = {"snapshot": 3, "approve": 1, "fire": 2, "reconcile": 1, "clear": 2, "status": 0}
+    shapes = {
+        "snapshot": 3,
+        "approve": 1,
+        "fire": 2,
+        "refire": 2,
+        "reconcile": 1,
+        "clear": 2,
+        "status": 0,
+    }
     if not args or args[0] not in shapes or len(args) != shapes[args[0]] + 1:
         print(USAGE)
         return 2
     cmd, rest = args[0], args[1:]
     step = (
         rest[-1]
-        if cmd == "fire"
+        if cmd in {"fire", "refire"}
         else (rest[0] if cmd in {"approve", "reconcile", "clear"} else None)
     )
     if step is not None and step not in STEPS:
@@ -321,6 +348,9 @@ def main(argv: list[str], make: Callable[[], Qualifier] = _real) -> int:
             print(f"{step} approved")
         elif cmd == "fire":
             result = q.fire(rest[0], step)
+            print(json.dumps(_shown(step, result), indent=2))
+        elif cmd == "refire":
+            result = q.refire(rest[0], step)
             print(json.dumps(_shown(step, result), indent=2))
         elif cmd == "reconcile":
             print(q.reconcile(step))
