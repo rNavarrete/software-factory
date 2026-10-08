@@ -116,6 +116,8 @@ The service posts this on the ticket: "It is unclear whether worker … started"
 | `ReviewStarter.start(pr)` | ENG-156 | Called once per attempt, when its PR first appears. Runs under the reviewer's own identity. |
 | `RepairAdvisor.advise(attempt, detail)` | ENG-160 | Suggests a repair. The service only posts the suggestion; a repair still needs its signed go-ahead. |
 
+The worker itself sits behind the existing runtime boundary: `RuntimeAdapter` in `controller/interfaces.py`, which the service reaches only through the `adapter` factory `Dispatcher` takes. A worker pool (ENG-154) plugs in there. The first deployment keeps one worker at a time.
+
 ENG-174 also has to settle how a verified Todo move becomes a signed contract approval. That is a change to the approval rules, and it needs Rolando's sign-off.
 
 ## Known limits
