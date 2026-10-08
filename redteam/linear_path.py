@@ -768,18 +768,21 @@ def _merge_without_ready(reviewed: str, passed: bool, reason: str) -> Callable[[
     exception, never verified work."""
 
     def run(attack: bool) -> Observed:
-        from types import SimpleNamespace
-
         from controller.interfaces import AttemptId
+        from controller.review.reviewer import ReviewState, ReviewStatus, Revision
         from controller.service.fixtures import RecordingReviewer
         from tests.test_repair import SHA_B
 
         head = SHA_B
 
         class Reviewed(RecordingReviewer):
-            def evidence(self, attempt):
+            def check(self, attempt):
                 commit, ok = (reviewed, passed) if attack else (head, True)
-                return SimpleNamespace(reviewed_commit=commit, passed=ok, unresolved=lambda: ())
+                if not commit:
+                    return ReviewStatus(ReviewState.RUNNING, attempt, 1, "Still reviewing.")
+                state = ReviewState.PASSED if ok else ReviewState.FAILED
+                revision = Revision("o/r", 1, "0" * 64, commit, "f" * 40, "f" * 40)
+                return ReviewStatus(state, attempt, 1, "Reviewed.", revision=revision)
 
             def merged_head(self, attempt):
                 return head
@@ -798,6 +801,10 @@ def _merge_without_ready(reviewed: str, passed: bool, reason: str) -> Callable[[
             ]
             t.tick(minutes=6)
             text = _texts(t)
+            if "**Factory: Merged" not in text:
+                # No merge record at all would make the honest twin "go
+                # through" vacuously; it must be recorded as verified work.
+                return Observed(False, f"no merge record: {text[-300:]!r}", True)
             return stopped(
                 "Merged as an exception" in text,
                 "recorded as an exception"
