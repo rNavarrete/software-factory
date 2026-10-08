@@ -50,3 +50,17 @@ class ReportFailedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreparerSeamTests(unittest.TestCase):
+    """ENG-175's additions: a question's kind and a prepared task's summary."""
+
+    def test_kind_defaults_to_product_and_is_checked(self):
+        from controller.service.seams import QUESTION_KINDS, Prepared, Question
+
+        self.assertEqual(Question("What colour?").kind, "product")
+        for kind in QUESTION_KINDS:
+            Question("x", kind=kind)
+        with self.assertRaises(ValueError):
+            Question("x", kind="approval")
+        self.assertEqual(Prepared({}).summary, "")

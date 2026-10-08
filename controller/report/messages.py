@@ -150,7 +150,10 @@ def question(q: Question) -> str:
     kind = str(getattr(q, "kind", "product") or "product")
     notice = kind in NOTICE_KINDS
     stage = Stage.STOPPED if notice else Stage.NEEDS_DECISION
-    lines = [f"**Factory: {stage.value}**", "", _quote(q.text, 1500)]
+    lines = [f"**Factory: {stage.value}**", ""]
+    if not notice:
+        lines.append("Before the factory can start, it needs an answer:")
+    lines.append(_quote(q.text, 1500))
     if q.context:
         lines += ["", f"Why it matters: {_quote(q.context, 1500)}"]
     if q.options and not notice:

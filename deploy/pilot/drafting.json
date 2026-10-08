@@ -1,0 +1,35 @@
+{
+  "format": "factory-drafting/v1",
+  "projects": [
+    {
+      "linear_project_id": "58d48e11-3a45-4431-92b7-19b51a4e9539",
+      "writable_paths": ["src/**", "tests/**", "index.html", "README.md", "docs/**"],
+      "protected_paths": [
+        ".github/**",
+        ".claude/**",
+        "CLAUDE.md",
+        "scripts/**",
+        "package.json",
+        "package-lock.json",
+        "eslint.config.js",
+        ".prettierrc.json",
+        ".prettierignore",
+        "tsconfig.json",
+        "vite.config.ts",
+        ".nvmrc"
+      ],
+      "verification_commands": ["npm run typecheck", "npm test", "npm run build"],
+      "test_command": "npm test",
+      "escalate_to": "rNavarrete",
+      "max_criteria": 6,
+      "max_ticket_chars": 8000,
+      "base": {
+        "branch": "main",
+        "workflow_path": ".github/workflows/ci.yml",
+        "job": "verified",
+        "lookback": 20
+      },
+      "worker": ["node 22", "npm ci"]
+    }
+  ]
+}
