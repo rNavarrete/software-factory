@@ -42,6 +42,7 @@ from pathlib import Path
 
 from controller import contract as contracts
 from controller.approval import ContractStore
+from controller.approval.approval import SOURCE_AUTHORIZATION
 from controller.attempts import AttemptGate
 from controller.attempts import events as gate_events
 from controller.attempts.policy import LedgerView
@@ -56,14 +57,20 @@ from controller.interfaces import (
 )
 from controller.ledger.redact import redact
 from controller.recovery import FINISHED, Recovery, State
+from controller.report import messages as m
+from controller.report.messages import Stage
+from controller.report.reporter import QUESTION_PREFIX
 from controller.service import queue as q
 from controller.service.onboarding import Onboarding, OnboardingError
 from controller.service.seams import (
     Authorization,
+    AuthorizationRefused,
     Integrations,
     Prepared,
     PullRequestRef,
     Question,
+    ReportFailed,
+    Standing,
 )
 
 log = logging.getLogger("factory.service")
@@ -80,6 +87,11 @@ _WATCHED = frozenset(
 _FINAL_REFUSALS = frozenset(
     {"contract-invalid", "wrong-repository", "base-not-on-main", "contract-changed"}
 )
+
+# When the signer may stand in for a missing approval: nothing in force for
+# this contract. Never after Rolando rejected or revoked it.
+_ASK_SIGNER = frozenset({"approval-missing", "approval-expired", "approval-for-different-contract"})
+_NEVER_ASK_SIGNER = frozenset({"approval-rejected", "approval-revoked"})
 
 
 def never(summary: str, code: str) -> bool:
@@ -237,11 +249,8 @@ class Service:
             )
         ]
         if gap is not None and gap > self._s.outage_after:
-            text = (
-                f"The factory was not running from {_when(last)} to {_when(now)}."
-                " It is back and is now catching up on anything it missed in Linear and"
-                " on GitHub. Nothing was started twice."
-            )
+            pending = [i.issue_key for i in self._view().open_items()]
+            text = m.health(_when(last), _when(now), pending)
             stamp = now.strftime("%Y%m%dT%H%M%SZ")
             for issue in self._notice_targets():
                 events.append(q.message(f"outage:{stamp}:{issue}", issue, text, now))
@@ -279,6 +288,7 @@ class Service:
         events: list[LedgerEvent] = []
         seen = set(view.seen)
         open_issues = {i.issue_id for i in view.open_items()}
+        earlier = {i.issue_id: i for i in view.open_items()}
 
         for c in batch.controls:
             if c.event_id in seen:
@@ -288,7 +298,11 @@ class Service:
             events.append(q.control(c, applied, now))
             target = c.issue_id or self._status_issue()
             if target:
-                events.append(q.message(f"control:{c.event_id}", target, applied, now))
+                events.append(
+                    q.message(
+                        f"control:{c.event_id}", target, m.progress(Stage.NOTICE, applied), now
+                    )
+                )
 
         for ref in batch.refusals:
             if ref.event_id in seen:
@@ -299,7 +313,10 @@ class Service:
                 q.message(
                     f"refused:{ref.event_id}",
                     ref.issue_id,
-                    f"The factory did not start work on this ticket: {ref.reason}",
+                    m.progress(
+                        Stage.STOPPED,
+                        f"The factory did not start work on this ticket: {ref.reason}",
+                    ),
                     now,
                 )
             )
@@ -310,23 +327,74 @@ class Service:
                 continue
             seen.add(a.event_id)
             reason = self._acceptance_problem(a, open_issues)
+            old = earlier.pop(a.issue_id, None)
+            if reason is not None and old is not None and self._replaceable(old, a):
+                # A newer move of a ticket whose older move hasn't started
+                # anything: the newer one is what Rolando approved last.
+                events += self._replace(old, now)
+                open_issues.discard(a.issue_id)
+                reason = self._acceptance_problem(a, open_issues)
             if reason is None:
                 events.append(q.accepted(a, now))
                 open_issues.add(a.issue_id)
                 r.accepted.append(a.issue_key)
-                text = (
+                text = m.progress(
+                    Stage.QUEUED,
                     "The factory picked this ticket up and queued it. It will post here when"
-                    " it starts the work."
+                    " it starts the work.",
                 )
             else:
                 events.append(q.refused(a, reason, now))
                 r.refused.append(a.issue_key)
-                text = f"The factory did not start work on this ticket: {reason}"
+                text = m.progress(
+                    Stage.STOPPED, f"The factory did not start work on this ticket: {reason}"
+                )
             events.append(q.message(f"intake:{a.event_id}", a.issue_id, text, now))
 
         if batch.cursor and batch.cursor != view.cursor:
             events.append(q.cursor(batch.cursor, now))
         self._append(*events)
+
+    def _replaceable(self, old: q.Item, new: Authorization) -> bool:
+        return (
+            self._config is not None
+            and self._config.intake_enabled
+            and self._config.project(new.project_id) is not None
+            and new.moved_at > datetime.fromisoformat(old.moved_at)
+            and not self._owned_attempts(old)
+        )
+
+    def _replace(self, old: q.Item, now: datetime) -> list[LedgerEvent]:
+        return [
+            q.item_closed(old, "replaced", now),
+            q.message(
+                f"closed:{old.event_id}",
+                old.issue_id,
+                m.progress(
+                    Stage.STOPPED,
+                    "You moved this ticket to Todo again before the factory started it. It will"
+                    " work from that newer move instead.",
+                ),
+                now,
+            ),
+        ]
+
+    def _owned_attempts(self, item: q.Item) -> set[AttemptId]:
+        """The attempts reserved for the item's task after it was accepted."""
+        return {
+            s.event.attempt
+            for s in self._store.events(item.task)
+            if s.event.kind == gate_events.ATTEMPT_RESERVED
+            and s.seq > item.seq
+            and s.event.attempt is not None
+        }
+
+    def _standing(self, item: q.Item) -> Standing:
+        source = self._x.source
+        check = getattr(source, "standing", None)
+        if check is not None:
+            return check(item.authorization())
+        return Standing(withdrawn=source.revalidate(item.authorization()))
 
     def _acceptance_problem(self, a: Authorization, open_issues: set[str]) -> str | None:
         assert self._config is not None
@@ -407,12 +475,21 @@ class Service:
                 self._watch(item, status, now)
                 return False
             if status.state is State.MERGED:
-                self._close(
-                    item, "merged", now, "Rolando merged the PR. This ticket's work is done."
-                )
+                self._close_merged(item, status, now)
                 r.closed.append(item.issue_key)
                 return False
             if status.state in FINISHED:
+                if item.withdrawn is not None:
+                    self._close(
+                        item,
+                        "withdrawn",
+                        now,
+                        f"Attempt {status.attempt} ended as {status.state.value}. You had moved"
+                        " the ticket out of Todo, so the factory stops here and suggests no"
+                        " repair.",
+                    )
+                    r.closed.append(item.issue_key)
+                    return False
                 advice = self._x.repair.advise(status.attempt, status.detail)
                 if advice is None:
                     self._close(
@@ -421,6 +498,7 @@ class Service:
                         now,
                         f"Attempt {status.attempt} ended as {status.state.value}"
                         f" ({status.detail}). The factory has stopped work on this ticket.",
+                        stage=Stage.FAILED,
                     )
                     r.closed.append(item.issue_key)
                     return False
@@ -432,6 +510,7 @@ class Service:
                     now,
                     f"Attempt {status.attempt} ended as {status.state.value}. A repair is"
                     f" suggested: {advice}. It needs your go-ahead before it starts.",
+                    stage=Stage.NEEDS_DECISION,
                 )
                 r.closed.append(item.issue_key)
                 return False
@@ -456,13 +535,53 @@ class Service:
             )
             r.closed.append(item.issue_key)
             return False
-        reason = self._x.source.revalidate(item.authorization())
-        if reason is not None:
-            self._close(item, "authorization-withdrawn", now, f"The factory stopped: {reason}")
+        if item.withdrawn is not None:
+            self._close(
+                item,
+                "withdrawn",
+                now,
+                "The factory won't start anything more for this ticket: you moved it out of"
+                " Todo after its worker started. For new work, write a new ticket.",
+            )
             r.closed.append(item.issue_key)
+            return False
+        standing = self._standing(item)
+        if standing.reason is None and not standing.in_todo:
+            standing = Standing(withdrawn="the ticket left Todo before the factory started it")
+        if standing.reason is not None:
+            again = (
+                " To start from the new text, move it out of Todo and back."
+                if standing.withdrawn is None
+                else ""
+            )
+            self._close(
+                item,
+                "authorization-withdrawn",
+                now,
+                f"The factory stopped before starting: {standing.reason}.{again}",
+            )
+            r.closed.append(item.issue_key)
+            return False
+        if standing.waiting_on:
+            names = ", ".join(standing.waiting_on)
+            self._notice(
+                item,
+                f"waiting-on:{names}",
+                m.progress(
+                    Stage.WAITING,
+                    f"Waiting before starting: this ticket is blocked by {names},"
+                    " which isn't done.",
+                    wait_reason=names,
+                ),
+                now,
+            )
             return False
         contract = self._contract(item, project.as_mapping(), project, r)
         if contract is None:
+            return False
+        if not self._protected_ok(item, project, contract, now):
+            return False
+        if not self._authorized(item, contract, r, now):
             return False
         try:
             result = self._dispatcher.dispatch(contract)
@@ -478,12 +597,83 @@ class Service:
                 r.closed.append(item.issue_key)
                 return False
             for b in e.blocks:
-                self._notice(item, f"blocked:{b.code}", f"Waiting before starting: {b.detail}", now)
+                self._notice(
+                    item,
+                    f"blocked:{b.code}",
+                    m.progress(
+                        Stage.WAITING,
+                        "Waiting before starting.",
+                        wait_reason=b.detail,
+                    ),
+                    now,
+                )
             return False
         if result.run is None:
             return False  # already dispatched; watched next round
         r.fired.append(str(result.run))
-        self._notice(item, f"fired:{result.run}", _fired_text(result), now)
+        self._notice(item, f"fired:{result.run}", m.progress(*_fired_text(result)), now)
+        return True
+
+    def _protected_ok(self, item: q.Item, project, contract: Mapping[str, object], now) -> bool:
+        """A contract that may reach the project's protected paths (as the
+        onboarding file says now) starts only on Rolando's typed approval,
+        never on a Todo move alone, even one signed before the paths were
+        protected."""
+        problems = project.protected_problems(contract)
+        if not problems or self._dispatcher.approvals.typed_approval_in_force(contract, now):
+            return True
+        self._notice(
+            item,
+            "needs-typed-approval",
+            m.progress(Stage.WAITING, "Waiting before starting: " + "; ".join(problems) + "."),
+            now,
+        )
+        return False
+
+    def _authorized(
+        self, item: q.Item, contract: Mapping[str, object], r: TickReport, now: datetime
+    ) -> bool:
+        """Rolando's Todo move as the approval (his choice, 2026-10-08): if
+        the contract has no standing approval, ask the signer, which checks
+        the move with Linear itself and signs. The service only appends what
+        the signer signed; it can't sign anything."""
+        authorizer = self._x.authorizer
+        if authorizer is None:
+            return True
+        _, _, blocks = self._dispatcher.launcher.check(contract, now)
+        codes = {b.code for b in blocks}
+        if not codes & _ASK_SIGNER:
+            return True  # approved already, or blocked for another reason dispatch reports
+        if codes & _NEVER_ASK_SIGNER:
+            return True  # Rolando rejected or revoked it; dispatch reports that
+        try:
+            event = authorizer.authorize(item.authorization(), contract)
+        except AuthorizationRefused as e:
+            if e.final:
+                self._close(
+                    item,
+                    "authorization-refused",
+                    now,
+                    f"The factory can't count your Todo move as approval: {e.reason}.",
+                )
+                r.closed.append(item.issue_key)
+            else:
+                self._notice(
+                    item,
+                    "authorize-wait",
+                    m.progress(Stage.WAITING, f"Waiting before starting: {e.reason}."),
+                    now,
+                )
+            return False
+        d = event.data
+        if (
+            event.kind != SOURCE_AUTHORIZATION
+            or event.task != item.task
+            or d.get("event_id") != item.event_id
+            or d.get("digest") != contracts.digest(contract).value
+        ):
+            raise RuntimeError("the signer answered for a different move or contract")
+        self._append(event)
         return True
 
     def _contract(
@@ -495,13 +685,7 @@ class Service:
             return self._within(item, project, contract, r, now)
         out = self._x.preparer.prepare(item.authorization(), entry)
         if isinstance(out, Question):
-            self._close(
-                item,
-                "question",
-                now,
-                f"Before the factory can start, it needs an answer: {out.text}\n\n"
-                "Answer here and move the ticket to Todo again.",
-            )
+            self._ask(item, out, now)
             r.closed.append(item.issue_key)
             return None
         assert isinstance(out, Prepared)
@@ -510,6 +694,10 @@ class Service:
         contract = contracts.freeze(out.contract)
         digest = self._contracts.save(contract)
         self._append(q.item_contract(item, digest.value, now))
+        if out.summary.strip():
+            self._notice(
+                item, f"summary:{digest.value[:12]}", m.progress(Stage.NOTICE, out.summary), now
+            )
         return contract
 
     def _within(
@@ -536,14 +724,20 @@ class Service:
         ):
             self._last_reconcile[attempt] = now
             status = self._dispatcher.reconcile(attempt).status
+            if status.state is not State.MERGED:
+                # A merge moves the ticket to Done; that is not a withdrawal.
+                self._check_standing_while_running(item, now)
         if status.state is State.UNKNOWN:
             self._notice(
                 item,
                 f"unknown:{status.latest_run}",
-                f"It is unclear whether worker {status.latest_run} started. The factory will not"
-                " start it again on its own and holds the lane until this is settled. Look for"
-                " the session on the factory routine's run page, then record what you found"
-                " (see the recovery steps in docs/service.md).",
+                m.progress(
+                    Stage.UNCLEAR,
+                    f"It is unclear whether worker {status.latest_run} started. The factory"
+                    " will not start it again on its own and holds the lane until this is"
+                    " settled. Look for the session on the factory routine's run page, then"
+                    " record what you found (see the recovery steps in docs/service.md).",
+                ),
                 now,
             )
         view = self._view()
@@ -569,18 +763,107 @@ class Service:
                 q.message(
                     f"review:{attempt}",
                     item.issue_id,
-                    f"The worker opened PR #{number}. The independent review has started.",
+                    m.progress(
+                        Stage.REVIEWING,
+                        f"The worker opened PR #{number}. The independent review has started.",
+                        pr_url=self._pr_url(item, number),
+                    ),
                     now,
                 ),
             )
         if status.state is State.MERGED:
-            self._close(item, "merged", now, "Rolando merged the PR. This ticket's work is done.")
+            self._close_merged(item, status, now)
 
-    def _close(self, item: q.Item, reason: str, now: datetime, text: str) -> None:
+    def _check_standing_while_running(self, item: q.Item, now: datetime) -> None:
+        """Rolando's move is checked again while the worker runs. A change
+        never alters the contract or starts anything; it is reported."""
+        if item.withdrawn is not None:
+            return
+        try:
+            standing = self._standing(item)
+        except Exception as e:  # Linear down: reconcile still goes on
+            log.warning("%s: can't read Linear: %s", item.issue_key, _error(e))
+            return
+        if standing.withdrawn is not None:
+            self._append(
+                q.item_withdrawn(item, standing.withdrawn, now),
+                q.message(
+                    f"{item.event_id}:withdrawn",
+                    item.issue_id,
+                    m.progress(
+                        Stage.STOPPED,
+                        f"This ticket no longer stands as approved ({standing.withdrawn}) after"
+                        " the worker started. The factory won't start anything more for it,"
+                        " repairs included. It can't stop a worker that is already running: if it"
+                        " should stop, stop the session from the factory routine's run page, then"
+                        " record what you found (docs/service.md, recovery steps). The factory"
+                        " keeps checking GitHub for what the worker did.",
+                    ),
+                    now,
+                ),
+            )
+        elif standing.changed is not None:
+            self._notice(
+                item,
+                "changed-while-running",
+                m.progress(
+                    Stage.NOTICE,
+                    f"This ticket changed while the worker was running ({standing.changed}). The"
+                    " worker keeps the task it started with and nothing new starts. If the change"
+                    " matters, say what you want here, or move the ticket out of Todo and In"
+                    " Progress to stop further work on it.",
+                ),
+                now,
+            )
+
+    def _close(
+        self, item: q.Item, reason: str, now: datetime, text: str, *, stage: Stage = Stage.STOPPED
+    ) -> None:
         self._append(
             q.item_closed(item, reason, now),
+            q.message(f"closed:{item.event_id}", item.issue_id, m.progress(stage, text), now),
+        )
+
+    def _pr_url(self, item: q.Item, number: int | None) -> str:
+        """The PR's GitHub address, from the project's onboarded repository."""
+        project = self._config.project(item.project_id) if self._config else None
+        if project is None or not number:
+            return ""
+        return f"https://github.com/{project.repository}/pull/{number}"
+
+    def _close_merged(self, item: q.Item, status, now: datetime) -> None:
+        """The merge record. The service holds no review verdict yet (ENG-156),
+        so a merge is recorded as an exception that says what is missing,
+        never as verified work."""
+        evidence = m.ReviewEvidence(started=str(status.attempt) in self._view().reviews)
+        number = status.pull_requests[-1] if status.pull_requests else None
+        _, text = m.merged(number, "", evidence, pr_url=self._pr_url(item, number))
+        self._append(
+            q.item_closed(item, "merged", now),
             q.message(f"closed:{item.event_id}", item.issue_id, text, now),
         )
+
+    def _ask(self, item: q.Item, question: Question, now: datetime) -> None:
+        """A product question closes the item; moving the ticket to Todo again
+        after updating it starts a new one. The same question (same key) is
+        posted once; if it comes back because the ticket didn't change, a
+        short note says so instead of going silent."""
+        kind = str(getattr(question, "kind", "product") or "product")
+        reason = "question" if kind == "product" else f"question-{kind}"
+        key = f"{QUESTION_PREFIX}{item.issue_id}:{question.key or item.event_id}"
+        events = [q.item_closed(item, reason, now)]
+        if key not in self._view().queued_keys:
+            events.append(q.message(key, item.issue_id, m.question(question), now))
+        else:
+            events.append(
+                q.message(
+                    f"{item.event_id}:question-repeat",
+                    item.issue_id,
+                    m.question_repeat(question),
+                    now,
+                )
+            )
+        self._append(*events)
 
     def _notice(self, item: q.Item, key: str, text: str, now: datetime) -> None:
         full = f"{item.event_id}:{key}"
@@ -590,21 +873,31 @@ class Service:
     # --- 4. outbox --------------------------------------------------------------------
 
     def _flush(self, r: TickReport) -> None:
-        for m in sorted(self._view().outbox.values(), key=lambda m: m.seq):
+        # The comments on a ticket are its status board, so they go out in the
+        # order they were written: while an older message for a ticket waits to
+        # be retried, newer ones for that ticket wait behind it.
+        held: set[str] = set()
+        for msg in sorted(self._view().outbox.values(), key=lambda x: x.seq):
             now = self._now()
-            if m.last_failed_at is not None:
+            if msg.issue_id in held:
+                continue
+            if msg.last_failed_at is not None:
                 wait = min(
-                    self._s.outbox_retry_after * (2 ** min(m.failures - 1, 10)),
+                    self._s.outbox_retry_after * (2 ** min(msg.failures - 1, 10)),
                     self._s.outbox_retry_max,
                 )
-                if now - m.last_failed_at < wait:
+                if now - msg.last_failed_at < wait:
+                    held.add(msg.issue_id)
                     continue
             try:
-                self._x.reporter.post(m.issue_id, m.key, m.text)
+                self._x.reporter.post(msg.issue_id, msg.key, msg.text)
             except Exception as e:
-                self._append(q.send_failed(m.key, _error(e), now))
+                held.add(msg.issue_id)
+                self._append(q.send_failed(msg.key, _error(e), now))
+                if isinstance(e, ReportFailed) and e.hold_all:
+                    break  # Linear itself is down or rate limiting: try again next round
                 continue
-            self._append(q.sent(m.key, now))
+            self._append(q.sent(msg.key, now))
             r.sent += 1
 
 
@@ -620,15 +913,17 @@ def _waiting_to_refire(status, attempt_state) -> bool:
     )
 
 
-def _fired_text(result) -> str:
+def _fired_text(result) -> tuple[Stage, str]:
     if result.outcome == "launched":
-        return (
+        return Stage.WORKING, (
             f"The factory started the worker ({result.run}). Its draft PR will appear on the"
             " repository; the factory will post here when it does."
         )
     if result.outcome == "not-launched":
-        return f"The worker did not start ({result.message}). The factory will try again later."
-    return f"It is unclear whether the worker started: {result.message}"
+        return Stage.WAITING, (
+            f"The worker did not start ({result.message}). The factory will try again later."
+        )
+    return Stage.UNCLEAR, f"It is unclear whether the worker started: {result.message}"
 
 
 def _error(e: BaseException) -> str:

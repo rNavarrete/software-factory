@@ -428,6 +428,10 @@ class Dispatcher:
             **({} if warn is None else {"warn": warn}),
         )
 
+    @property
+    def approvals(self) -> Approvals:
+        return self._approvals
+
     def dispatch(self, contract: Mapping[str, object]) -> DispatchResult:
         """Fire the next attempt of ``contract``'s task, or report the one on record.
 

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from controller.interfaces import AttemptId
 from controller.service.seams import (
+    Answer,
     Authorization,
     Control,
     IntakeBatch,
@@ -24,6 +25,7 @@ from controller.service.seams import (
     Question,
     Refusal,
     ReportFailed,
+    Standing,
 )
 
 log = logging.getLogger("factory.service.fixtures")
@@ -42,6 +44,10 @@ class FixtureSource:
         self.events = list(events)
         self.withdrawn = dict(withdrawn or {})
         """issue_id -> reason ``revalidate`` gives."""
+        self.changed: dict[str, str] = {}
+        """issue_id -> what changed after the move."""
+        self.blocked: dict[str, tuple[str, ...]] = {}
+        """issue_id -> keys of open tickets that block it."""
         self.fail_next: Exception | None = None
         self.polls: list[str | None] = []
 
@@ -60,7 +66,11 @@ class FixtureSource:
         )
 
     def revalidate(self, authorization: Authorization) -> str | None:
-        return self.withdrawn.get(authorization.issue_id)
+        return self.standing(authorization).reason
+
+    def standing(self, authorization: Authorization) -> Standing:
+        i = authorization.issue_id
+        return Standing(self.withdrawn.get(i), self.changed.get(i), self.blocked.get(i, ()))
 
 
 class FixturePreparer:
@@ -119,6 +129,18 @@ class RecordingReviewer:
         return f"fixture review of PR #{pr.number} (already started)"
 
 
+class FixtureDecisions:
+    """Answers by issue id, as ``DecisionReader`` would return them."""
+
+    def __init__(self, by_issue: Mapping[str, Sequence[Answer]] | None = None) -> None:
+        self.by_issue = {k: list(v) for k, v in (by_issue or {}).items()}
+        self.calls: list[str] = []
+
+    def answers(self, issue_id: str) -> Sequence[Answer]:
+        self.calls.append(issue_id)
+        return list(self.by_issue.get(issue_id, ()))
+
+
 class NoRepair:
     def advise(self, attempt: AttemptId, detail: str) -> str | None:
         return None
@@ -143,6 +165,7 @@ def load_events(path: Path) -> list[Authorization | Refusal | Control]:
 
 
 __all__ = [
+    "FixtureDecisions",
     "FixturePreparer",
     "FixtureSource",
     "LogReporter",
