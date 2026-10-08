@@ -96,41 +96,55 @@ class HttpGitHubApiTests(unittest.TestCase):
 
 class Secrets:
     def get(self, name):
-        return {"github-token": TOKEN, "reviewer-token": "sk-ant-oat01-x"}[name]
+        return {"github-token": TOKEN, "review-token": "github_pat_review"}[name]
 
 
 class WiringTests(unittest.TestCase):
     def args(self, **kw):
-        return argparse.Namespace(**{"reviewer_routine": None, "reviewer_login": None, **kw})
+        return argparse.Namespace(
+            **{"review_dispatcher": None, "review_model": None, "review_effort": "", **kw}
+        )
 
-    def test_without_a_reviewer_routine_the_stand_in_is_used(self):
+    def test_without_review_settings_the_stand_in_is_used(self):
         self.assertIsNone(_reviewer(self.args(), Secrets(), None, Path("/nonexistent")))
 
-    def test_routine_and_login_go_together(self):
-        with self.assertRaises(SystemExit):
-            _reviewer(self.args(reviewer_login="factory-verifier"), Secrets(), None, Path("/x"))
+    def test_dispatcher_and_model_go_together(self):
+        for kw in ({"review_dispatcher": "rNavarrete"}, {"review_model": "gpt-6.1-sol"}):
+            with self.subTest(kw=kw), self.assertRaises(SystemExit):
+                _reviewer(self.args(**kw), Secrets(), None, Path("/x"))
 
-    def test_the_worker_or_rolando_can_never_be_the_reviewer(self):
-        for login in ("rnavarrete-factory-bot", "rNavarrete"):
-            with self.assertRaises(ValueError):
+    def test_the_worker_can_never_start_trusted_reviews(self):
+        for login in ("rnavarrete-factory-bot", "rnavarrete-factory-bot[bot]", "not a login"):
+            with self.subTest(login=login), self.assertRaises(SystemExit):
                 _reviewer(
-                    self.args(reviewer_routine="trig_01ABC", reviewer_login=login),
+                    self.args(review_dispatcher=login, review_model="gpt-6.1-sol"),
                     Secrets(),
                     None,
                     Path("/x"),
                 )
 
-    def test_a_configured_reviewer_is_the_automatic_one(self):
+    def test_a_malformed_model_or_effort_is_refused(self):
+        for kw in ({"review_model": "GPT 6"}, {"review_model": "m", "review_effort": "x; rm"}):
+            with self.subTest(kw=kw), self.assertRaises(SystemExit):
+                _reviewer(
+                    self.args(review_dispatcher="rNavarrete", **kw), Secrets(), None, Path("/x")
+                )
+
+    def test_configured_settings_give_the_workflow_reviewer(self):
         from controller.review.reviewer import AutoReviewer
+        from controller.review.workflow import WorkflowDispatchRuntime
 
         with tempfile.TemporaryDirectory() as d:
             r = _reviewer(
-                self.args(reviewer_routine="trig_01ABC", reviewer_login="factory-verifier"),
+                self.args(review_dispatcher="rNavarrete", review_model="gpt-6.1-sol"),
                 Secrets(),
                 None,
                 Path(d),
             )
         self.assertIsInstance(r, AutoReviewer)
+        self.assertIsInstance(r._runtime, WorkflowDispatchRuntime)
+        self.assertEqual(r._policy.workflow, "codex-review")
+        self.assertFalse(r._policy.reviewers)
 
 
 if __name__ == "__main__":

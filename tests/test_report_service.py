@@ -526,6 +526,43 @@ class ReviewMessageTests(unittest.TestCase):
         self.assertNotEqual(review_messages(s)[0][0], review_messages(t)[0][0])
         self.assertIn("Waiting", review_messages(s)[0][1])
 
+    def test_a_started_codex_review_is_reported_once_per_revision(self) -> None:
+        s = replace(status(ReviewState.RUNNING), pass_kind="full", reviewer="codex-review")
+        ((key, text),) = review_messages(s)
+        self.assertIn("Codex review is running", text)
+        self.assertEqual(review_messages(s)[0][0], key)
+        t = replace(s, pass_kind="verify")
+        self.assertIn("corrected version", review_messages(t)[0][1])
+
+    def test_a_corrected_version_that_passed_says_so(self) -> None:
+        fixed = replace(finding("review-code", Route.REPAIR, "Mutates input"), resolved=True)
+        s = replace(
+            status(ReviewState.PASSED, findings=(fixed,)),
+            pass_kind="verify",
+            reviewer="codex-review",
+            review_url="https://github.com/rNavarrete/software-factory/actions/runs/9",
+        )
+        text = review_messages(s)[0][1]
+        self.assertIn("corrected version", text)
+        self.assertIn("1 earlier finding(s) checked as fixed", text)
+        self.assertIn("actions/runs/9", text)
+
+    def test_a_failed_review_never_says_a_correction_is_running(self) -> None:
+        s = replace(
+            status(
+                ReviewState.FAILED,
+                findings=(
+                    finding("review-code", Route.REPAIR, "Mutates input"),
+                    finding("review-test", Route.REPAIR, "No test for order"),
+                ),
+            ),
+            reviewer="codex-review",
+        )
+        text = review_messages(s)[0][1]
+        self.assertIn("found 2 problem(s)", text)
+        self.assertIn("only after the previous worker is confirmed finished", text)
+        self.assertNotIn("is running", text)
+
 
 if __name__ == "__main__":
     unittest.main()

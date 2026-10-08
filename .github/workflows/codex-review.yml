@@ -1,0 +1,175 @@
+# The factory's independent review of one worker PR revision (ENG-156,
+# docs/review.md). Only the factory's controller starts it, through the API,
+# with one request key; it never runs on a push or a PR. The worker has no
+# access to this repository, so it can't change this file, the instructions or
+# the code these jobs run. Every action is pinned to a full commit.
+name: Codex review
+run-name: codex-review ${{ inputs.key }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      key:
+        description: The controller's request key (rv-...)
+        required: true
+        type: string
+      request:
+        description: The review job envelope (JSON), written by the controller
+        required: true
+        type: string
+      model:
+        description: The OpenAI model for the review
+        required: true
+        type: string
+      effort:
+        description: Reasoning effort (empty for the model's default)
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: codex-review-${{ inputs.key }}
+  cancel-in-progress: false
+
+jobs:
+  # Reads the PR at the exact head and asks Codex for the structured review.
+  # The OpenAI key is only in the "codex-review" environment, which only runs
+  # from main. Nothing from the pilot repository is installed or run here.
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: codex-review
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - name: Check out the factory (instructions and checker)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: factory
+          persist-credentials: false
+      - name: Check the request and write the prompt
+        id: prepare
+        working-directory: factory
+        env:
+          KEY: ${{ inputs.key }}
+          REQUEST: ${{ inputs.request }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
+        run: python3 -E -s -m controller.review.codex_job prepare --out "$RUNNER_TEMP/review"
+      - name: Check out the PR at the exact head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ steps.prepare.outputs.repository }}
+          ref: ${{ steps.prepare.outputs.head }}
+          path: pilot
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm the checked-out commit
+        env:
+          HEAD_SHA: ${{ steps.prepare.outputs.head }}
+          MERGE_BASE: ${{ steps.prepare.outputs.merge_base }}
+        run: |
+          test "$(git -C pilot rev-parse HEAD)" = "$HEAD_SHA"
+          git -C pilot cat-file -e "$MERGE_BASE^{commit}"
+      # Last step of the job, as the action's security guide advises.
+      - name: Codex review (read-only)
+        id: codex
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.12
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          codex-version: 0.160.1
+          model: ${{ inputs.model }}
+          effort: ${{ inputs.effort }}
+          prompt-file: ${{ runner.temp }}/review/prompt.md
+          output-schema-file: ${{ runner.temp }}/review/schema.json
+          working-directory: pilot
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+          codex-args: '["--ephemeral"]'
+
+  # Runs the tests the review linked, from the PR's head, against the base's
+  # product code. This runs the worker's code, so it gets no secrets and no
+  # token permissions, and sudo and Docker are switched off first.
+  proofs:
+    needs: review
+    if: needs.review.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions: {}
+    outputs:
+      proofs: ${{ steps.proofs.outputs.proofs }}
+    steps:
+      - name: Check out the factory (checker)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: factory
+          persist-credentials: false
+      - name: Check the request
+        id: prepare
+        working-directory: factory
+        env:
+          KEY: ${{ inputs.key }}
+          REQUEST: ${{ inputs.request }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
+        run: python3 -E -s -m controller.review.codex_job prepare --out "$RUNNER_TEMP/review"
+      - name: Check out the PR at the exact head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ steps.prepare.outputs.repository }}
+          ref: ${{ steps.prepare.outputs.head }}
+          path: pilot
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22
+      - name: Switch off sudo and Docker before running the PR's code
+        run: |
+          sudo systemctl stop docker.socket docker.service containerd.service || true
+          sudo sh -c 'deluser runner docker 2>/dev/null; deluser runner sudo 2>/dev/null; rm -f /etc/sudoers.d/runner; sed -i "/^runner[[:space:]]/d" /etc/sudoers' || true
+          if sudo -n true 2>/dev/null; then echo "sudo is still available" >&2; exit 1; fi
+      - name: Run the linked tests on the base's code
+        id: proofs
+        working-directory: factory
+        env:
+          KEY: ${{ inputs.key }}
+          REQUEST: ${{ inputs.request }}
+          FINAL_MESSAGE: ${{ needs.review.outputs.final_message }}
+        run: python3 -E -s -m controller.review.codex_job proofs --pilot "$GITHUB_WORKSPACE/pilot"
+
+  # Writes the one result the controller reads. Runs no PR code, gets no key.
+  publish:
+    needs: [review, proofs]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Check out the factory (checker)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: factory
+          persist-credentials: false
+      - name: Write the result
+        working-directory: factory
+        env:
+          KEY: ${{ inputs.key }}
+          REQUEST: ${{ inputs.request }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          FINAL_MESSAGE: ${{ needs.review.outputs.final_message }}
+          PROOFS_RESULT: ${{ needs.proofs.result }}
+          PROOFS: ${{ needs.proofs.outputs.proofs }}
+        run: python3 -E -s -m controller.review.codex_job publish --out "$RUNNER_TEMP/result"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: factory-review-result
+          path: ${{ runner.temp }}/result/result.json
+          if-no-files-found: error
+          retention-days: 30

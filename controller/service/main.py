@@ -528,31 +528,41 @@ ROLANDO_LINEAR_ID = "cd9ec650-f957-4f25-b5f0-9c14bcae49c8"
 
 
 def _reviewer(args: argparse.Namespace, secrets, store, root: Path):
-    """The independent review (ENG-156), when a reviewer routine is set up:
-    ``--reviewer-routine`` and ``--reviewer-login`` (docs/review.md). Without
-    them the stand-in reviewer is used and no review job is ever launched."""
-    if not (args.reviewer_routine or args.reviewer_login):
+    """The independent review (ENG-156), when the Codex review workflow is set
+    up: ``--review-dispatcher`` (the GitHub login that owns the review token)
+    and ``--review-model`` (docs/review.md). Without them the stand-in
+    reviewer is used and no review is ever started."""
+    if not (args.review_dispatcher or args.review_model):
         return None
-    if not (args.reviewer_routine and args.reviewer_login):
-        raise SystemExit("--reviewer-routine and --reviewer-login go together")
-    from controller.adapter.routine import RoutineAdapter
+    if not (args.review_dispatcher and args.review_model):
+        raise SystemExit("--review-dispatcher and --review-model go together")
     from controller.approval import ContractStore
     from controller.recovery import PILOT_REPO
     from controller.review.reviewer import AutoReviewer, ReviewPolicy, ledger_contracts
-    from controller.review.runtime import RoutineReviewRuntime
+    from controller.review.workflow import (
+        WorkflowConfig,
+        WorkflowDispatchRuntime,
+        WorkflowResults,
+    )
     from controller.service.github_http import HttpGitHubApi
 
-    policy = ReviewPolicy(reviewers=frozenset({args.reviewer_login}))
-    adapter = RoutineAdapter(
-        args.reviewer_routine, start_key=lambda trig: secrets.get("reviewer-token")
-    )
+    try:
+        config = WorkflowConfig(
+            dispatchers=frozenset({args.review_dispatcher}),
+            model=args.review_model,
+            effort=args.review_effort or "",
+        )
+    except ValueError as e:
+        raise SystemExit(f"review settings: {e}") from None
+    token = lambda: secrets.get("review-token")  # noqa: E731
     return AutoReviewer(
         store,
         HttpGitHubApi(lambda: secrets.get("github-token")),
-        RoutineReviewRuntime(adapter),
+        WorkflowDispatchRuntime(config, token),
         ledger_contracts(store, ContractStore(root / "contracts").load),
-        policy=policy,
+        policy=ReviewPolicy(workflow=config.identity),
         repo=PILOT_REPO,
+        results=WorkflowResults(HttpGitHubApi(token), config),
     )
 
 
@@ -591,8 +601,11 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--reporter", choices=("log", "linear"), default="log")
         s.add_argument("--approver-linear-id", default=ROLANDO_LINEAR_ID)
         s.add_argument("--source", choices=("fixtures", "linear"), default="fixtures")
-        s.add_argument("--reviewer-routine", help="the reviewer routine's trig_ id (ENG-156)")
-        s.add_argument("--reviewer-login", help="the reviewer's GitHub account (ENG-156)")
+        s.add_argument(
+            "--review-dispatcher", help="GitHub login that owns the review token (ENG-156)"
+        )
+        s.add_argument("--review-model", help="OpenAI model for the Codex review (ENG-156)")
+        s.add_argument("--review-effort", default="", help="Codex reasoning effort (optional)")
         s.add_argument("--user", help="become this user before starting (on the host)")
     sub.add_parser("status")
     s = sub.add_parser("install-secrets")

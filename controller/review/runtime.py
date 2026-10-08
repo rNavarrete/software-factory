@@ -48,15 +48,17 @@ class ReviewJob:
     """The GitHub login the job must post as; anything else is not read."""
     contract: Mapping[str, object]
     previous_findings: Sequence[Mapping[str, object]] = ()
+    ci: Sequence[Mapping[str, object]] = ()
+    """The trusted CI run's results for this head (command, exit code, link)."""
 
 
 class ReviewTooLarge(ValueError):
     """The envelope would not fit in one fire. Nothing was sent."""
 
 
-def review_text(job: ReviewJob) -> str:
-    """The fire text for ``job``. Raises ReviewTooLarge if it can't fit, after
-    dropping the previous findings' long fields first."""
+def review_text(job: ReviewJob, limit: int = MAX_FIRE_TEXT_CHARS) -> str:
+    """The fire text for ``job``. Raises ReviewTooLarge if it can't fit in
+    ``limit`` characters, after dropping the previous findings' long fields."""
     body = {
         "envelope": ENVELOPE,
         "key": job.key,
@@ -72,15 +74,17 @@ def review_text(job: ReviewJob) -> str:
         "contract": json.loads(canonical_bytes(job.contract)),
         "previous_findings": [dict(f) for f in job.previous_findings],
     }
+    if job.ci:
+        body["ci"] = [dict(c) for c in job.ci]
     text = json.dumps(body, ensure_ascii=False, sort_keys=True)
-    if len(text) > MAX_FIRE_TEXT_CHARS:
+    if len(text) > limit:
         body["previous_findings"] = [
             {k: f.get(k) for k in ("id", "category", "criterion", "summary")}
             for f in job.previous_findings
         ]
         text = json.dumps(body, ensure_ascii=False, sort_keys=True)
-    if len(text) > MAX_FIRE_TEXT_CHARS:
-        raise ReviewTooLarge(f"review job text is {len(text)} chars, limit {MAX_FIRE_TEXT_CHARS}")
+    if len(text) > limit:
+        raise ReviewTooLarge(f"review job text is {len(text)} chars, limit {limit}")
     return text
 
 

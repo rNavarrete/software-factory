@@ -5,13 +5,16 @@ calls for, each with an outbox key. The service posts each key once, so the
 same verdict on the same revision is never reported twice, and a new revision
 or a new verdict is. Built on ENG-178's message texts (controller/report).
 
-- passed: "Ready for your review", naming the exact commit.
-- failed: what the repair step has to fix; nothing is asked of Rolando.
+- running: once per revision, that the review has started (with its link).
+- passed: "Ready for your review", naming the exact commit, and saying when
+  it is a corrected version that passed its verification pass.
+- failed: what a correction has to fix. It never says a correction is
+  running: that is said only when one actually starts (ENG-160).
 - needs Rolando: one observation request per behavior only he can check
   (his ``Observation:`` reply is bound to that commit), and one note listing
   anything else only he can settle.
 - not reviewable, blocked, unknown: one plain notice each.
-- waiting for CI, running: nothing; the earlier "Reviewing" entry stands.
+- waiting for CI: nothing; the earlier "Reviewing" entry stands.
 
 A message is a report, never an approval.
 """
@@ -23,6 +26,7 @@ import hashlib
 from controller.report import messages as m
 from controller.report.messages import Stage
 from controller.review.reviewer import ReviewState, ReviewStatus
+from controller.review.workflow import IDENTITY
 from verify.findings import Route, Severity
 
 
@@ -37,24 +41,43 @@ def review_messages(status: ReviewStatus, pr_url: str = "") -> list[tuple[str, s
         items = [f for f in open_ if f.route is route]
         return " ".join(f"({i}) {f.summary}" for i, f in enumerate(items, 1))
 
+    codex = status.reviewer == IDENTITY
+    who = "Codex review" if codex else "Independent review"
+    name = "Codex review" if codex else "independent review"
+    verified = status.pass_kind == "verify"
+    if s is ReviewState.RUNNING and status.pass_kind:
+        text = (
+            f"PR #{n} is ready at `{m.short_sha(commit)}` and the {name} is running"
+            f" ({'verification pass on the corrected version' if verified else 'full review'})."
+        )
+        return [(f"{base}:running", m.progress(Stage.REVIEWING, text, pr_url=pr_url))]
     if s is ReviewState.PASSED:
         advisory = [f.summary for f in status.findings if not f.resolved and f not in open_]
-        checks = [m.Check("Independent review", "passed")]
+        fixed = [f for f in status.findings if f.resolved]
+        checks = [m.Check(who, "passed, verification pass" if verified else "passed")]
         if status.review_url:
-            checks.append(m.Check("Review comment", status.review_url))
+            checks.append(m.Check("Review evidence", status.review_url))
+        changed = (
+            f"The corrected version in PR #{n}; {len(fixed)} earlier finding(s) checked as fixed."
+            if verified
+            else f"The worker's change in PR #{n}."
+        )
         r = m.Readiness(
             pr_url=pr_url,
             commit=commit,
-            changed=f"The worker's change in PR #{n}.",
+            changed=changed,
             checks=checks,
             limitations=advisory,
         )
         return [(f"ready:{status.attempt}:{commit}", m.ready(r))]
     if s is ReviewState.FAILED:
+        count = len([f for f in open_ if f.route is Route.REPAIR])
         text = (
-            f"The independent review of PR #{n} at `{m.short_sha(commit)}` found problems for"
-            f" the repair step to fix: {lines(Route.REPAIR) or status.note} Nothing is needed"
-            " from you for these."
+            f"The {name} of PR #{n} at `{m.short_sha(commit)}` found {count} problem(s)"
+            f" for a correction: {lines(Route.REPAIR) or status.note} A correction can start"
+            " only within the task's approved allowance, and only after the previous worker is"
+            " confirmed finished; you'll get a separate note when one actually starts."
+            " Nothing is needed from you for these."
         )
         return [(f"{base}:failed", m.progress(Stage.FAILED, text, pr_url=pr_url))]
     if s is ReviewState.NEEDS_ROLANDO:

@@ -34,8 +34,8 @@ printf '%s\n' "$HOME" >/run/factory-home
 python3 -s -m controller.service install-secrets "$FACTORY_SECRETS_DIR"
 # The service's copy: never the approval key.
 python3 -s -m controller.service install-secrets /run/factory-service-secrets \
-    --only routine-token,github-token,linear-key,reviewer-token --owner factory
-for name in APPROVAL_KEY ROUTINE_TOKEN GITHUB_TOKEN LINEAR_KEY REVIEWER_TOKEN; do
+    --only routine-token,github-token,linear-key,review-token --owner factory
+for name in APPROVAL_KEY ROUTINE_TOKEN GITHUB_TOKEN LINEAR_KEY REVIEW_TOKEN; do
     unset "FACTORY_$name"
 done
 chown -R factory:factory "$HOME"
@@ -53,11 +53,11 @@ until [ -S /run/factory-signer/signer.sock ]; do
     fi
     sleep 0.1
 done
-# The independent reviewer runs only once its routine and account are set
+# The Codex review runs only once its settings are made
 # (deploy/fly/setup-reviewer.sh); neither value is secret.
-if [ -n "${FACTORY_REVIEWER_ROUTINE:-}" ] && [ -n "${FACTORY_REVIEWER_LOGIN:-}" ]; then
-    set -- "$@" --reviewer-routine "$FACTORY_REVIEWER_ROUTINE" \
-        --reviewer-login "$FACTORY_REVIEWER_LOGIN"
+if [ -n "${FACTORY_REVIEW_DISPATCHER:-}" ] && [ -n "${FACTORY_REVIEW_MODEL:-}" ]; then
+    set -- "$@" --review-dispatcher "$FACTORY_REVIEW_DISPATCHER" \
+        --review-model "$FACTORY_REVIEW_MODEL" --review-effort "${FACTORY_REVIEW_EFFORT:-}"
 fi
 env FACTORY_SECRETS_DIR=/run/factory-service-secrets \
     FACTORY_SIGNER_SOCKET=/run/factory-signer/signer.sock \

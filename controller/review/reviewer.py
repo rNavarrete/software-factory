@@ -21,12 +21,16 @@ GitHub, so nothing is judged on an old picture:
    fire allowance, usage reading and holds. The claim is written to the
    ledger before the launch, so a crash or a second reviewer never launches
    it twice; a launch whose answer was lost is never repeated.
-5. The job posts its mapping, failure proofs and findings as one comment from
-   the reviewer's own account. Only that account counts: not the worker, not
-   an edited comment, not a comment for another revision (``verify.review``).
-   The two verifiers then decide: passed, failed (findings for the repair
-   worker), or needs Rolando (a behavior only he can check, a protected
-   control, a product or security question).
+5. Read the job's result. With the Codex review workflow
+   (``controller.review.workflow``) the result is the trusted workflow run's
+   artifact, authenticated from GitHub's own record of the run; comments are
+   not read at all. With a reviewer account instead, the job posts one comment
+   and only that account counts: not the worker, not an edited comment, not a
+   comment for another revision (``verify.review``). Either way the two
+   verifiers then decide: passed, failed (findings for the repair worker), or
+   needs Rolando (a behavior only he can check, a protected control, or a
+   product or security question). A run that gave no usable result is
+   "unknown", never a pass.
 
 The verdict names the exact commit it covers. A new push or a moved base is a
 new key: the old verdict stays in the ledger for that commit and says nothing
@@ -52,6 +56,7 @@ from controller.attempts.limits import PILOT_LIMITS, Limits
 from controller.attempts.policy import LedgerView, Notice, _check_snapshot, _check_window
 from controller.interfaces import (
     LAUNCH_TIMEOUT_SECONDS,
+    MAX_FIRE_TEXT_CHARS,
     AttemptId,
     ContractDigest,
     LaunchOutcome,
@@ -64,6 +69,13 @@ from controller.loop.check import Assessment, assess
 from controller.loop.collect import PILOT_REPO, Collected, GitHubApi, collect
 from controller.review import events as ev
 from controller.review.runtime import ReviewJob, ReviewRuntime, ReviewTooLarge, review_text
+from controller.review.workflow import (
+    Found,
+    ResultRequest,
+    ResultState,
+    WorkflowResults,
+    request_hash,
+)
 from controller.service.seams import PullRequestRef
 from verify.criteria import DEFAULT_POLICY, TrustPolicy, _login_key
 from verify.findings import (
@@ -76,6 +88,7 @@ from verify.findings import (
     for_route,
     from_reports,
 )
+from verify.review import Review
 
 POLICY_VERSION = "1"
 
@@ -117,8 +130,19 @@ class ReviewPolicy:
     review_timeout: timedelta = timedelta(hours=2)
     """After this, a launched job that hasn't posted is reported as unknown."""
     trust: TrustPolicy = DEFAULT_POLICY
+    workflow: str = ""
+    """The name results from the trusted review workflow carry
+    (``controller.review.workflow.IDENTITY``). Set instead of ``reviewers``
+    when the review runs as that workflow; its results are authenticated from
+    the run, not from who posted them."""
 
     def __post_init__(self) -> None:
+        if self.workflow and self.reviewers:
+            raise ValueError("the review runs either as a workflow or as reviewer accounts")
+        if self.workflow and (
+            _login_key(self.workflow) is None or self.trust.is_worker(self.workflow)
+        ):
+            raise ValueError(f"review workflow name {self.workflow!r} can't be used")
         for login in self.reviewers:
             if _login_key(login) is None or login.lower().endswith("[bot]"):
                 raise ValueError(f"reviewer {login!r} is not a GitHub user login")
@@ -135,8 +159,14 @@ class ReviewPolicy:
         return self.passes_per_cycle + self.extra_passes
 
     @property
+    def configured(self) -> bool:
+        return bool(self.workflow or self.reviewers)
+
+    @property
     def reviewer(self) -> str:
-        """The login the next job is told to post as."""
+        """Who the next job's result is attributed to."""
+        if self.workflow:
+            return self.workflow
         return sorted(self.reviewers)[0] if self.reviewers else ""
 
 
@@ -236,7 +266,11 @@ class AutoReviewer:
         limits: Limits = PILOT_LIMITS,
         repo: str = PILOT_REPO,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        results: WorkflowResults | None = None,
     ) -> None:
+        if (results is None) == bool(policy.workflow):
+            raise ValueError("a review workflow needs both its results source and its name")
+        self._results = results
         self._store = store
         self._api = api
         self._runtime = runtime
@@ -357,6 +391,7 @@ class AutoReviewer:
                 view,
                 "Waiting for CI on `{head}` before reviewing PR #{n}.",
             )
+        found = self._find(view, key, rev, contract)
         observations, clearances = self._decisions(attempt, digest, cand)
         a = assess(
             contract,
@@ -365,6 +400,7 @@ class AutoReviewer:
             observations=observations,
             clearances=clearances,
             mappers=self._policy.reviewers,
+            review=None if found is None else (found.review or Review()),
         )
         findings = self._findings(a, rev.head, previous)
         if a.definite_failure:
@@ -384,9 +420,63 @@ class AutoReviewer:
                 author=a.review.author,
                 blockers=a.blockers,
             )
+        if found is not None and found.state is ResultState.RUNNING:
+            job = view.jobs.get(key)
+            return ReviewStatus(
+                ReviewState.RUNNING,
+                attempt,
+                rev.pr,
+                f"The independent review of PR #{rev.pr} is running ({found.url}).",
+                key,
+                rev,
+                tuple(findings),
+                pass_kind=job.pass_kind if job else None,
+            )
+        if found is not None and found.state is ResultState.INCOMPLETE:
+            return self._record(
+                attempt,
+                cycle,
+                rev,
+                key,
+                ReviewState.UNKNOWN,
+                findings,
+                view,
+                "The review run for PR #{n} gave no usable result: "
+                + _braces(f"{found.reason} ({found.url})")
+                + ". It doesn't count as a pass, and the factory won't start it again by"
+                " itself.",
+            )
         if a.review.url is None:
-            return self._without_review(attempt, cycle, rev, key, contract, findings, view, a)
+            return self._without_review(
+                attempt, cycle, rev, key, contract, findings, view, a, collected
+            )
         return self._decide(attempt, cycle, rev, key, findings, a, view)
+
+    def _find(self, view: ev.ReviewView, key: str, rev: Revision, contract) -> Found | None:
+        """The trusted workflow's result for this exact request, or None when
+        the review doesn't run as a workflow."""
+        if self._results is None:
+            return None
+        job = view.jobs.get(key)
+        if job is None:
+            return Found(ResultState.ABSENT)
+        criteria = {
+            str(c["id"]): str(c["evidence"]["type"]) for c in contract["acceptance_criteria"]
+        }
+        return self._results.find(
+            ResultRequest(
+                key=key,
+                repository=rev.repository,
+                pr=rev.pr,
+                digest=rev.digest,
+                head=rev.head,
+                base=rev.base,
+                merge_base=rev.merge_base,
+                claimed=job.claims,
+                requests=frozenset(job.requests),
+                criteria=criteria,
+            )
+        )
 
     # --- deciding -----------------------------------------------------------------
 
@@ -494,11 +584,11 @@ class AutoReviewer:
     # --- no review posted yet -------------------------------------------------------
 
     def _without_review(
-        self, attempt, cycle, rev, key, contract, findings, view, a: Assessment
+        self, attempt, cycle, rev, key, contract, findings, view, a: Assessment, collected
     ) -> ReviewStatus:
         n = rev.pr
         common = dict(key=key, revision=rev, findings=tuple(findings))
-        if not self._policy.reviewers:
+        if not self._policy.configured:
             return ReviewStatus(
                 ReviewState.BLOCKED,
                 attempt,
@@ -568,7 +658,7 @@ class AutoReviewer:
                     **common,
                 )
             # Definitely not launched: it may be launched again, within its allowance.
-        return self._launch(attempt, cycle, rev, key, contract, findings, common)
+        return self._launch(attempt, cycle, rev, key, contract, findings, common, collected)
 
     def _lost(self, attempt, n, job, common) -> ReviewStatus:
         return ReviewStatus(
@@ -606,7 +696,9 @@ class AutoReviewer:
         except LedgerLocked:
             pass
 
-    def _launch(self, attempt, cycle, rev, key, contract, findings, common) -> ReviewStatus:
+    def _launch(
+        self, attempt, cycle, rev, key, contract, findings, common, collected
+    ) -> ReviewStatus:
         n = rev.pr
         with self._store.writer_lock():
             stored = self._store.events()
@@ -653,7 +745,12 @@ class AutoReviewer:
                         reviewer=self._policy.reviewer,
                         contract=contract,
                         previous_findings=[f.as_data() for f in previous if not f.resolved],
-                    )
+                        ci=[
+                            {"command": r.command, "exit_code": r.exit_code, "url": r.url}
+                            for r in collected.results
+                        ],
+                    ),
+                    getattr(self._runtime, "max_chars", MAX_FIRE_TEXT_CHARS),
                 )
             except ReviewTooLarge as e:
                 return ReviewStatus(
@@ -677,6 +774,7 @@ class AutoReviewer:
                     merge_base=rev.merge_base,
                     digest=rev.digest,
                     now=self._now(),
+                    request=request_hash(text),
                 )
             )
         try:
@@ -884,6 +982,10 @@ class _Answer:
 
 def _finding(d: Mapping[str, object]) -> Finding:
     return finding_from_data(d)
+
+
+def _braces(text: str) -> str:
+    return text.replace("{", "{{").replace("}", "}}")
 
 
 def _clip(e: BaseException) -> str:

@@ -8,8 +8,9 @@ The service needs four secrets, each scoped to one job:
 - ``github-token``: read-only access to the pilot repo, for reconcile and the
   base-commit check. Never the bot's write access, never Rolando's login.
 - ``linear-key``: ENG-174's and ENG-178's Linear access.
-- ``reviewer-token``: the reviewer routine's start key (fire only), on the
-  reviewer's own claude.ai account (ENG-156).
+- ``review-token``: starts and reads the Codex review workflow in the factory
+  repository (Actions read and write, Contents read, that repository only).
+  It can't change code in either repository (ENG-156).
 
 None of them is ever passed to the worker: the worker only receives the fire
 text (contract and markers), and runs in the cloud with no route to the host.
@@ -30,7 +31,7 @@ from collections.abc import Iterable, MutableMapping
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-NAMES = ("approval-key", "routine-token", "github-token", "linear-key", "reviewer-token")
+NAMES = ("approval-key", "routine-token", "github-token", "linear-key", "review-token")
 ENV_PREFIX = "FACTORY_"
 _NAME_RE = re.compile(r"^[a-z]+(?:-[a-z]+)*$")
 

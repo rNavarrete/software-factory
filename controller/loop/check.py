@@ -185,15 +185,20 @@ def assess(
     observations=(),
     clearances=(),
     mappers: frozenset[str] | None = None,
+    review: Review | None = None,
 ) -> Assessment:
+    """``review``, when given, is the independent review to use, already
+    authenticated by its source (controller.review.workflow); the PR's
+    comments are then not read for one."""
     if collected.candidate is None or collected.pending:
         return Assessment(collected)
     candidate = collected.candidate
-    review = (
-        read_review(collected.comments, digest.value, candidate)
-        if mappers is None
-        else read_review(collected.comments, digest.value, candidate, mappers=mappers)
-    )
+    if review is None:
+        review = (
+            read_review(collected.comments, digest.value, candidate)
+            if mappers is None
+            else read_review(collected.comments, digest.value, candidate, mappers=mappers)
+        )
     criteria = verify(
         contract,
         digest,

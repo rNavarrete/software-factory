@@ -66,6 +66,9 @@ class Job:
     rate_limited: int = 0
     """Launches the runtime turned away with a 429. They count against the
     weekly allowance, but not against the job's own launch tries."""
+    requests: tuple[str, ...] = ()
+    """sha256 of each request text sent, so a result can be matched to the
+    exact request the controller made (controller.review.workflow)."""
 
     @property
     def unanswered(self) -> bool:
@@ -144,9 +147,14 @@ class ReviewView:
                 str(d["head"]),
                 str(d["base"]),
                 (e.at,),
+                requests=_request(d),
             )
             old = self.jobs.get(key)
-            self.jobs[key] = job if old is None else replace(old, claims=old.claims + (e.at,))
+            if old is not None:
+                job = replace(
+                    old, claims=old.claims + (e.at,), requests=old.requests + job.requests
+                )
+            self.jobs[key] = job
             self.intents_at.append(e.at)
         elif e.kind == REVIEW_JOB_LAUNCHED:
             key = str(d["key"])
@@ -208,24 +216,39 @@ def intent(
     merge_base: str,
     digest: str,
     now: datetime,
+    request: str | None = None,
 ) -> LedgerEvent:
+    """``request`` is the sha256 of the request text about to be sent."""
+    data = {
+        "key": key,
+        "cycle": cycle,
+        "pass": pass_kind,
+        "number": number,
+        "pr": pr,
+        "head": head,
+        "base": base,
+        "merge_base": merge_base,
+        "digest": digest,
+    }
+    if request is not None:
+        data["request"] = request
     return LedgerEvent(
         REVIEW_JOB_INTENT,
         now,
         attempt.task,
         attempt,
-        data={
-            "key": key,
-            "cycle": cycle,
-            "pass": pass_kind,
-            "number": number,
-            "pr": pr,
-            "head": head,
-            "base": base,
-            "merge_base": merge_base,
-            "digest": digest,
-        },
+        data=data,
     )
+
+
+def _request(d: Mapping[str, object]) -> tuple[str, ...]:
+    value = d.get("request")
+    if value is None:
+        return ()
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError("a request hash must be 64 hex characters")
+    int(value, 16)
+    return (value,)
 
 
 def launched(

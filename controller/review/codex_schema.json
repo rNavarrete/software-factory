@@ -1,0 +1,216 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "key",
+    "commit",
+    "summary",
+    "complete",
+    "criteria",
+    "links",
+    "limits",
+    "findings",
+    "areas",
+    "unreviewed_context"
+  ],
+  "properties": {
+    "key": {
+      "type": "string"
+    },
+    "commit": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "criterion",
+          "verdict",
+          "reasoning"
+        ],
+        "properties": {
+          "criterion": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "met",
+              "not-met",
+              "cannot-tell"
+            ]
+          },
+          "reasoning": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "links": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "criterion",
+          "path",
+          "test",
+          "assertion",
+          "why"
+        ],
+        "properties": {
+          "criterion": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "test": {
+            "type": "string"
+          },
+          "assertion": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "criterion",
+          "reason"
+        ],
+        "properties": {
+          "criterion": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "category",
+          "severity",
+          "criterion",
+          "path",
+          "line",
+          "summary",
+          "evidence",
+          "suggested_action"
+        ],
+        "properties": {
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "code",
+              "test",
+              "scope",
+              "product",
+              "security"
+            ]
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "blocking",
+              "advisory"
+            ]
+          },
+          "criterion": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "suggested_action": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "areas": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "area",
+          "examined",
+          "note"
+        ],
+        "properties": {
+          "area": {
+            "type": "string",
+            "enum": [
+              "behavior",
+              "criteria-coverage",
+              "regressions-and-edge-cases",
+              "scope",
+              "tests-and-controls",
+              "security-and-secrets",
+              "claims"
+            ]
+          },
+          "examined": {
+            "type": "boolean"
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "unreviewed_context": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
