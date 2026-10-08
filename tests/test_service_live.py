@@ -219,6 +219,16 @@ class LiveIntakeOffTests(LiveCase):
         self.assertEqual(len(self.linear.bodies()), 1)
         self.assertEqual(len(self.view().outbox), 0)
 
+    def test_key_acting_as_rolando_reads_and_posts_nothing(self):
+        self.rolando_moves()
+        self.linear.tickets.viewer["id"] = APPROVER
+        self.linear.comments.viewer_id = APPROVER
+        self.once()
+        self.once()
+        self.assertEqual(self.linear.bodies(), [])
+        self.assertEqual(list(self.view().items), [])
+        self.assertTrue(all("FactoryViewer" in r for r in self.linear.requests))
+
     def test_linear_down_records_nothing_and_catches_up(self):
         self.rolando_moves()
         self.linear.down = True

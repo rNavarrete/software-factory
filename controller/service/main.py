@@ -241,7 +241,13 @@ def build(args: argparse.Namespace):
         from controller.intake.linear import HttpTransport
 
         # Reads only: Todo moves and ticket text. The reporter has its own.
-        linear = HttpTransport(lambda: secrets.get("linear-key"), linear_opener())
+        # Each key value is checked before its first use: never Rolando's
+        # (ready_check made sure the onboarding file names the same user).
+        linear = HttpTransport(
+            lambda: secrets.get("linear-key"),
+            linear_opener(),
+            forbidden_user=lambda: args.approver_linear_id,
+        )
     if args.source == "linear":
         from controller.intake import LinearSource, policy_from
 
@@ -428,7 +434,10 @@ def _todo_move_handler(args: argparse.Namespace, key, linear_key: str):
     def load():
         return onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
 
-    reader = LinearSource(HttpTransport(lambda: linear_key), lambda: None)  # type: ignore[arg-type,return-value]
+    transport = HttpTransport(
+        lambda: linear_key, forbidden_user=lambda: load().approver_linear_user_id
+    )
+    reader = LinearSource(transport, lambda: None)  # type: ignore[arg-type,return-value]
     authorizer = TodoMoveAuthorizer(
         key, load, reader.fetch, reader.viewer_id, OneContractPerMove(Path(args.state))
     )
