@@ -66,7 +66,7 @@ Every 60 seconds (`controller/service/service.py`):
 
 Each step stands alone. If Linear or GitHub is down, only that step waits for the next round.
 
-The service never approves, merges or releases anything, and it never writes a decision. It fires only a contract Rolando has already approved. How a verified Todo move becomes that approval is ENG-174's to propose and Rolando's to sign off on. Until then, a queued ticket shows "Waiting before starting" with the reason.
+The service never approves, merges or releases anything, and it never signs a decision. It fires only a contract Rolando has approved: by typing the code, or, with `--source linear`, by his own Todo move as checked and signed by the signer process (docs/intake.md). Until then, a queued ticket shows "Waiting before starting" with the reason.
 
 ## Onboarding a Linear project
 
@@ -110,7 +110,7 @@ The service posts this on the ticket: "It is unclear whether worker … started"
 
 | Protocol | Ticket | Contract |
 |---|---|---|
-| `AuthorizationSource.poll(cursor)` / `.revalidate(authorization)` | ENG-174 | Returns only Todo moves it has proved were made by Rolando on an exact ticket revision. Each has a stable `event_id`, so a replay is ignored. Also returns the moves it refused, and pause/resume controls. `revalidate` is checked again right before the first fire. |
+| `AuthorizationSource.poll(cursor)` / `.standing(authorization)` | ENG-174 (`controller/intake`, docs/intake.md) | Returns only Todo moves it has proved were made by Rolando on an exact ticket revision. Each has a stable `event_id`, so a replay is ignored. Also returns the moves it refused, and pause/resume controls. `standing` is checked again before every dispatch try and every five minutes while the worker runs. |
 | `ContractPreparer.prepare(authorization, project)` | ENG-175 | Returns a contract with a plain summary the service posts once, or a question with its kind (product, split, scope, changed, factory). A question closes the item, and moving the ticket to Todo again starts a new one. Built in `controller/prepare/`, see docs/prepare.md. |
 | `Reporter.post(issue_id, key, text)` | ENG-178 | Posts on Linear. Must be idempotent per `key`, because the service retries when it can't tell a failure from a lost answer. Built: `LinearReporter` (`--reporter linear`), see `docs/reporting.md`. |
 | `DecisionReader.answers(issue_id)` | ENG-178 | Rolando's own, unedited replies to the factory's product questions, for later use in drafting. Never an approval. |
@@ -119,11 +119,11 @@ The service posts this on the ticket: "It is unclear whether worker … started"
 
 The worker itself sits behind the existing runtime boundary: `RuntimeAdapter` in `controller/interfaces.py`, which the service reaches only through the `adapter` factory `Dispatcher` takes. A worker pool (ENG-154) plugs in there. The first deployment keeps one worker at a time.
 
-ENG-174 also has to settle how a verified Todo move becomes a signed contract approval. That is a change to the approval rules, and it needs Rolando's sign-off.
+ENG-174 settled how a verified Todo move becomes the approval: Rolando chose it on 2026-10-08, and the signer process signs it after checking with Linear itself (docs/intake.md).
 
 ## Known limits
 
-- **The machine holds the approval key, and the same key that checks an approval can create one.** The signatures are HMAC, so whoever can check them can also sign. The service process never writes a decision, because every confirmation it gives says no and a test makes sure it never calls the approval writers. But any code in the same process could forge one, and that will include the Linear integrations, which read untrusted ticket text. Python's standard library has no public-key signatures, so this can't be closed without adding a dependency. ENG-174 should decide how to handle it: either run the Linear-reading code in a separate process that doesn't have the key, or accept the risk and record it in the governance map.
+- **Only the signer holds the approval key (ENG-174).** The key is HMAC, so whoever can check a signature can also make one. On the machine it therefore lives only in a small signer process running as its own user (`factory-signer`). The service runs as `factory`, can't read the key file, and can only ask the signer whether a signature is good. Code that reads Linear text, model output or GitHub data can't forge an approval. Rolando's own commands over `fly ssh console` run as root and sign as before. If the signer or the service stops, the start script stops the other and exits, and Fly starts the machine again with both. See docs/intake.md.
 - **Each ticket gets one task and one attempt budget for its whole life.** If a ticket the factory already worked on is moved to Todo again, the service says so and does nothing. New work needs a new ticket.
 - **A suggested repair closes the ticket's queue entry.** A repair still needs Rolando's signed go-ahead. How that go-ahead puts the work back in the queue is ENG-160's job.
 - **The GitHub token expires.** Fine-grained tokens last at most a year. When it expires, the service can't read GitHub and says so every round. Renewing it is one `fly secrets import` (see the setup steps in the PR).

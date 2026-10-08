@@ -31,6 +31,9 @@ INTAKE_CURSOR = "intake-cursor"
 CONTROL_APPLIED = "control-applied"
 ITEM_CONTRACT = "item-contract"
 ITEM_CLOSED = "item-closed"
+ITEM_WITHDRAWN = "item-withdrawn"
+"""Rolando's move stopped standing after the worker started: nothing more
+starts for the item (no repairs); its attempt is still reconciled."""
 OUTBOX_QUEUED = "outbox-queued"
 OUTBOX_SENT = "outbox-sent"
 OUTBOX_FAILED = "outbox-failed"
@@ -47,6 +50,7 @@ KINDS = frozenset(
         CONTROL_APPLIED,
         ITEM_CONTRACT,
         ITEM_CLOSED,
+        ITEM_WITHDRAWN,
         OUTBOX_QUEUED,
         OUTBOX_SENT,
         OUTBOX_FAILED,
@@ -69,6 +73,7 @@ class Item:
     seq: int
     digest: str | None = None
     closed: str | None = None
+    withdrawn: str | None = None
 
     def authorization(self) -> Authorization:
         return Authorization(
@@ -144,6 +149,10 @@ class ServiceView:
                 item = v.items.get(str(d["event_id"]))
                 if item is not None and item.closed is None:
                     item.closed = str(d["reason"])
+            elif e.kind == ITEM_WITHDRAWN:
+                item = v.items.get(str(d["event_id"]))
+                if item is not None and item.withdrawn is None:
+                    item.withdrawn = str(d["reason"])
             elif e.kind == OUTBOX_QUEUED:
                 key = str(d["key"])
                 if key not in v.queued_keys:
@@ -231,6 +240,12 @@ def item_contract(item: Item, digest: str, now: datetime) -> LedgerEvent:
 def item_closed(item: Item, reason: str, now: datetime) -> LedgerEvent:
     return LedgerEvent(
         ITEM_CLOSED, now, item.task, data={"event_id": item.event_id, "reason": reason}
+    )
+
+
+def item_withdrawn(item: Item, reason: str, now: datetime) -> LedgerEvent:
+    return LedgerEvent(
+        ITEM_WITHDRAWN, now, item.task, data={"event_id": item.event_id, "reason": reason}
     )
 
 
