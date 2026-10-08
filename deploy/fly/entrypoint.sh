@@ -34,9 +34,9 @@ done
 # fixture with the fake worker: it never starts a real worker.
 # The independent reviewer runs only once its routine and account are set
 # (deploy/fly/setup-reviewer.sh); neither value is secret.
-set --
 if [ -n "${FACTORY_REVIEWER_ROUTINE:-}" ] && [ -n "${FACTORY_REVIEWER_LOGIN:-}" ]; then
-    set -- --reviewer-routine "$FACTORY_REVIEWER_ROUTINE" --reviewer-login "$FACTORY_REVIEWER_LOGIN"
+    set -- "$@" --reviewer-routine "$FACTORY_REVIEWER_ROUTINE" \
+        --reviewer-login "$FACTORY_REVIEWER_LOGIN"
 fi
 env FACTORY_SECRETS_DIR=/run/factory-service-secrets \
     FACTORY_SIGNER_SOCKET=/run/factory-signer/signer.sock \
