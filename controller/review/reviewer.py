@@ -44,7 +44,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 
+from controller.adapter.routine import LaunchInterrupted
+from controller.attempts import events as aev
 from controller.attempts.events import ATTEMPT_RESERVED
+from controller.attempts.gate import _EXHAUSTED_RE, _MAX_RETRY_AFTER
 from controller.attempts.limits import PILOT_LIMITS, Limits
 from controller.attempts.policy import LedgerView, Notice, _check_snapshot, _check_window
 from controller.interfaces import (
@@ -53,6 +56,7 @@ from controller.interfaces import (
     ContractDigest,
     LaunchOutcome,
     LaunchResult,
+    LedgerEvent,
     LedgerLocked,
     LedgerStore,
 )
@@ -65,9 +69,10 @@ from verify.criteria import DEFAULT_POLICY, TrustPolicy, _login_key
 from verify.findings import (
     Finding,
     Route,
-    Severity,
+    adopt_ids,
     blocking,
     carry_forward,
+    finding_from_data,
     for_route,
     from_reports,
 )
@@ -293,37 +298,47 @@ class AutoReviewer:
             policy=self._policy.trust,
         )
         cand = collected.candidate
-        if cand is None:
-            return self._not_reviewable(attempt, number, collected, view)
-        rev = Revision(
-            self._repo, number, digest.value, cand.head_commit, cand.base_commit, cand.merge_base
-        )
-        key = rev.key()
         cycle = ev.cycle_of(attempt.task, digest.value)
-        if collected.problems:
+        if cand is None:
+            rev = Revision(self._repo, number, digest.value, "", "", "")
+        else:
+            rev = Revision(
+                self._repo,
+                number,
+                digest.value,
+                cand.head_commit,
+                cand.base_commit,
+                cand.merge_base,
+            )
+        key = rev.key()
+        previous = self._previous_findings(view, cycle, key)
+        if cand is None or collected.problems:
             found = from_reports(None, None, commit=rev.head, problems=collected.problems)
-            if any(f.route is not Route.REPAIR for f in found):
-                return self._not_reviewable(attempt, number, collected, view)
+            if cand is None or any(f.route is not Route.REPAIR for f in found):
+                return self._not_reviewable(attempt, cycle, rev, key, collected, view, previous)
             # Only what a repair push fixes (failed CI, a marker): fail now, no job.
-            previous = self._previous_findings(view, cycle, key)
             return self._record(
                 attempt,
                 cycle,
                 rev,
                 key,
                 ReviewState.FAILED,
-                carry_forward(previous, found),
+                carry_forward(previous, found, evaluated=False),
                 view,
                 "PR #{n} fails before any review is needed: {why}",
             )
         if collected.pending:
-            return ReviewStatus(
-                ReviewState.WAITING_CI,
+            # Recorded, so an earlier verdict for another revision is no
+            # longer the latest evidence for this attempt.
+            return self._record(
                 attempt,
-                number,
-                f"Waiting for CI on `{rev.head[:12]}` before reviewing PR #{number}.",
-                key,
+                cycle,
                 rev,
+                key,
+                ReviewState.WAITING_CI,
+                carry_forward(previous, (), evaluated=False),
+                view,
+                "Waiting for CI on `{head}` before reviewing PR #{n}.",
             )
         observations, clearances = self._decisions(attempt, digest, cand)
         a = assess(
@@ -334,18 +349,22 @@ class AutoReviewer:
             clearances=clearances,
             mappers=self._policy.reviewers,
         )
-        previous = self._previous_findings(view, cycle, key)
         findings = self._findings(a, rev.head, previous)
         if a.definite_failure:
+            repair = any(f.route is Route.REPAIR for f in blocking(findings))
             return self._record(
                 attempt,
                 cycle,
                 rev,
                 key,
-                ReviewState.FAILED,
+                ReviewState.FAILED if repair else ReviewState.NEEDS_ROLANDO,
                 findings,
                 view,
-                "PR #{n} fails before any review is needed: {why}",
+                "PR #{n} fails before any review is needed: {why}"
+                if repair
+                else "PR #{n} can't go further without you: {why}",
+                review_url=a.review.url,
+                author=a.review.author,
                 blockers=a.blockers,
             )
         if a.review.url is None:
@@ -355,14 +374,16 @@ class AutoReviewer:
     # --- deciding -----------------------------------------------------------------
 
     def _findings(self, a: Assessment, head: str, previous: Sequence[Finding]) -> tuple:
+        reviewed = a.review.url is not None
         current = from_reports(
             a.criteria,
             a.assertions,
             commit=head,
             observable=a.observable,
-            mapped=a.review.url is not None,
+            mapped=reviewed,
         )
-        return carry_forward(previous, current + a.review.findings)
+        mine = adopt_ids(a.review.findings, previous)
+        return carry_forward(previous, current + mine, evaluated=reviewed)
 
     def _decide(self, attempt, cycle, rev, key, findings, a: Assessment, view) -> ReviewStatus:
         open_ = blocking(findings)
@@ -416,7 +437,8 @@ class AutoReviewer:
             latest is not None
             and latest.verdict == state.value
             and latest.review_url == review_url
-            and [f["id"] for f in latest.findings] == [f["id"] for f in data]
+            and [(f["id"], f["resolved"]) for f in latest.findings]
+            == [(f["id"], f["resolved"]) for f in data]
         )
         if not same:
             event = ev.verdict(
@@ -640,7 +662,12 @@ class AutoReviewer:
                     now=self._now(),
                 )
             )
-        result = self._fire(text)
+        try:
+            result = self._fire(text)
+        except LaunchInterrupted as e:  # Ctrl-C mid-launch: record its answer, then stop
+            r = e.result
+            self._write_launch(attempt, key, _Answer(r.outcome, r.http_status, r.session_url))
+            raise
         self._write_launch(attempt, key, result)
         if result.outcome is LaunchOutcome.LAUNCHED:
             note = f"The independent review of PR #{n} has started ({kind} pass)."
@@ -662,23 +689,60 @@ class AutoReviewer:
             return _Answer(LaunchOutcome.NOT_LAUNCHED, detail=_clip(e))
         except Exception as e:
             return _Answer(LaunchOutcome.OUTCOME_UNKNOWN, detail=_clip(e))
-        return _Answer(r.outcome, r.http_status, r.session_url, r.detail)
+        return _Answer(
+            r.outcome,
+            r.http_status,
+            r.session_url,
+            r.detail,
+            r.retry_after_seconds,
+            r.response_body,
+        )
 
     def _write_launch(self, attempt, key, result: _Answer) -> None:
-        event = ev.launched(
-            attempt,
-            key,
-            result.outcome,
-            self._now(),
-            http_status=result.http_status,
-            session_url=result.session_url,
-            detail=result.detail,
-        )
+        now = self._now()
+        events = [
+            ev.launched(
+                attempt,
+                key,
+                result.outcome,
+                now,
+                http_status=result.http_status,
+                session_url=result.session_url,
+                detail=result.detail,
+            )
+        ]
+        if result.http_status == 429:
+            # The same wait the attempt gate records, so workers wait too.
+            if result.retry_after_seconds is not None:
+                wait = timedelta(seconds=min(max(result.retry_after_seconds, 0), _MAX_RETRY_AFTER))
+            else:
+                wait = self._limits.rate_limit_default_wait
+            events.append(
+                LedgerEvent(
+                    aev.RATE_LIMIT_WAIT,
+                    now,
+                    data={"not_before": (now + wait).isoformat(), "review_job": key},
+                )
+            )
+        body = result.response_body or ""
+        if result.http_status != 200 and _EXHAUSTED_RE.search(body):
+            # Usage is used up: hold the whole factory, as a worker launch would.
+            events.append(
+                LedgerEvent(
+                    aev.HOLD_SET,
+                    now,
+                    data={
+                        "reason": aev.SUBSCRIPTION_EXHAUSTED,
+                        "note": f"Set automatically from the response to review job {key}.",
+                        "automatic": True,
+                    },
+                )
+            )
         try:
             with self._store.writer_lock():
-                self._store.append(event)
+                self._store.append(*events)
         except LedgerLocked:
-            self._unwritten.setdefault(key, []).append(event)
+            self._unwritten.setdefault(key, []).extend(events)
 
     def _flush_unwritten(self) -> None:
         if not self._unwritten:
@@ -705,8 +769,9 @@ class AutoReviewer:
         _check_snapshot(gate, now, self._limits, notices, [])
         _check_window(gate, now, self._limits, notices, [])
         out = [n.detail for n in notices]
-        if job is not None and len(job.claims) >= self._policy.launches_per_job:
-            out.append(f"this review job was already tried {len(job.claims)} times")
+        tries = len(job.claims) - job.rate_limited if job is not None else 0
+        if job is not None and tries >= self._policy.launches_per_job:
+            out.append(f"this review job was already tried {tries} times")
         if job is None and len(view.cycle_jobs(cycle)) >= self._policy.max_passes:
             out.append(
                 f"this task's {self._policy.max_passes} review passes are used; more need an"
@@ -716,28 +781,52 @@ class AutoReviewer:
 
     # --- helpers --------------------------------------------------------------------
 
-    def _not_reviewable(self, attempt, number, collected: Collected, view) -> ReviewStatus:
-        head = collected.candidate.head_commit if collected.candidate else ""
-        if head and collected.problems == (f"PR #{number} is closed.",):
-            # A merged (or closed) PR, unchanged otherwise: the last verdict for
-            # its last commit still stands.
-            for record in sorted(view.verdicts.values(), key=lambda v: -v.seq):
-                if record.attempt == attempt and record.head == head:
-                    return self._from_record(record, view)
-        findings = from_reports(None, None, commit=head, problems=collected.problems)
-        return ReviewStatus(
-            ReviewState.NOT_REVIEWABLE,
+    def _not_reviewable(
+        self, attempt, cycle, rev, key, collected: Collected, view, previous
+    ) -> ReviewStatus:
+        number = rev.pr
+        if (
+            rev.head
+            and collected.problems == (f"PR #{number} is closed.",)
+            and self._merged(number)
+        ):
+            # A merged PR, otherwise unchanged: the last verdict stands if it
+            # was for exactly this revision.
+            records = [v for v in view.verdicts.values() if v.attempt == attempt]
+            latest = max(records, key=lambda v: v.seq, default=None)
+            if latest is not None and latest.key == key:
+                return self._from_record(latest, view)
+        found = from_reports(None, None, commit=rev.head, problems=collected.problems)
+        if not found:
+            found = from_reports(
+                None, None, commit=rev.head, problems=("The PR could not be read as a candidate.",)
+            )
+        # Recorded, so no earlier verdict stays the latest evidence.
+        return self._record(
             attempt,
-            number,
-            f"The factory can't review PR #{number} as it is: {' '.join(collected.problems)}",
-            findings=findings,
+            cycle,
+            rev,
+            key,
+            ReviewState.NOT_REVIEWABLE,
+            carry_forward(previous, found, evaluated=False),
+            view,
+            "The factory can't review PR #{n} as it is: {why}",
         )
 
+    def _merged(self, number: int) -> bool:
+        try:
+            pr = self._api.json(f"repos/{self._repo}/pulls/{number}")
+        except Exception:
+            return False
+        return isinstance(pr, dict) and pr.get("merged") is True
+
     def _previous_findings(self, view: ev.ReviewView, cycle: str, key: str) -> tuple[Finding, ...]:
+        """The open findings as the latest record of another revision in this
+        cycle left them (every record carries the open ones forward)."""
         records = [v for v in view.by_cycle.get(cycle, []) if v.key != key]
         if not records:
             return ()
-        return tuple(_finding(f) for f in records[-1].findings)
+        return tuple(_finding(f) for f in records[-1].findings if not f.get("resolved"))
 
     def _from_record(self, record: ev.VerdictRecord, view) -> ReviewStatus:
         rev = Revision(
@@ -772,22 +861,12 @@ class _Answer:
     http_status: int | None = None
     session_url: str | None = None
     detail: str = ""
+    retry_after_seconds: int | None = None
+    response_body: str | None = None
 
 
 def _finding(d: Mapping[str, object]) -> Finding:
-    return Finding(
-        id=str(d["id"]),
-        severity=Severity(str(d["severity"])),
-        category=str(d["category"]),
-        route=Route(str(d["route"])),
-        summary=str(d["summary"]),
-        evidence=str(d["evidence"]),
-        suggested_action=str(d["suggested_action"]),
-        commit=str(d["commit"]),
-        criterion=d.get("criterion") if isinstance(d.get("criterion"), str) else None,
-        resolved=d.get("resolved") is True,
-        source=str(d.get("source") or "verifier"),
-    )
+    return finding_from_data(d)
 
 
 def _clip(e: BaseException) -> str:

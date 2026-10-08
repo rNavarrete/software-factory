@@ -56,7 +56,8 @@ class AsOpen:
     Two things change at merge that the review relies on: the PR's state, and
     the CI run's link to the PR (GitHub empties a run's ``pull_requests`` once
     its PR is merged). The replay restores both from the PR itself; everything
-    else is read as GitHub returns it.
+    else is read as GitHub returns it. The restored link uses the PR's base as
+    GitHub shows it now, so a replay can miss CI that was stale at the time.
     """
 
     def __init__(self, api: GitHubApi, number: int, repo: str) -> None:

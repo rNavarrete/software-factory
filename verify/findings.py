@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 
@@ -64,6 +64,8 @@ class Finding:
     resolved: bool = False
     source: str = "verifier"
     """``verifier`` (computed from independent evidence) or the reviewer's login."""
+    claimed_id: str | None = None
+    """The earlier finding a reviewer says this one repeats (``adopt_ids``)."""
 
     def as_data(self) -> dict[str, object]:
         """The finding as JSON-ready data, for the ledger and the repair worker."""
@@ -100,6 +102,7 @@ def _f(
     subject: str = "",
     severity: Severity = Severity.BLOCKING,
     source: str = "verifier",
+    claimed_id: str | None = None,
 ) -> Finding:
     return Finding(
         id=finding_id(category, criterion, subject or summary),
@@ -112,12 +115,49 @@ def _f(
         commit=commit,
         criterion=criterion,
         source=source,
+        claimed_id=claimed_id,
+    )
+
+
+_ID_RE = re.compile(r"F-[0-9a-f]{12}")
+
+
+def finding_from_data(d: object) -> Finding:
+    """A finding read back from the ledger. Raises KeyError, TypeError or
+    ValueError on anything malformed, so a bad record grants nothing."""
+    if not isinstance(d, Mapping):
+        raise TypeError("a finding must be an object")
+    texts = {}
+    for key in ("id", "category", "summary", "evidence", "suggested_action", "commit", "source"):
+        value = d[key]
+        if not isinstance(value, str):
+            raise TypeError(f"finding {key} must be text")
+        texts[key] = value
+    if not _ID_RE.fullmatch(texts["id"]):
+        raise ValueError("malformed finding id")
+    criterion = d.get("criterion")
+    if criterion is not None and not isinstance(criterion, str):
+        raise TypeError("finding criterion must be text or null")
+    resolved = d.get("resolved", False)
+    if not isinstance(resolved, bool):
+        raise TypeError("finding resolved must be true or false")
+    return Finding(
+        id=texts["id"],
+        severity=Severity(d["severity"]),
+        category=texts["category"],
+        route=Route(d["route"]),
+        summary=texts["summary"],
+        evidence=texts["evidence"],
+        suggested_action=texts["suggested_action"],
+        commit=texts["commit"],
+        criterion=criterion,
+        resolved=resolved,
+        source=texts["source"],
     )
 
 
 # Gates of verify.criteria, and who fixes each one.
 _GATE_ROUTES = {
-    "branch": (Route.REPAIR, "markers", "Push to the marker branch the task names."),
     "pr title": (Route.REPAIR, "markers", "Use the PR title marker the task names."),
     "pr body": (Route.REPAIR, "markers", "Put the approved Contract-Digest line in the PR body."),
     "base": (Route.REPAIR, "base", "Start the branch from the approved base commit."),
@@ -128,7 +168,8 @@ _GATE_ROUTES = {
         "Make every verification command pass on the candidate.",
     ),
 }
-# Anything else (the contract itself, the repository) means the factory can't
+# Anything else (the contract itself, the repository, the branch: a branch
+# that isn't the attempt's, or an attempt over its approved budget) means the factory can't
 # trust what it is looking at: that is never the repair worker's to fix.
 _INTEGRITY = (Route.ROLANDO, "integrity", "Stop and check what the factory is reviewing.")
 
@@ -136,34 +177,35 @@ _INTEGRITY = (Route.ROLANDO, "integrity", "Stop and check what the factory is re
 # fixes. Every other problem means the factory can't trust what it is looking
 # at (another repository or branch, a closed PR, an author that isn't the
 # worker, evidence it can't read): Rolando's to look at.
+# Each names the gate it matches, so the same problem keeps one id whichever
+# way it was found.
 _REPAIRABLE_PROBLEMS = (
     (
         re.compile(r"^The trusted CI run \(\S+\) did not pass"),
-        "checks-failed",
-        "Make every verification command pass on the candidate.",
+        "verification commands",
     ),
+    (re.compile(r"^PR #\d+'s title is "), "pr title"),
+    (re.compile(r"^PR #\d+'s body has no single Contract-Digest line"), "pr body"),
     (
-        re.compile(r"^PR #\d+'s title is "),
-        "markers",
-        "Use the PR title marker the task names.",
-    ),
-    (
-        re.compile(r"^PR #\d+'s body has no single Contract-Digest line"),
-        "markers",
-        "Put the approved Contract-Digest line in the PR body.",
-    ),
-    (
-        re.compile(r"its results may be for an older main\. Re-run CI on the PR\.$"),
+        re.compile(
+            r"^The CI run \(\S+\) checked [0-9a-f]+ on base [0-9a-f]+, not [0-9a-f]+ on"
+            r" [0-9a-f]+: its results may be for an older main\. Re-run CI on the PR\.$"
+        ),
         "stale-ci",
-        "Bring main into the branch and push, so CI checks the current base.",
     ),
+)
+_STALE_CI = (
+    Route.REPAIR,
+    "stale-ci",
+    "Bring main into the branch and push, so CI checks the current base.",
 )
 
 
 def _problem_route(problem: str) -> tuple[Route, str, str, str]:
-    for pattern, category, action in _REPAIRABLE_PROBLEMS:
+    for pattern, gate in _REPAIRABLE_PROBLEMS:
         if pattern.search(problem):
-            return Route.REPAIR, category, action, category
+            route, category, action = _GATE_ROUTES.get(gate, _STALE_CI)
+            return route, category, action, gate
     return (
         Route.ROLANDO,
         "integrity",
@@ -364,6 +406,9 @@ def from_reviewer(
         if criterion is not None and not isinstance(criterion, str):
             raise ValueError(f"{where}.criterion must be text or absent")
         route = Route.ROLANDO if category in ("product", "security") else Route.REPAIR
+        claimed = item.get("id")
+        if claimed is not None and not (isinstance(claimed, str) and _ID_RE.fullmatch(claimed)):
+            raise ValueError(f"{where}.id must be a finding id from previous_findings or absent")
         out.append(
             _f(
                 f"review-{category}",
@@ -375,8 +420,29 @@ def from_reviewer(
                 criterion=criterion,
                 severity=Severity(severity),
                 source=reviewer,
+                claimed_id=claimed,
             )
         )
+    return _dedupe(out)
+
+
+def adopt_ids(findings: Iterable[Finding], previous: Iterable[Finding]) -> tuple[Finding, ...]:
+    """Give a reviewer's finding the earlier id it says it repeats, when that
+    id was an open finding of the same category from the same reviewer.
+    Rewording a finding then doesn't count as fixing it. Any other claimed id
+    is ignored and the finding keeps the id of what it says."""
+    earlier = {f.id: f for f in previous if not f.resolved}
+    out = []
+    for f in findings:
+        old = earlier.get(f.claimed_id or "")
+        if (
+            old is not None
+            and old.category == f.category
+            and old.source.lower() == f.source.lower()
+            and f.source != "verifier"
+        ):
+            f = replace(f, id=old.id)
+        out.append(f)
     return _dedupe(out)
 
 
@@ -387,16 +453,24 @@ def _dedupe(items: Iterable[Finding]) -> tuple[Finding, ...]:
     return tuple(seen.values())
 
 
-def carry_forward(previous: Iterable[Finding], current: Iterable[Finding]) -> tuple[Finding, ...]:
-    """The current findings, plus earlier ones the new revision no longer
-    raises, marked resolved. A resolved finding is reported once; it does not
-    keep coming back."""
+def carry_forward(
+    previous: Iterable[Finding], current: Iterable[Finding], *, evaluated: bool = True
+) -> tuple[Finding, ...]:
+    """The current findings, plus the earlier open ones the current findings
+    don't repeat.
+
+    ``evaluated`` says the current findings come from a full check of the new
+    revision (a review was read). Only then is an earlier finding the new
+    revision no longer raises marked resolved; it is reported resolved once
+    and does not keep coming back. Otherwise (CI failed or is still running,
+    no review yet) nothing was re-checked, so earlier findings stay open.
+    """
     current = tuple(current)
     now_ids = {f.id for f in current}
-    resolved = tuple(
-        replace(f, resolved=True) for f in previous if f.id not in now_ids and not f.resolved
-    )
-    return current + _dedupe(resolved)
+    left = tuple(f for f in previous if f.id not in now_ids and not f.resolved)
+    if evaluated:
+        left = tuple(replace(f, resolved=True) for f in left)
+    return current + _dedupe(left)
 
 
 def blocking(findings: Iterable[Finding]) -> tuple[Finding, ...]:
@@ -410,6 +484,8 @@ def for_route(findings: Iterable[Finding], route: Route) -> tuple[Finding, ...]:
 __all__ = [
     "REVIEWER_CATEGORIES",
     "Finding",
+    "adopt_ids",
+    "finding_from_data",
     "Route",
     "Severity",
     "blocking",

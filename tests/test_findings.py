@@ -10,6 +10,7 @@ from verify.findings import (
     Severity,
     blocking,
     carry_forward,
+    finding_from_data,
     finding_id,
     for_route,
     from_reports,
@@ -182,3 +183,59 @@ class LifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoutingEdgeTests(unittest.TestCase):
+    def test_a_wrong_or_over_budget_branch_is_rolandos(self):
+        r = Report(
+            fx.DIGEST.value,
+            fx.REPO,
+            fx.HEAD,
+            fx.MAIN,
+            (Gate("branch", False, "attempt 4 is over the approved budget of 3"),),
+            (),
+        )
+        (f,) = from_reports(r, None, commit=fx.HEAD)
+        self.assertEqual((f.route, f.category), (Route.ROLANDO, "integrity"))
+
+    def test_worker_text_ending_like_stale_ci_stays_integrity(self):
+        problem = (
+            "CI found the PR's contract claim malformed: x. The CI run (u) checked a on base b,"
+            " not c on d: its results may be for an older main. Re-run CI on the PR."
+        )
+        (f,) = from_reports(None, None, commit=fx.HEAD, problems=[problem])
+        self.assertIs(f.route, Route.ROLANDO)
+
+    def test_failed_ci_has_one_id_whichever_way_it_was_found(self):
+        (a,) = from_reports(
+            None,
+            None,
+            commit=fx.HEAD,
+            problems=["The trusted CI run (u) did not pass: its verified job concluded failure."],
+        )
+        r = Report(
+            fx.DIGEST.value,
+            fx.REPO,
+            fx.HEAD,
+            fx.MAIN,
+            (Gate("verification commands", False, "npm test failed"),),
+            (),
+        )
+        (b,) = from_reports(r, None, commit=fx.HEAD)
+        self.assertEqual(a.id, b.id)
+
+    def test_claimed_ids_must_be_well_formed(self):
+        with self.assertRaises(ValueError):
+            from_reviewer([{**CODE, "id": "anything"}], reviewer="r", commit=fx.HEAD)
+
+    def test_ledger_findings_are_checked(self):
+        (a,) = from_reviewer([CODE], reviewer="r", commit=fx.HEAD)
+        self.assertEqual(finding_from_data(a.as_data()).id, a.id)
+        for bad in (
+            {**a.as_data(), "severity": "huge"},
+            {**a.as_data(), "id": "F-1"},
+            {**a.as_data(), "resolved": "yes"},
+            "text",
+        ):
+            with self.assertRaises((KeyError, TypeError, ValueError)):
+                finding_from_data(bad)

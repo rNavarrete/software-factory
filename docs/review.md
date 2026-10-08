@@ -36,9 +36,11 @@ Every finding has these fields (`verify/findings.py`):
 - **commit**: the exact commit it was found on.
 - **resolved**
 
-When a repair pushes a new revision, the next review is a verification pass. It gets the open findings and checks them on the new commit. Findings the new revision no longer raises are marked resolved, once.
+When a repair pushes a new revision, the next review is a verification pass. It gets the open findings and checks them on the new commit. A finding is marked resolved, once, only when a review of a later revision no longer raises it. A push whose CI fails, CI that is still running, or a job that never reports leaves every open finding open.
 
-The reviewer's own finding ids are ignored. Ids come from what the finding says, so a reviewer can't mark someone else's finding resolved.
+A finding's id comes from what it says. On a verification pass the reviewer may repeat an earlier finding by its id, so rewording it doesn't count as fixing it. That id is only accepted when it names an open finding of the same category from the same reviewer, so a reviewer can't take over someone else's finding.
+
+Every result is recorded, including "waiting for CI" and "not reviewable". So once a PR is pushed again, retargeted, or closed without merging, an earlier pass is no longer the latest evidence. A merged PR keeps the verdict for its last revision only if the merged revision is exactly the one reviewed.
 
 ## Allowances
 
@@ -48,13 +50,16 @@ A job that was definitely not launched (for example, a missing start key) may be
 
 Review launches count in the same weekly fire allowance as worker launches (12 a week). They are also stopped by the same holds, the same 429 wait and the same usage reading. A launch that was rejected still counts.
 
+A 429 on a review launch records the same wait the workers obey. A 429 doesn't use up the job's own tries. A "usage limit" answer puts the whole factory on hold, as a worker launch would.
+
 ## What must be set up before it runs for real
 
 Until a reviewer account is configured, nothing is launched and the review reports "No reviewer account is set up".
 
 1. **A reviewer GitHub account.** It must be a plain user account that is not the worker's bot and not Rolando's, and it must have no access to the pilot repository. It can still comment, because the repository is public. Check it with `python3 -m controller.review qualify-identity <login>`.
 2. **A reviewer routine** with the saved prompt in `controller/review/reviewer_prompt.md`. It needs its own start key, kept in the service's secrets like the worker's. Its GitHub access must be the reviewer account. The cleanest option is a separate claude.ai account linked to the reviewer GitHub account. Running it on the factory account would post as the worker's bot, and those comments are ignored.
-3. **Service wiring.** Today the service calls `start` once when it first sees an attempt's PR. It also needs to call `check` each round, and pass the latest `evidence` into the merge record (ENG-178's `ReviewEvidence`, whose `reviewed_commit` is the verdict's exact commit). This lands after the ENG-178 PR merges.
+3. **Rolando's answers.** The review needs his recorded observations of behavior only a person can check, and his clearances of protected-control changes. Until it is given a source for them (the Linear observation replies from the progress-reporting work), a task with either stays at "needs Rolando".
+4. **Service wiring.** Today the service calls `start` once when it first sees an attempt's PR. It also needs to call `check` each round, and pass the latest `evidence` into the merge record (ENG-178's `ReviewEvidence`, whose `reviewed_commit` is the verdict's exact commit). This lands after the ENG-178 PR merges. Until then the service's "review started" message only means a review was asked for.
 
 ## Trying it without starting anything
 
@@ -69,5 +74,6 @@ This reads the PR with `gh api` as you. It uses a throwaway ledger, sends nothin
 ## Limits
 
 - The verdict rests on the CI artifacts GitHub keeps for 90 days. After that an old PR can't be reviewed again.
+- Each move of main is a new revision, so it uses a review pass. After one full and one verification pass, a further move of main needs an explicit allowance.
 - The reviewer can be the same model provider as the worker. A different provider is preferred when one is qualified (ENG-154), but the review doesn't wait for it.
 - The review job runs in its own cloud session. The factory relies on the reviewer account's lack of write access, not on the session's good behavior, to keep it from changing anything.

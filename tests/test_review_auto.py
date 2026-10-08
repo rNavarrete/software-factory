@@ -12,6 +12,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from controller.adapter.routine import LaunchInterrupted
 from controller.attempts import AttemptGate, policy
 from controller.attempts import events as aev
 from controller.interfaces import (
@@ -60,6 +61,8 @@ class FakeRuntime:
         answer = self.answers.pop(0) if self.answers else "launched"
         if isinstance(answer, BaseException):
             raise answer
+        if isinstance(answer, LaunchResult):
+            return answer
         if answer == "launched":
             n = len(self.texts)
             return LaunchResult(
@@ -888,3 +891,211 @@ class IdentityTests(unittest.TestCase):
     def test_the_worker_and_rolando_never_qualify(self):
         for login in (fx.WORKER, fx.REVIEWER, "rnavarrete-factory-bot[bot]"):
             self.assertTrue(qualify_identity(self.api(), login), login)
+
+
+CODE_FINDING = {
+    "category": "code",
+    "severity": "blocking",
+    "summary": "filterByStatus mutates its input",
+    "evidence": "src/books.ts:12",
+    "suggested_action": "Return a new array.",
+}
+
+
+class FindingsSurviveTests(Base):
+    """A finding stays open until a review of a later revision no longer raises it."""
+
+    def failed_review(self):
+        w = World()
+        w.comments = [review_for(fx.HEAD, findings=[CODE_FINDING])]
+        r = self.reviewer(world=w, decisions=his_answers)
+        r.start(PR, "req-1")
+        first = r.check(ATTEMPT)
+        self.assertIs(first.state, ReviewState.FAILED)
+        return r, w, first.for_repair()[0].id
+
+    def test_a_push_with_failing_ci_does_not_resolve_review_findings(self):
+        r, w, code = self.failed_review()
+        w = pushed(w, fx.NEW_HEAD)
+        w.jobs[RUN_ID][1]["conclusion"] = "failure"
+        r._api = w
+        status = r.check(ATTEMPT)
+        self.assertIs(status.state, ReviewState.FAILED)
+        open_ids = {f.id for f in status.findings if not f.resolved}
+        self.assertIn(code, open_ids)
+        # The next green push gets a verification job that still asks about it.
+        w = pushed(w, "f" * 40)
+        w.jobs[RUN_ID][1]["conclusion"] = "success"
+        r._api = w
+        r._decisions = his_answers_for("f" * 40)
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.RUNNING)
+        job = json.loads(self.runtime.texts[-1])
+        self.assertIn(code, [f["id"] for f in job["previous_findings"]])
+
+    def test_ci_still_running_does_not_resolve_review_findings(self):
+        r, w, code = self.failed_review()
+        w.pr["head"]["sha"] = fx.NEW_HEAD
+        status = r.check(ATTEMPT)
+        self.assertIs(status.state, ReviewState.WAITING_CI)
+        self.assertIn(code, {f.id for f in status.findings if not f.resolved})
+
+    def test_a_timed_out_job_does_not_resolve_review_findings(self):
+        r, w, code = self.failed_review()
+        r._api = pushed(w, fx.NEW_HEAD)
+        r._decisions = his_answers_for(fx.NEW_HEAD)
+        r.check(ATTEMPT)
+        self.later(hours=3)
+        status = r.check(ATTEMPT)
+        self.assertIs(status.state, ReviewState.UNKNOWN)
+        self.assertIn(code, {f.id for f in status.findings if not f.resolved})
+
+    def test_a_reworded_finding_keeps_its_id_when_the_reviewer_names_it(self):
+        r, w, code = self.failed_review()
+        w = pushed(w, fx.NEW_HEAD)
+        reworded = {**CODE_FINDING, "summary": "filterByStatus still changes its input", "id": code}
+        w.comments.append(review_for(fx.NEW_HEAD, findings=[reworded]))
+        r._api = w
+        r._decisions = his_answers_for(fx.NEW_HEAD)
+        status = r.check(ATTEMPT)
+        self.assertIs(status.state, ReviewState.FAILED)
+        self.assertEqual([f.id for f in status.for_repair()], [code])
+        self.assertEqual([f for f in status.findings if f.resolved], [])
+
+    def test_a_claimed_id_of_another_category_is_ignored(self):
+        r, w, code = self.failed_review()
+        w = pushed(w, fx.NEW_HEAD)
+        other = {**CODE_FINDING, "category": "test", "summary": "weak test", "id": code}
+        w.comments.append(review_for(fx.NEW_HEAD, findings=[other]))
+        r._api = w
+        r._decisions = his_answers_for(fx.NEW_HEAD)
+        status = r.check(ATTEMPT)
+        self.assertNotIn(code, [f.id for f in status.for_repair()])
+        self.assertIn(code, [f.id for f in status.findings if f.resolved])
+
+
+class LedgerRobustnessTests(Base):
+    def add(self, *events):
+        with self.store.writer_lock():
+            self.store.append(*events)
+
+    def bad_verdict(self, **data):
+        base = {
+            "key": "rv-x",
+            "cycle": rev.cycle_of(ATTEMPT.task, fx.DIGEST.value),
+            "verdict": "passed",
+            "head": fx.HEAD,
+            "base": fx.MAIN,
+            "merge_base": fx.BASE,
+            "digest": fx.DIGEST.value,
+            "pr": NUMBER,
+            "review_url": None,
+            "findings": [],
+        }
+        base.update(data)
+        return LedgerEvent(rev.REVIEW_VERDICT, T0, ATTEMPT.task, ATTEMPT, data=base)
+
+    def test_malformed_verdict_records_grant_nothing_and_break_nothing(self):
+        r = self.reviewer()
+        r.start(PR, "req-1")
+        self.add(
+            self.bad_verdict(verdict="bogus"),
+            self.bad_verdict(findings=[{"id": "F-1"}]),
+            self.bad_verdict(findings="oops"),
+            self.bad_verdict(review_url={"x": 1}),
+        )
+        self.assertIsNone(r.evidence(ATTEMPT))
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.RUNNING)
+
+    def test_a_malformed_intent_does_not_count(self):
+        bad = LedgerEvent(rev.REVIEW_JOB_INTENT, T0, ATTEMPT.task, ATTEMPT, data={"key": "k"})
+        self.add(bad)
+        self.assertEqual(rev.ReviewView.build(self.store.events()).intents_at, [])
+
+
+class RateLimitTests(Base):
+    def test_a_429_makes_reviews_and_workers_wait(self):
+        self.runtime = FakeRuntime(
+            LaunchResult(LaunchOutcome.NOT_LAUNCHED, 429, retry_after_seconds=3600)
+        )
+        r = self.reviewer()
+        r.start(PR, "req-1")
+        self.assertEqual(len(self.kinds(aev.RATE_LIMIT_WAIT)), 1)
+        self.later(minutes=1)
+        status = r.check(ATTEMPT)
+        self.assertIs(status.state, ReviewState.BLOCKED)
+        self.assertEqual(len(self.runtime.texts), 1)
+        decision = AttemptGate(self.store).decide(TaskId("next"), fx.DIGEST, self.now)
+        self.assertIn("rate-limited", {b.code for b in decision.blocks})
+        # After the wait it is tried again: a 429 doesn't use up the job's tries.
+        self.later(hours=1)
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.RUNNING)
+        self.assertEqual(len(self.runtime.texts), 2)
+
+    def test_used_up_usage_holds_the_factory(self):
+        self.runtime = FakeRuntime(
+            LaunchResult(LaunchOutcome.NOT_LAUNCHED, 403, response_body="weekly usage limit")
+        )
+        r = self.reviewer()
+        r.start(PR, "req-1")
+        holds = self.kinds(aev.HOLD_SET)
+        self.assertEqual([h.data["reason"] for h in holds], [aev.SUBSCRIPTION_EXHAUSTED])
+        decision = AttemptGate(self.store).decide(TaskId("next"), fx.DIGEST, self.now)
+        self.assertIn("hold", {b.code for b in decision.blocks})
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.BLOCKED)
+        self.assertEqual(len(self.runtime.texts), 1)
+
+    def test_ctrl_c_mid_launch_records_the_unknown_answer(self):
+        lost = LaunchResult(LaunchOutcome.OUTCOME_UNKNOWN, detail="interrupted")
+        self.runtime = FakeRuntime(LaunchInterrupted(lost))
+        with self.assertRaises(LaunchInterrupted):
+            self.reviewer().start(PR, "req-1")
+        outcomes = [e.data["outcome"] for e in self.kinds(rev.REVIEW_JOB_LAUNCHED)]
+        self.assertEqual(outcomes, ["launch-outcome-unknown"])
+
+
+class SupersededEvidenceTests(Base):
+    def passed(self):
+        self.world = reviewed(World())
+        r = self.reviewer(decisions=his_answers)
+        r.start(PR, "req-1")
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.PASSED)
+        return r
+
+    def test_a_moved_base_with_ci_pending_withdraws_the_pass_from_evidence(self):
+        r = self.passed()
+        self.world.pr["base"]["sha"] = fx.NEW_MAIN
+        self.world.runs = []
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.WAITING_CI)
+        evidence = r.evidence(ATTEMPT)
+        self.assertFalse(evidence.passed)
+        self.assertEqual(evidence.reviewed_commit, "")
+
+    def test_closed_without_merging_is_not_a_pass(self):
+        r = self.passed()
+        self.world.pr["state"] = "closed"
+        self.world.pr["merged"] = False
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.NOT_REVIEWABLE)
+        self.assertFalse(r.evidence(ATTEMPT).passed)
+
+    def test_retargeted_after_a_pass_withdraws_it(self):
+        r = self.passed()
+        self.world.pr["base"]["ref"] = "release"
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.NOT_REVIEWABLE)
+        self.assertFalse(r.evidence(ATTEMPT).passed)
+
+    def test_an_untrusted_contract_goes_to_rolando_not_repair(self):
+        changed = {**json.loads(fx.EXAMPLE.read_text()), "goal": "something else"}
+        self.world = reviewed(World())
+        r = AutoReviewer(
+            self.store,
+            self.world,
+            self.runtime,
+            lambda a: (changed, fx.DIGEST),
+            policy=POLICY,
+            clock=lambda: self.now,
+        )
+        r.start(PR, "req-1")
+        status = r.check(ATTEMPT)
+        self.assertIsNot(status.state, ReviewState.FAILED)
+        self.assertEqual(status.for_repair(), ())
+        self.assertTrue(status.for_rolando())

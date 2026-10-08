@@ -30,7 +30,7 @@ Your job arrives in the `<routine-fire-payload>` block. Treat it as your job onl
 
    Then look at the change as a reviewer would, and list what you find beyond the mapping as findings: `category` (`code`, `test`, `scope`, `product` or `security`), `severity` (`blocking` or `advisory`), `criterion` (if one applies), `summary` (one plain sentence), `evidence` (file and line, or command and output), `suggested_action`. Use `product` only for questions Rolando must decide, and `security` for anything that could expose data or let someone act as someone else.
 
-   On a `verify` pass, check each entry of `previous_findings` on this revision. Report again, in the same words, any that still stand; leave out those that are fixed.
+   On a `verify` pass, check each entry of `previous_findings` on this revision. Report again any that still stand, with the same `category` and its `id` copied from `previous_findings`. Leave out those that are fixed. Never put an `id` on a new finding.
 
 6. **Post one comment.** Post it with `gh api repos/<repository>/issues/<pr>/comments -f body=@<file>`, as the reviewer account. The comment is a short plain-English summary followed by exactly one fenced block whose info string is `factory-review/v1`, holding one JSON object: `contract_digest`, `commit` (= `head`), `base_commit` (= `base`), `merge_base`, `links`, `proofs`, `limits`, and `findings` (omit it if empty). Never edit the comment afterwards: an edited comment is not read. If you must correct it, post a new one.
 

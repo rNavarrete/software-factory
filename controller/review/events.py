@@ -22,12 +22,27 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from controller.interfaces import AttemptId, LaunchOutcome, LedgerEvent, StoredEvent, TaskId
+from verify.findings import finding_from_data
 
 REVIEW_WATCH = "review-watch"
 REVIEW_JOB_INTENT = "review-job-intent"
 REVIEW_JOB_LAUNCHED = "review-job-launched"
 REVIEW_VERDICT = "review-verdict"
 KINDS = frozenset({REVIEW_WATCH, REVIEW_JOB_INTENT, REVIEW_JOB_LAUNCHED, REVIEW_VERDICT})
+
+# Every verdict a record may hold (controller.review.reviewer.ReviewState).
+VERDICTS = frozenset(
+    {
+        "waiting-for-ci",
+        "running",
+        "passed",
+        "failed",
+        "needs-rolando",
+        "blocked",
+        "unknown",
+        "not-reviewable",
+    }
+)
 
 PASS_FULL = "full"
 PASS_VERIFY = "verify"
@@ -48,6 +63,9 @@ class Job:
     """When each launch was claimed (an intent written)."""
     outcomes: tuple[tuple[str, datetime, str], ...] = ()
     """(outcome, when, detail) for each launch whose answer was recorded."""
+    rate_limited: int = 0
+    """Launches the runtime turned away with a 429. They count against the
+    weekly allowance, but not against the job's own launch tries."""
 
     @property
     def unanswered(self) -> bool:
@@ -116,22 +134,20 @@ class ReviewView:
             self.watches.setdefault(e.attempt, (int(d["pr"]), str(d["request"])))
         elif e.kind == REVIEW_JOB_INTENT:
             key = str(d["key"])
-            self.intents_at.append(e.at)
+            job = Job(
+                key,
+                e.attempt,
+                str(d["cycle"]),
+                str(d["pass"]),
+                int(d["number"]),
+                int(d["pr"]),
+                str(d["head"]),
+                str(d["base"]),
+                (e.at,),
+            )
             old = self.jobs.get(key)
-            if old is None:
-                self.jobs[key] = Job(
-                    key,
-                    e.attempt,
-                    str(d["cycle"]),
-                    str(d["pass"]),
-                    int(d["number"]),
-                    int(d["pr"]),
-                    str(d["head"]),
-                    str(d["base"]),
-                    (e.at,),
-                )
-            else:
-                self.jobs[key] = replace(old, claims=old.claims + (e.at,))
+            self.jobs[key] = job if old is None else replace(old, claims=old.claims + (e.at,))
+            self.intents_at.append(e.at)
         elif e.kind == REVIEW_JOB_LAUNCHED:
             key = str(d["key"])
             job = self.jobs[key]
@@ -139,9 +155,18 @@ class ReviewView:
                 return  # an answer with no claim waiting for it grants nothing
             outcome = LaunchOutcome(str(d["outcome"])).value
             self.jobs[key] = replace(
-                job, outcomes=job.outcomes + ((outcome, e.at, str(d.get("detail") or "")),)
+                job,
+                outcomes=job.outcomes + ((outcome, e.at, str(d.get("detail") or "")),),
+                rate_limited=job.rate_limited + (d.get("http_status") == 429),
             )
         elif e.kind == REVIEW_VERDICT:
+            if d["verdict"] not in VERDICTS:
+                raise ValueError(f"unknown verdict {d['verdict']!r}")
+            findings = d.get("findings") or []
+            if not isinstance(findings, (list, tuple)):
+                raise TypeError("findings must be a list")
+            for f in findings:
+                finding_from_data(f)  # raises on anything malformed
             record = VerdictRecord(
                 key=str(d["key"]),
                 attempt=e.attempt,
@@ -152,7 +177,7 @@ class ReviewView:
                 merge_base=str(d["merge_base"]),
                 digest=str(d["digest"]),
                 pr=int(d["pr"]),
-                review_url=d.get("review_url") or None,
+                review_url=_url(d.get("review_url")),
                 findings=tuple(d.get("findings") or ()),
                 at=e.at,
                 seq=item.seq,
@@ -276,6 +301,7 @@ __all__ = [
     "REVIEW_JOB_LAUNCHED",
     "REVIEW_VERDICT",
     "REVIEW_WATCH",
+    "VERDICTS",
     "Job",
     "ReviewView",
     "VerdictRecord",
@@ -285,3 +311,11 @@ __all__ = [
     "verdict",
     "watch",
 ]
+
+
+def _url(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise TypeError("review_url must be text")
+    return value
