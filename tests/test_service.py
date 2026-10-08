@@ -756,3 +756,81 @@ class NoSidePathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QualificationRunTests(unittest.TestCase):
+    """The deployed qualification run, end to end through ``main``: its own
+    home, secret files, the fixture folder, the fake worker. GitHub reads are
+    stubbed; nothing touches the network."""
+
+    FIXTURES = Path(__file__).parents[1] / "deploy" / "qualification"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name) / "home"
+        secrets = Path(tmp.name) / "secrets"
+        env = {"HOME": str(self.home), "FACTORY_SECRETS_DIR": str(secrets)}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        service_main.install_secrets(
+            secrets,
+            {env_name("approval-key"): "cd" * 32, env_name("github-token"): GH_TOKEN},
+        )
+        for target, value in (
+            ("controller.dispatch.GhBaseCheck.on_branch", True),
+            ("controller.recovery.GhCliReader.branch_head", None),
+            ("controller.recovery.GhCliReader.pulls_for_branch", []),
+            ("controller.recovery.GhCliReader.recent_pulls", []),
+        ):
+            p = mock.patch(target, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.args = [
+            "--fixtures",
+            str(self.FIXTURES),
+            "--onboarding",
+            str(self.FIXTURES / "onboarding.json"),
+        ]
+
+    def ledger(self):
+        return SqliteLedgerStore(self.home / ".software-factory" / "ledger.db")
+
+    def rolando_prepares(self):
+        """His two steps over ``fly ssh console``: approve the fixture contract
+        and record a usage reading."""
+        import json
+
+        store = self.ledger()
+        now = datetime.now(UTC)
+        contract = json.loads((self.FIXTURES / "contracts" / "QUAL-1.json").read_text())
+        Approvals(store, StaticKey(bytes.fromhex("cd" * 32)), confirm=yes).approve(contract, now)
+        AttemptGate(store).record_snapshot(now, 10, 20, 0, now)
+        store.close()
+
+    def fires(self):
+        store = self.ledger()
+        try:
+            return [s.event for s in store.events() if s.event.kind == ev.FIRE_INTENT]
+        finally:
+            store.close()
+
+    def test_unapproved_fixture_waits(self):
+        self.assertEqual(service_main.main(["once", *self.args]), 0)
+        self.assertEqual(self.fires(), [])
+
+    def test_approved_fixture_fires_once_across_restarts(self):
+        self.rolando_prepares()
+        for _ in range(3):  # three separate service processes
+            self.assertEqual(service_main.main(["once", *self.args]), 0)
+        fires = self.fires()
+        self.assertEqual(len(fires), 1)
+        self.assertEqual(str(fires[0].run), "qual-1-a1-f1")
+        backups = list((self.home / ".software-factory" / "backups").glob("ledger-*.db"))
+        self.assertTrue(backups)
+        self.assertTrue((self.home / ".software-factory" / "service.heartbeat").exists())
+
+    def test_missing_secrets_dir_does_not_start(self):
+        with mock.patch.dict(os.environ, {"FACTORY_SECRETS_DIR": ""}):
+            self.assertEqual(service_main.main(["once", *self.args]), 4)

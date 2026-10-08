@@ -1,0 +1,20 @@
+# The factory's background service (ENG-194). Deploy from the repo root:
+#   fly deploy . --config deploy/fly/fly.toml --dockerfile deploy/fly/Dockerfile --ha=false
+app = "rnavarrete-factory"
+primary_region = "iad"
+
+[build]
+
+# The ledger, backups, contracts and onboarding file live on this volume.
+# A volume attaches to one machine only, so a second copy can't run.
+[mounts]
+  source = "factory_data"
+  destination = "/data"
+
+[[restart]]
+  policy = "always"
+  retries = 10
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

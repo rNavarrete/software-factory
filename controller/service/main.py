@@ -5,8 +5,8 @@
     python3 -m controller.service status                 the queue and outbox
     python3 -m controller.service install-secrets        host start-up step
 
-Everything lives under the factory home (``$FACTORY_HOME``, default
-``~/.software-factory``): ``ledger.db``, ``backups/``, ``contracts/``,
+Everything lives under the factory home (``~/.software-factory``, the same
+folder the ``python3 -m controller`` commands use): ``ledger.db``, ``backups/``, ``contracts/``,
 ``onboarding.json``, ``service.heartbeat`` and ``service.lock``. Secrets come
 from ``$FACTORY_SECRETS_DIR`` (one 0400 file each, see secrets.py).
 
@@ -42,7 +42,6 @@ log = logging.getLogger("factory.service")
 
 DEFAULT_INTERVAL = 60
 SECRETS_DIR_ENV = "FACTORY_SECRETS_DIR"
-HOME_ENV = "FACTORY_HOME"
 
 
 class AlreadyRunning(Exception):
@@ -50,7 +49,10 @@ class AlreadyRunning(Exception):
 
 
 def home() -> Path:
-    return Path(os.environ.get(HOME_ENV) or "~/.software-factory").expanduser()
+    """The same folder the ``python3 -m controller`` commands use."""
+    from controller.ledger.store import DEFAULT_HOME
+
+    return DEFAULT_HOME.expanduser()
 
 
 @contextmanager
@@ -170,7 +172,7 @@ def build(args: argparse.Namespace):
         reviewer=fixtures.RecordingReviewer(),
         repair=fixtures.NoRepair(),
     )
-    config_path = root / "onboarding.json"
+    config_path = Path(args.onboarding) if args.onboarding else root / "onboarding.json"
     service = Service(
         store,
         dispatcher,
@@ -183,7 +185,7 @@ def build(args: argparse.Namespace):
         backup=backup,
         instance=os.environ.get("FLY_MACHINE_ID", os.uname().nodename),
     )
-    return service
+    return service, store
 
 
 def run_forever(
@@ -229,11 +231,11 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--fixtures", required=True, help="folder with events.json and contracts/")
         s.add_argument("--real-runtime", dest="fake_runtime", action="store_false")
         s.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
+        s.add_argument("--onboarding", help="mapping file (default: onboarding.json in the home)")
     sub.add_parser("status")
     s = sub.add_parser("install-secrets")
     s.add_argument("target", type=Path)
     args = p.parse_args(sys.argv[1:] if argv is None else argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     if args.cmd == "install-secrets":
         names = install_secrets(args.target)
@@ -253,13 +255,16 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, on_signal)
     try:
         with service_lock(home()):
-            service = build(args)
-            if args.cmd == "once":
-                report = service.tick()
-                print(json.dumps(report.__dict__, default=str, indent=2))
-                return 1 if report.errors else 0
-            run_forever(service.tick, args.interval, lambda: stopping)
-            return 0
+            service, store = build(args)
+            try:
+                if args.cmd == "once":
+                    report = service.tick()
+                    print(json.dumps(report.__dict__, default=str, indent=2))
+                    return 1 if report.errors else 0
+                run_forever(service.tick, args.interval, lambda: stopping)
+                return 0
+            finally:
+                store.close()
     except AlreadyRunning as e:
         print(f"Not started: {e}.", file=sys.stderr)
         return 3

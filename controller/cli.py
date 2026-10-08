@@ -61,7 +61,13 @@ class Controller:
 
 
 def _real() -> Controller:
-    from controller.approval import ContractStore, KeychainKey
+    """On the Mac: Keychain keys and Rolando's ``gh`` login. On the service host
+    (``FACTORY_SECRETS_DIR`` set): the host's own secret files and its read-only
+    GitHub token (see controller/service/secrets.py). Decisions are still
+    confirmed by typing the code at a terminal in both places."""
+    import os
+
+    from controller.approval import ContractStore, KeychainKey, StaticKey
     from controller.dispatch import GhBaseCheck
     from controller.ledger import SqliteLedgerStore
     from controller.ledger.store import DEFAULT_HOME
@@ -70,15 +76,29 @@ def _real() -> Controller:
     store = SqliteLedgerStore()  # ~/.software-factory, created 0700
     backups = DEFAULT_HOME.expanduser() / "backups"
     gate = AttemptGate(store)
-    approvals = Approvals(store, KeychainKey(), contracts=ContractStore())
-    recovery = Recovery(store, approvals, GhCliReader(), gate=gate)
+    host = os.environ.get("FACTORY_SECRETS_DIR")
+    extra: dict[str, object] = {}
+    if host:
+        from controller.service.github_http import HttpGhRunner
+        from controller.service.secrets import FileSecrets, approval_key_bytes
+
+        secrets = FileSecrets(host)
+        key = StaticKey(approval_key_bytes(secrets))
+        gh = HttpGhRunner(lambda: secrets.get("github-token"))
+        reader, base = GhCliReader(run=gh), GhBaseCheck(run=gh)
+        extra["start_key"] = lambda trig: secrets.get("routine-token")
+    else:
+        key, reader, base = KeychainKey(), GhCliReader(), GhBaseCheck()
+    approvals = Approvals(store, key, contracts=ContractStore())
+    recovery = Recovery(store, approvals, reader, gate=gate)
     dispatcher = Dispatcher(
         store,
         approvals,
         recovery,
         gate,
-        GhBaseCheck(),
+        base,
         backup=lambda now: store.backup(backups, now),
+        **extra,  # type: ignore[arg-type]
     )
     return Controller(store, approvals, recovery, gate, dispatcher)
 

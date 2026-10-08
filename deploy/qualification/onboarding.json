@@ -1,0 +1,24 @@
+{
+  "format": "factory-onboarding/v1",
+  "intake_enabled": true,
+  "projects": [
+    {
+      "linear_project_id": "qualification",
+      "name": "Qualification fixture",
+      "repository": "rNavarrete/factory-pilot-demo",
+      "routine_id": "trig_01CHWbQ267i1CMLGUym1kGd9",
+      "allowed_actions": [
+        "modify-files",
+        "add-files",
+        "add-tests"
+      ],
+      "checks": [
+        "npm run typecheck",
+        "npm test",
+        "npm run build"
+      ],
+      "max_attempts": 2,
+      "status_issue_id": "qual-status"
+    }
+  ]
+}
