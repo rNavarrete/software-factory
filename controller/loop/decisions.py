@@ -62,6 +62,17 @@ def flag_names(flag: str) -> tuple[str, ...]:
     return tuple(sorted(n for n in names if n))
 
 
+def flag_label(flag: str) -> str:
+    """The short name to show Rolando for what ``flag`` points at."""
+    _, _, subject = flag.partition(":")
+    first = subject.split(_SEP)[0].strip()
+    if subject.strip() == "ci-report":
+        return "the CI report"
+    if "/" in first or "." in first:
+        return first.rsplit("/", 1)[-1]
+    return subject.strip()
+
+
 def names_flag(flag: str, note: str) -> bool:
     """Whether ``note`` names what ``flag`` points at (see ``flag_names``)."""
     text = note.lower()

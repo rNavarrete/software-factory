@@ -15,7 +15,13 @@ import unittest
 from controller.approval import ApprovalRefused
 from controller.ledger import kinds
 from controller.loop.check import assess
-from controller.loop.decisions import CLEARED, ReviewDecisions, flag_names, names_flag
+from controller.loop.decisions import (
+    CLEARED,
+    ReviewDecisions,
+    flag_label,
+    flag_names,
+    names_flag,
+)
 from controller.loop.loop import EXIT_READY, EXIT_STOPPED, EXIT_WAITING, _look_hint
 from redteam import fixtures as fx
 from tests.github_world import ATTEMPT, NUMBER, REPO, World
@@ -58,6 +64,17 @@ class FlagNamesTests(unittest.TestCase):
         ):
             with self.subTest(note=note):
                 self.assertFalse(names_flag(flag, note))
+
+    def test_the_label_shown_is_one_of_the_names(self):
+        for flag in (
+            "changed-test:tests/books.test.ts",
+            "may-not-run:tests/books.test.ts > filterByStatus > keeps order",
+            "passes-without-change:ac4",
+            "control-change:ci-report",
+            "control-change:.github/workflows/ci.yml",
+        ):
+            with self.subTest(flag=flag):
+                self.assertTrue(names_flag(flag, f"Looked at {flag_label(flag)}: fine."))
 
     def test_criterion_flag_needs_the_criterion_id(self):
         self.assertTrue(names_flag("passes-without-change:ac4", "ac4: accepted, weak test"))

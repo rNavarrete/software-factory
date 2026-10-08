@@ -49,7 +49,7 @@ from controller.interfaces import AttemptId, ContractDigest, LedgerStore, TaskId
 from controller.ledger import kinds, records
 from controller.loop.check import CHECK_NAME, Assessment, assess, render
 from controller.loop.collect import GitHubApi, GitHubUnreadable, collect
-from controller.loop.decisions import ReviewDecisions, Timer, flag_names, names_flag
+from controller.loop.decisions import ReviewDecisions, Timer, flag_label, flag_names, names_flag
 from controller.recovery import FINISHED, PILOT_REPO, Recovery, RecoveryRefused, State
 from verify.criteria import Verdict, _permitted
 
@@ -339,11 +339,18 @@ class Loop:
                 self.now(),
             )
             asked = True
-        for f in a.open_flags():
+        flags = a.open_flags()
+        if flags:
+            self.say(
+                "\n---- Flags: each one is about the code or tests in the PR, not the"
+                " behavior above ----"
+            )
+        for f in flags:
+            name = flag_label(f.key)
             answer = self.timer.timed(
-                lambda f=f: self.asker.ask(
+                lambda f=f, name=name: self.asker.ask(
                     f"\nNeeds your eyes ({f.key}):\n  {f.detail}\n"
-                    "If you've looked and it's fine, type a few words on what you checked"
+                    f"If you've looked and it's fine, say what you checked in {name}"
                     " (Enter to leave it open): "
                 ),
                 f"looked at flag {f.key} on PR #{a.collected.pr_number}",
