@@ -1,8 +1,8 @@
 {
   "format": "factory-onboarding/v1",
-  "intake_enabled": false,
+  "intake_enabled": true,
   "approver_linear_user_id": "cd9ec650-f957-4f25-b5f0-9c14bcae49c8",
-  "intake_since": "2026-10-09T00:00:00+00:00",
+  "intake_since": "2026-10-08T23:30:00+00:00",
   "projects": [
     {
       "linear_project_id": "58d48e11-3a45-4431-92b7-19b51a4e9539",
@@ -20,11 +20,17 @@
         "npm run build"
       ],
       "max_attempts": 2,
+      "repair_allowance": 1,
+      "repair_allowance_since": "2026-10-08T23:30:00+00:00",
+      "status_issue_id": "21f299b2-cf1f-4cfe-8182-0fd4ffeb1cc1",
       "issues": [
         "ENG-187",
         "ENG-188",
         "ENG-189",
-        "ENG-191"
+        "ENG-191",
+        "ENG-200",
+        "ENG-201",
+        "ENG-202"
       ],
       "skip_labels": [
         "baseline"

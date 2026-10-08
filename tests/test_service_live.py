@@ -455,13 +455,16 @@ class PackagedImageTests(unittest.TestCase):
 class ShippedFilesTests(unittest.TestCase):
     """What the start script runs with FACTORY_MODE=live."""
 
-    def test_pilot_onboarding_keeps_intake_off(self):
+    def test_pilot_onboarding_turns_intake_on_only_from_a_fixed_time(self):
+        # Switched on for the go-live run (docs/go-live.md); moves before
+        # intake_since are never read.
         config = onboarding.load(
             ROOT / "deploy" / "pilot" / "onboarding.json",
             repository=PILOT_REPO,
             routine_id=FACTORY_ROUTINE,
         )
-        self.assertFalse(config.intake_enabled)
+        self.assertTrue(config.intake_enabled)
+        self.assertIsNotNone(config.intake_since)
         self.assertEqual(config.approver_linear_user_id, service_main.ROLANDO_LINEAR_ID)
 
     def test_pilot_drafting_policy_covers_every_onboarded_project(self):

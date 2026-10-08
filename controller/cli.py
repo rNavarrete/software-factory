@@ -42,7 +42,7 @@ from pathlib import Path
 from controller import contract as contracts
 from controller.approval import ApprovalRefused, Approvals
 from controller.attempts import AttemptGate
-from controller.attempts.events import ClearingBasis
+from controller.attempts.events import FIRE_INTENT, ClearingBasis
 from controller.attempts.policy import LedgerView
 from controller.dispatch import Dispatcher, Refused
 from controller.interfaces import AttemptId, LedgerLocked, LedgerStore, TaskId
@@ -279,6 +279,18 @@ def _status(c: Controller, task: str | None, now: datetime) -> None:
         print(f"Blocks new work: {b.detail} [{b.code}]")
     for a in c.gate.run_alerts(now):
         print(f"Alert: {a.detail}")
+    for reason in view.holds:
+        print(f"Hold: {reason}")
+    snap = view.snapshot
+    if snap is None:
+        print("Usage reading: none recorded")
+    else:
+        print(
+            f"Usage reading: {snap.taken_at:%Y-%m-%d %H:%M} UTC, session {snap.session_pct:g}%,"
+            f" weekly {snap.weekly_pct:g}%"
+        )
+    fires = [s for s in c.store.events() if s.event.kind == FIRE_INTENT]
+    print(f"Worker starts on record: {len(fires)}")
 
 
 def _print_attempt(a) -> None:

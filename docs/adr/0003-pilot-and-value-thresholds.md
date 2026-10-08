@@ -19,8 +19,8 @@ The pilot runs on a **new, purpose-built public demo repository**, not on a prod
 | Stack | TypeScript, Vite, Vitest (jsdom), no framework. Data in browser localStorage, no backend, no secrets |
 | Existing checks | `.github/workflows/ci.yml`: `npm ci`, typecheck, tests, build on every PR and on main. ENG-140 hardens this into the trusted independent check |
 | Access model | Rolando owns the repo. The worker pushes branches and opens PRs only under the ENG-183 factory identity via ENG-180's GitHub access. The Claude GitHub App must be installed on this repo. Rolando approves PRs and merges (ADR 0001 §4). Auto-fix stays off on every PR (ADR 0001 §9.6). Because the repo is public, anyone can open fork PRs; their CI runs read-only with no secrets, which is harmless, and the factory ignores PRs it did not open |
-| Release destination | GitHub Pages, through `.github/workflows/release.yml`. It runs only on manual `workflow_dispatch`, and its `deploy` job uses the `github-pages` environment. Merging never deploys |
-| Release gate | Because the repo is **public**, GitHub environment required reviewers are available on every plan (ADR 0001 §9.5). ENG-142 adds Rolando as the only required reviewer on `github-pages`, with self-review allowed for him and no bypass. The environment's deployment branches are limited to `main`, and before approving, Rolando checks that the run's commit SHA is the one that passed CI. That binds the release to the exact tested commit (ADR 0001 §5.3). Pages source must be set to "GitHub Actions" |
+| Release destination | GitHub Pages, through `.github/workflows/release.yml`. It runs only on manual `workflow_dispatch`, and its `deploy` job uses the `github-pages` environment. Merging never deploys. *Superseded 2026-10-08: the release still runs only on manual `workflow_dispatch` from `release.yml`, but it now uses the pilot repo's `release` environment and publishes to a separate site repository ([control-audit.md](../control-audit.md), G-F4)* |
+| Release gate | Because the repo is **public**, GitHub environment required reviewers are available on every plan (ADR 0001 §9.5). ENG-142 adds Rolando as the only required reviewer on `github-pages` (*now the `release` environment, see the row above*), with self-review allowed for him and no bypass. The environment's deployment branches are limited to `main`, and before approving, Rolando checks that the run's commit SHA is the one that passed CI. That binds the release to the exact tested commit (ADR 0001 §5.3). Pages source must be set to "GitHub Actions" |
 
 **Why a demo repo:** it is small and reversible, and nothing real can break. Tests, CI and a release path exist before the factory starts. Both arms of the comparison work on the same unfamiliar codebase. Going public resolves the release-gate limitation in ADR 0001 §9.5 at no cost.
 
@@ -31,6 +31,8 @@ The pilot runs on a **new, purpose-built public demo repository**, not on a prod
 ## 3. Pilot tasks
 
 Linear project: [Factory Pilot Demo](https://linear.app/rolando-projects/project/factory-pilot-demo-741b375d401e). This is a list Rolando picks from by hand, not an intake queue (ADR 0001 §7).
+
+*Superseded 2026-10-08 in part:* Rolando still picks by hand, now by moving a ticket to Todo. Only tickets listed in `deploy/pilot/onboarding.json` can start work. The baseline tickets are not listed, so a Todo move on them is refused ([intake.md](../intake.md#baseline-tickets), [ADR 0001 §12](0001-operating-model.md#12-authorization-policy-v2-2026-10-08-todo-move-as-approval)).
 
 | Pair | Kind | Baseline arm (current workflow, ENG-184) | Factory arm (ENG-161) | Difficulty difference |
 |---|---|---|---|---|
@@ -97,7 +99,7 @@ Across the pairs the difficulty differences roughly cancel out (factory arm hard
 
 ## 8. What other tickets inherit
 
-- **ENG-139/140/141/142/143** work in `rNavarrete/factory-pilot-demo`. ENG-142 configures the `github-pages` environment reviewer, the main ruleset, and the `workflow_dispatch` permissions.
+- **ENG-139/140/141/142/143** work in `rNavarrete/factory-pilot-demo`. ENG-142 configures the `github-pages` environment reviewer (*now the `release` environment, 2026-10-08*), the main ruleset, and the `workflow_dispatch` permissions.
 - **ENG-180** installs the Claude GitHub App and bot access on this repo.
 - **ENG-184** records baseline minutes on the four baseline-arm tasks, following the run order in §4.
 
@@ -107,3 +109,4 @@ Across the pairs the difficulty differences roughly cancel out (factory arm hard
 - Write-up signed off by Rolando: "ok" in the ENG-137 thread, 2026-10-07 22:51Z, before any build work in the pilot repo.
 - Critic pass (separate reviewer agent, 2026-10-07): all four criteria answered after fixes; no conflict with ADR 0001.
 - Rolando's active time on ENG-137: about 5 minutes (two decisions, creating the repo, one sign-off).
+- Post-sign-off notes (2026-10-08): the *Superseded 2026-10-08* notes record the release environment change and Linear intake (ADR 0001 §12). The pilot repo, tasks, run order and thresholds are unchanged.

@@ -452,7 +452,7 @@ CONTROLS: tuple[Control, ...] = (
             "tests.test_attempts.StopProcedureTest.test_procedure_separates_the_three_kinds_of_stop",
             "tests.test_attempts.AttemptGateTests.test_automated_repair_is_refused",
         ),
-        note="Advisory: there is no way to stop a running cloud session except by hand (controller/attempts/stop-procedure.md says so), so automated repair stays refused.",
+        note="Advisory: there is no way to stop a running cloud session except by hand (controller/attempts/stop-procedure.md says so), so open-ended automated repair stays refused; only the bounded repair within a Todo move's allowance runs, after Rolando records that the earlier worker finished (G-C2, docs/repair.md).",
     ),
     Control(
         "G-C10",
