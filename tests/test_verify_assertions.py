@@ -2319,7 +2319,11 @@ class BypassFollowUpTest(ProbeCase):
             "  structuredClone = ((x) => x) as typeof structuredClone;\n",
             "  books.push({ id: 'x' } as Book);\n",
             "  const n = books.push({ id: 'x' } as Book);\n",
-            "  const xs = [1].map((x) => x);\n",
+            "  const p = Object.assign?.(Array.prototype, { filter: Array.prototype.slice });\n",
+            "  const gone = books.splice?.(0);\n",
+            "  const q = Object.assign<any, any>({}, {});\n",
+            "  const r = (books as any).sort!((a: Book, b: Book) => 0);\n",
+            "  const s = helper()(books);\n",
         ):
             with self.subTest(setup=setup):
                 head = HEAD_TEST.replace(
@@ -2334,6 +2338,10 @@ class BypassFollowUpTest(ProbeCase):
             "addedAt: 9 }];\n",
             "  const empty = filterByStatus([], 'done');\n",
             "  const pick = (b: Book) => b.id;\n",
+            "  const wrap = () => ({ id: '1' });\n",
+            "  const before = structuredClone(books);\n",
+            "  const ids = books\n    .map((b) => b.id)\n    .filter((id) => id !== '1');\n",
+            "  const now = new Date(2026, 0, 1).getTime();\n",
             "  // a comment\n",
         ):
             with self.subTest(setup=setup):
@@ -2389,6 +2397,49 @@ class BypassFollowUpTest(ProbeCase):
         started = time.monotonic()
         self.suppressed("src/books.ts", many, "")
         self.assertLess(time.monotonic() - started, 5)
+
+    # Third review round.
+
+    def test_new_test_writes_to_shared_values_or_globals_are_setup(self):
+        for patch in (
+            "Array['proto' + 'type'].filter = function () { return this; };",
+            "structuredClone = (x: any) => x;",
+            "books.push({ id: 'x' } as Book);",
+            "books.length = 0;",
+            "window.matchMedia = () => null as any;",
+            "process.env.TZ = 'UTC';",
+        ):
+            with self.subTest(patch=patch):
+                warm = f"  it('warms up', () => {{\n    {patch}\n  }});\n"
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + warm + "\n  it('returns only"
+                )
+                self.assertIn(SETUP_FLAG, open_keys(run(head)), run(head).blockers)
+
+    def test_new_test_that_only_reads_or_writes_its_own_values_is_fine(self):
+        for body in (
+            "const list = [...books];\n    list.push(books[0]);\n    let n = 0;\n    n += 1;",
+            "const keys = Object.keys(books[0]);\n    expect(keys).toContain('id');",
+            "const v = window.localStorage.getItem('x');\n    expect(v).toBeNull();",
+            "for (let i = 0; i < 2; i++) {\n      expect(i).toBeLessThan(2);\n    }",
+            "const el = document.createElement('p');\n    el.textContent = 'x';",
+            "[1, 2].forEach((x) => {\n      x = x + 1;\n    });",
+            "const b: Book = { ...books[0], id: '9' };\n    expect(b.id).toBe('9');",
+            "const [first] = filterByStatus(books, 'done');\n    expect(first.id).toBe('3');",
+        ):
+            with self.subTest(body=body):
+                warm = f"  it('reads', () => {{\n    {body}\n  }});\n"
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + warm + "\n  it('returns only"
+                )
+                self.assertTrue(run(head).ready, run(head).blockers)
+
+    def test_reordered_setup_lines_say_what_moved(self):
+        base = BASE_TEST.replace("const NOW", "const A = 1;\nconst B = 2;\nconst NOW", 1)
+        head = HEAD_TEST.replace("const NOW", "const B = 2;\nconst A = 1;\nconst NOW", 1)
+        report = run(head, base_text=base)
+        detail = next(f for f in report.open_flags if f.key == SETUP_FLAG).detail
+        self.assertIn("moved: const B = 2;", detail)
 
 
 if __name__ == "__main__":

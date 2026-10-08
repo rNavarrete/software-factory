@@ -55,7 +55,10 @@ options objects that can skip tests, tests registered inside functions or
 conditions, unparseable text) makes the link unknown rather than covered. It
 is still a heuristic, not a JavaScript engine. A test that mirrors an incorrect
 implementation in a way these checks cannot see is possible, which is why the
-failure proof and Rolando's review exist.
+failure proof and Rolando's review exist. Known limits of the setup checks: a
+patch made through a local alias of a global (``const A = Array; A[...] = ...``)
+inside a new test is not seen, and a new suite with the same title as an old
+one is read as the old one, so its fixtures count as setup.
 
 The module only reads. It does no I/O, changes none of its inputs, and its
 report has no way to approve, merge or release: ``ready`` means "ready for
@@ -1911,14 +1914,15 @@ def _compare_tests(path, old: _File, new: _File):
         f"+{t.name}: {line}"
         for t in new.tests
         if t.name not in olds
-        for line in _matching_lines(_PATCH_RE, new, t.block.start, t.block.end)
+        for line in _new_test_writes(new, t)
     ]
     if reaching:
         yield Flag(
             FlagKind.CHANGED_SETUP,
             path,
-            "a new test patches globals, prototypes or modules, which can change what the "
-            "other tests in the file check: " + " | ".join(reaching[:_DIFF_LINES]),
+            "a new test patches globals, prototypes or modules, or changes a value it does "
+            "not declare itself, which can change what the other tests in the file check: "
+            + " | ".join(reaching[:_DIFF_LINES]),
         )
     if old_imports != new_imports:
         yield Flag(
@@ -1960,16 +1964,66 @@ def _suite_path(f: _File, i: int) -> tuple[str | None, ...]:
 # A new test or suite body that patches globals, prototypes or modules can change
 # what other tests in the file check.
 _PATCH_RE = re.compile(
-    r"(?<![\w$])(?:prototype|__proto__|globalThis|window|global|self|process|eval|Function)"
-    r"(?![\w$])"
+    r"(?<![\w$])(?:prototype|__proto__|eval|Function)(?![\w$])"
     r"|(?<![\w$.])(?:vi|vitest)\s*\.\s*(?:spyOn|stubGlobal|stubEnv|mock|doMock|"
     r"useFakeTimers|setSystemTime)(?![\w$])"
     r"|(?<![\w$.])(?:Object|Reflect)\s*\.\s*(?:defineProperty|defineProperties|assign|"
     r"setPrototypeOf|set|deleteProperty)(?![\w$])"
-    r"|(?<![\w$.])[A-Z][\w$]*\s*\.\s*[\w$]+\s*(?:[-+*/]?=(?![=>]))"
+)
+# A write to ``name``, ``name.x``, ``name[...]`` (and deeper), or a mutating call
+# on it. Group 1 is the name.
+_MEMBER = r"(?:\s*(?:\?\.|\.)\s*[\w$]+|\s*\[[^\]\n]*\])"
+_NAME_WRITE_RE = re.compile(
+    rf"(?<![\w$.])([A-Za-z_$][\w$]*)(?:{_MEMBER}*\s*(?:[-+*/%&|^]|\*\*|\?\?|&&|\|\|)?"
+    rf"=(?![=>])|\s*(?:\+\+|--)|{_MEMBER}*\s*\.\s*(?:push|pop|shift|unshift|splice|sort|"
+    rf"reverse|fill|copyWithin|set|delete|clear|add)\s*\()"
+)
+_LOCAL_RES = (
+    re.compile(r"(?<![\w$.])(?:const|let|var|function\s*\*?|class)\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"(?<![\w$.])(?:const|let|var)\s*[\[{]([^=]*)="),
+    re.compile(r"\(([^()]*)\)\s*(?::[^=>{]*)?=>"),
+    re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*=>"),
+    re.compile(r"(?<![\w$.])(?:function\s*\*?\s*[\w$]*|catch)\s*\(([^()]*)\)"),
 )
 _FIXTURE_RE = re.compile(r"\s*(?:const|let|var)\s+[\w$]+\s*(?::[^=]*)?=(?![=>])")
 _WRITE_RE = re.compile(r"(?<![=!<>])=(?![=>])|\+\+|--|(?<![\w$])delete(?![\w$])")
+# Calls a plain fixture may make besides product code: they read and build values.
+_PURE_CALLS = frozenset(
+    {
+        "structuredClone", "map", "filter", "slice", "concat", "flatMap", "flat", "find",
+        "findIndex", "findLast", "some", "every", "includes", "indexOf", "join", "at",
+        "keys", "values", "entries", "toSorted", "toReversed", "getTime", "toISOString",
+        "Date", "UTC", "parse", "stringify", "String", "Number", "Boolean", "from", "of",
+        "trim", "toLowerCase", "toUpperCase", "startsWith", "endsWith", "padStart",
+        "padEnd", "repeat", "split", "fromEntries", "min", "max", "round", "floor", "ceil",
+    }
+)  # fmt: skip
+
+
+def _new_test_writes(f: _File, t: _Test) -> list[str]:
+    """Lines where a new test patches globals, prototypes or modules, or writes to
+    a name it does not declare itself (a shared fixture or a global)."""
+    a, e = t.block.start, t.block.end
+    body = f.masked[a:e]
+    local = set()
+    for rx in _LOCAL_RES:
+        for m in rx.finditer(body):
+            local.update(_idents(m.group(1)))
+    hits = [m.start() for m in _PATCH_RE.finditer(f.masked, a, e)]
+    hits += [
+        m.start()
+        for m in _NAME_WRITE_RE.finditer(f.masked, a, e)
+        if m.group(1) not in local
+        and m.group(1) not in _KEYWORDS_BEFORE_EXPR
+        and m.group(1) not in ("const", "let", "var")
+        and _before(f.masked, m.start()) != ":"  # a type annotation
+    ]
+    out: dict[int, str] = {}
+    for pos in sorted(hits):
+        start = f.text.rfind("\n", 0, pos) + 1
+        if start not in out:
+            out[start] = _normalize(f.text[start : _line_end(f.text, pos)])
+    return list(out.values())
 
 
 def _line_end(text: str, i: int) -> int:
@@ -1977,23 +2031,14 @@ def _line_end(text: str, i: int) -> int:
     return len(text) if j < 0 else j
 
 
-def _matching_lines(rx: re.Pattern[str], f: _File, a: int, e: int) -> list[str]:
-    """Each line of ``f`` holding a match of ``rx`` in [a, e), once."""
-    out: dict[int, str] = {}
-    for m in rx.finditer(f.masked, a, e):
-        start = f.text.rfind("\n", 0, m.start()) + 1
-        if start not in out:
-            out[start] = _normalize(f.text[start : _line_end(f.text, m.end())])
-    return list(out.values())
-
-
 def _plain_fixture(chunk: str, product: set[str]) -> bool:
-    """A ``const``/``let`` whose value writes nothing and calls only product code."""
+    """A ``const``/``let`` whose value writes nothing, patches nothing and calls
+    only product code or plain value-building functions."""
     m = _FIXTURE_RE.match(chunk)
     if not m:
         return False
     rhs = chunk[m.end() :]
-    if _WRITE_RE.search(rhs):
+    if _WRITE_RE.search(rhs) or _PATCH_RE.search(rhs):
         return False
     for k, c in enumerate(rhs):
         if c != "(":
@@ -2001,11 +2046,22 @@ def _plain_fixture(chunk: str, product: set[str]) -> bool:
         j = k - 1
         while j >= 0 and rhs[j] in _WS:
             j -= 1
-        if j < 0 or not (rhs[j].isalnum() or rhs[j] in "_$)]"):
-            continue  # grouping or an arrow function's parameters
-        word, _ = _word_before(rhs, j, 0)
-        if word not in product:
+        if j < 0:
+            continue
+        p = rhs[j]
+        if p.isalnum() or p in "_$":
+            word, _ = _word_before(rhs, j, 0)
+            if word in product or word in _PURE_CALLS:
+                continue
+            if word in ("typeof", "void", "in", "of", "instanceof", "return", "await", "new"):
+                continue
             return False
+        if p == ">" and j > 0 and rhs[j - 1] == "=":
+            continue  # an arrow function's parenthesized body
+        if p == "!" and not (j > 0 and (rhs[j - 1].isalnum() or rhs[j - 1] in "_$)]")):
+            continue  # negation
+        if p in ".)]>!`":
+            return False  # ?.(, f()(, a[0](, f<T>(, f!(, tagged templates
     return True
 
 
@@ -2106,6 +2162,8 @@ def _line_diff(before: list[str], after: list[str]) -> str:
             if extra[x] > 0:
                 extra[x] -= 1
                 out.append(f"{sign}{x}")
+    if not out:
+        out = [f"moved: {y}" for x, y in zip(before, after, strict=False) if x != y]
     more = len(out) - _DIFF_LINES
     shown = " | ".join(out[:_DIFF_LINES])
     return shown + (f" | ... and {more} more changed line(s)" if more > 0 else "")
