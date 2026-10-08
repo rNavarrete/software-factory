@@ -781,10 +781,25 @@ class TestThatMayNotRunTest(unittest.TestCase):
         self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
 
     def test_early_return_before_the_assertion_is_unknown(self):
-        for early in ("    return;", "    if (shelf.length > 0) return;"):
+        body = "    return;\n" + self.BODY
+        self.assert_unknown(probe_test(body), why="returns before the assertion")
+
+    def test_conditional_return_before_the_assertion_is_flagged(self):
+        for early in (
+            "    if (shelf.length > 0) return;",
+            "    if (!shelf) {\n      return;\n    }",
+        ):
             with self.subTest(early=early):
-                body = early + "\n" + self.BODY
-                self.assert_unknown(probe_test(body), why="returns or throws before the assertion")
+                report = probe_run(probe_test(early + "\n" + self.BODY), self.QUOTE)
+                flag = next(f for f in report.open_flags if f.kind is FlagKind.MAY_NOT_RUN)
+                self.assertIn("conditional return", flag.detail)
+                self.assertFalse(report.ready)
+
+    def test_throw_before_the_assertion_fails_the_test_so_it_is_fine(self):
+        body = "    if (shelf.length === 0) throw new Error('empty shelf');\n" + self.BODY
+        report = probe_run(probe_test(body), self.QUOTE)
+        self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
+        self.assertNotIn(FlagKind.MAY_NOT_RUN, open_kinds(report))
 
     def test_return_after_the_assertion_is_fine(self):
         report = probe_run(probe_test(self.BODY + "\n    return;"), self.QUOTE)
@@ -1337,7 +1352,7 @@ class GapsCannotBeWaivedTest(unittest.TestCase):
         self.assertFalse(report.ready)
         for cid in ("ac1", "ac2"):
             b = next(b for b in report.blockers if b.startswith(cid))
-            self.assertIn("only a revised contract, approved again", b)
+            self.assertIn("revise the contract and approve it again", b)
 
     def test_clearances_naming_a_criterion_or_gap_are_refused(self):
         for name in ("ac2", "uncovered:ac2", "unknown:ac2", "failed:ac2", "covered:ac2"):
@@ -1745,7 +1760,7 @@ class ReviewFindingsTest(unittest.TestCase):
         cases = {
             "function it": "function it(_n: string, _f: () => void) {}\n",
             "const expect": "const expect = (_v: unknown) => ({ toHaveLength() {} });\n",
-            "let test": "let test = 1;\n",
+            "let expect": "let expect: any = null;\n",
             "assignment": "globalThis.it = () => {};\n",
             "destructured": "const { describe: d, it } = await import('./helpers');\n",
         }
@@ -1754,7 +1769,7 @@ class ReviewFindingsTest(unittest.TestCase):
                 text = probe_file(probe_test(self.BODY)).replace(
                     "\nconst NOW", "\n" + prefix + "const NOW", 1
                 )
-                self.assert_unknown(text, "cannot be trusted")
+                self.assert_unknown(text, "")
         helper = probe_file(probe_test(self.BODY)).replace(
             "import { describe, expect, it } from 'vitest';",
             "import { describe, expect } from 'vitest';\nimport { it } from './helpers';",
@@ -1904,6 +1919,182 @@ class ReviewFindingsTest(unittest.TestCase):
     def test_escaped_title_matches_its_text(self):
         text = probe_file(probe_test(self.BODY, name="caf\\u00e9 \\x41"))
         report = self.status(text, name="probe > café A")
+        self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
+
+
+class SecondReviewTest(ReviewFindingsTest):
+    """AC1/AC3: tricks and false alarms found in the second review round."""
+
+    def prefixed(self, prefix, body=None):
+        text = probe_file(probe_test(body or self.BODY))
+        return text.replace("\nconst NOW", "\n" + prefix + "const NOW", 1)
+
+    def test_options_that_cannot_be_read_make_it_unknown(self):
+        for call in (
+            "it('checks it', { 'skip': true }, () => {",
+            "it('checks it', { ['sk' + 'ip']: true }, () => {",
+            "it('checks it', opts, () => {",
+        ):
+            with self.subTest(call=call):
+                text = probe_file(f"  {call}\n" + self.BODY + "\n  });\n")
+                self.assert_unknown(text, "")
+        after = probe_file("  it('checks it', () => {\n" + self.BODY + "\n  }, opts);\n")
+        self.assert_unknown(after, "cannot follow")
+
+    def test_skip_reached_through_a_string_makes_it_unknown(self):
+        text = probe_file(
+            "  it('checks it', (ctx) => {\n    ctx['skip']();\n" + self.BODY + "\n  });\n"
+        )
+        self.assert_unknown(text, "in a string")
+
+    def test_replacing_globals_makes_it_unknown(self):
+        for prefix in (
+            "Reflect.set(globalThis, 'it', () => {});\n",
+            "Object.assign(globalThis, { ['it']: () => {} });\n",
+            "(globalThis as any)['expect'] = () => ({});\n",
+        ):
+            with self.subTest(prefix=prefix):
+                self.assert_unknown(self.prefixed(prefix), "")
+
+    def test_typeof_cannot_hide_a_statement_behind_a_braceless_if(self):
+        body = (
+            "    const result = filterByStatus(shelf, 'reading');\n"
+            f"    if (false) typeof {self.QUOTE};"
+        )
+        self.assert_flag(probe_file(probe_test(body)), FlagKind.MAY_NOT_RUN, "`if` condition")
+        tests = (
+            "  if (false) typeof describe('inner', () => {\n" + probe_test(self.BODY) + "  });\n"
+        )
+        self.assert_unknown(probe_file(tests), "")
+
+    def test_reassigned_or_typeof_values_are_fixture_only(self):
+        reassigned = (
+            "    let x = filterByStatus(shelf, 'reading');\n"
+            "    x = [shelf[1]];\n    expect(x).toEqual([shelf[1]]);"
+        )
+        self.assert_flag(
+            probe_file(probe_test(reassigned)),
+            FlagKind.FIXTURE_ONLY,
+            "not traced",
+            quote="expect(x).toEqual([shelf[1]])",
+        )
+        quote = "expect(typeof filterByStatus).toBe('function')"
+        self.assert_flag(
+            probe_file(probe_test(f"    {quote};")), FlagKind.FIXTURE_ONLY, "", quote=quote
+        )
+
+    def test_value_mixed_by_an_operator_is_weak(self):
+        quote = "expect(filterByStatus(shelf, 'reading') && [shelf[1]]).toEqual([shelf[1]])"
+        self.assert_flag(
+            probe_file(probe_test(f"    {quote};")), FlagKind.WEAK_ASSERTION, "&&", quote=quote
+        )
+
+    def test_hidden_mirrors_are_flagged(self):
+        cases = {
+            "itself": ("    const r = filterByStatus(shelf, 'reading');\n", "expect(r).toEqual(r)"),
+            "alias": (
+                "    const f = filterByStatus;\n",
+                "expect(filterByStatus(shelf, 'reading')).toEqual(f(shelf, 'reading'))",
+            ),
+            "assert.deepEqual": (
+                "",
+                "assert.deepEqual(filterByStatus(shelf, 'x'), filterByStatus(shelf, 'x'))",
+            ),
+        }
+        for label, (setup, quote) in cases.items():
+            with self.subTest(label):
+                text = probe_file(probe_test(f"{setup}    {quote};"))
+                self.assert_flag(text, FlagKind.MIRRORS_CODE, "", quote=quote)
+        ns = self.prefixed(
+            "import * as lib from '../src/books';\n",
+            "    expect(filterByStatus(shelf, 'x')).toEqual(lib.filterByStatus(shelf, 'x'));",
+        )
+        quote = "expect(filterByStatus(shelf, 'x')).toEqual(lib.filterByStatus(shelf, 'x'))"
+        self.assert_flag(ns, FlagKind.MIRRORS_CODE, "filterByStatus", quote=quote)
+
+    def test_more_weak_matchers_are_flagged(self):
+        for quote in (
+            "expect(filterByStatus(shelf, 'x')).toMatchObject({})",
+            "expect(filterByStatus(shelf, 'x')).toEqual(expect.arrayContaining([]))",
+            "expect(filterByStatus(shelf, 'x')).toSatisfy(() => true)",
+            "expect(filterByStatus(shelf, 'x')).toHaveProperty('length')",
+        ):
+            with self.subTest(quote=quote):
+                text = probe_file(probe_test(f"    {quote};"))
+                self.assert_flag(text, FlagKind.WEAK_ASSERTION, "", quote=quote)
+
+    def test_exact_value_matchers_are_not_weak(self):
+        for quote in (
+            "expect(filterByStatus(shelf, 'x')[0]).toBeUndefined()",
+            "expect(filterByStatus(shelf, 'x')[0] ?? null).toBeNull()",
+        ):
+            with self.subTest(quote=quote):
+                report = self.status(probe_file(probe_test(f"    {quote};")), quote=quote)
+                weak = [f for f in report.open_flags if f.kind is FlagKind.WEAK_ASSERTION]
+                if "??" in quote:
+                    self.assertIn("??", weak[0].detail)
+                else:
+                    self.assertEqual(weak, [])
+
+    def test_html_in_supplied_text_cannot_hide_the_report(self):
+        head = HEAD_TEST.replace("const NOW", "// <!-- hide\nconst NOW", 1)
+        out = render(run(head, clearances=[]))
+        self.assertNotIn("<!--", out)
+        self.assertIn("&lt;\\!-- hide", out)
+
+    def test_long_unary_chains_do_not_crash(self):
+        body = "    const result = filterByStatus(shelf, 'reading');\n    " + "void " * 1500
+        report = self.status(probe_file(probe_test(body + self.QUOTE + ";")))
+        self.assertIn(cov(report).status, (Coverage.COVERED, Coverage.UNKNOWN))
+
+    def test_twenty_thousand_tests_parse_in_reasonable_time(self):
+        import time
+
+        many = "".join(
+            f"  it('case {i}', () => {{\n"
+            "    expect(filterByStatus(shelf, 'x')).toEqual([]);\n  });\n"
+            for i in range(20000)
+        )
+        started = time.monotonic()
+        report = self.status(probe_file(many + probe_test(self.BODY)))
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertEqual(cov(report).status, Coverage.COVERED)
+
+    def test_ordinary_names_are_not_mistaken_for_test_functions(self):
+        for setup in (
+            "const page = { skip: 0, take: 2 };\n",
+            "type Page = { skip?: number; test: boolean };\n",
+            "function assert(cond: unknown): asserts cond {\n"
+            "  if (!cond) throw new Error('no');\n}\n",
+            "const suite = [1, 2];\n",
+            "const settings = { test: 1, it: 2 };\n",
+        ):
+            with self.subTest(setup=setup):
+                report = self.status(self.prefixed(setup))
+                self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
+                self.assertTrue(report.ready, report.blockers)
+
+    def test_input_unchanged_check_is_not_fixture_only(self):
+        quote = "expect(shelf).toEqual(before)"
+        body = (
+            "    const before = structuredClone(shelf);\n"
+            "    filterByStatus(shelf, 'reading');\n"
+            f"    {quote};"
+        )
+        report = self.status(probe_file(probe_test(body)), quote=quote)
+        self.assertNotIn(FlagKind.FIXTURE_ONLY, open_kinds(report))
+
+    def test_values_from_a_helper_function_are_traced(self):
+        text = self.prefixed(
+            "function reading(list: Book[]) {\n  return filterByStatus(list, 'reading');\n}\n",
+            "    const result = reading(shelf);\n    " + self.QUOTE + ";",
+        )
+        report = self.status(text)
+        self.assertNotIn(FlagKind.FIXTURE_ONLY, open_kinds(report))
+
+    def test_generic_expect_can_be_linked(self):
+        quote = "expect<Book[]>(filterByStatus(shelf, 'reading')).toHaveLength(1)"
+        report = self.status(probe_file(probe_test(f"    {quote};")), quote=quote)
         self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
 
 

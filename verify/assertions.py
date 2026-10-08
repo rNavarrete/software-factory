@@ -402,7 +402,8 @@ class AssertionReport:
         out += [f"criterion check: {b}" for b in self.verification.blockers]
         out += [
             f"{c.criterion} is {c.status.value}: {'; '.join(c.reasons)} "
-            "(only a revised contract, approved again, can change what it needs)"
+            "(this cannot be cleared: fix the evidence on a new revision, or revise the "
+            "contract and approve it again)"
             for c in self.criteria
             if c.status is not Coverage.COVERED
         ]
@@ -643,14 +644,31 @@ _GUARDED = (
 )
 _SHADOW_RES = (
     re.compile(rf"(?<![\w$.])(?:function\s*\*?|class|const|let|var)\s+({_GUARDED})(?![\w$])"),
-    re.compile(rf"(?<![\w$])({_GUARDED})\s*(?:[-+*/%&|^]|\*\*|<<|>>>?|&&|\|\||\?\?)?=(?![=>])"),
+    re.compile(rf"(?<![\w$.])({_GUARDED})\s*(?:[-+*/%&|^]|\*\*|<<|>>>?|&&|\|\||\?\?)?=(?![=>])"),
 )
 _DESTRUCTURE_RE = re.compile(r"(?<![\w$.])(?:const|let|var)\s*([\[{])")
-_SKIP_WORD_RE = re.compile(r"(?<![\w$])skip(?![\w$])")
+# Ways to skip, or reach a test function, that are not part of a test's declaration.
+_RUNTIME_SKIP_RES = (
+    re.compile(r"\.\s*skip(?![\w$])"),
+    re.compile(r"(?<![\w$.])skip\s*\("),
+)
+_GLOBAL_WRITE_RES = (
+    re.compile(r"(?<![\w$.])(?:globalThis|global|window|self)\s*(?:\?\.\s*)?\["),
+    re.compile(rf"(?<![\w$.])(?:globalThis|global|window|self)\s*\.\s*(?:{_GUARDED})(?![\w$])"),
+    re.compile(
+        r"(?<![\w$.])(?:Reflect|Object)\s*\.\s*"
+        r"(?:set|assign|defineProperty|defineProperties|setPrototypeOf)\s*\("
+    ),
+)
+_INDIRECT_WORDS = frozenset(
+    _GUARDED.split("|") + ["skip", "only", "todo", "fails", "skipIf", "runIf", "skipped"]
+)
 
 
 @dataclass(frozen=True)
 class _Block:
+    fn: str
+    """The function the test is declared with: describe, it, test..."""
     is_suite: bool
     title: str | None
     mods: frozenset[str]
@@ -685,9 +703,13 @@ class _File:
     tests: tuple[_Test, ...]
     has_only: bool
     problems: tuple[str, ...]
-    """File-level reasons no test in it can be trusted (shadowing, runtime skips)."""
+    """File-level reasons no test in it can be trusted (runtime skips, globals)."""
+    shadowed: tuple[tuple[str, str], ...]
+    """(name, why) for each test function or assertion name the file redefines."""
     imports: tuple[tuple[str, str], ...]
     """(local name, module specifier) for every value import."""
+    namespaces: tuple[str, ...]
+    """Local names of ``import * as name`` imports."""
     mocks: tuple[str, ...]
     """Module specifiers mocked with vi.mock/vi.doMock; "?" if not a plain string."""
     spies: tuple[str, ...]
@@ -704,7 +726,7 @@ def _parse(text: str) -> _File:
     scan = _Scanner(text)
     masked = scan.masked()
     newlines = tuple(i for i, c in enumerate(text) if c == "\n")
-    imports, import_spans = _imports(text, scan)
+    imports, namespaces, import_spans = _imports(text, scan)
     problems: list[str] = []
 
     def line(pos: int) -> int:
@@ -713,10 +735,12 @@ def _parse(text: str) -> _File:
     def in_import(pos: int) -> bool:
         return any(a <= pos < b for a, b in import_spans)
 
+    shadowed = _shadowing(masked, imports)
+    declared = {name for name, _ in shadowed}
     blocks: list[_Block] = []
     suites: list[int] = []  # stack of open suite block indices
     for m in _CALL_RE.finditer(masked):
-        if in_import(m.start()):
+        if in_import(m.start()) or _is_key(masked, m.start(), m.end()):
             continue
         fn = m.group(1)
         mods = set()
@@ -742,6 +766,8 @@ def _parse(text: str) -> _File:
                     j = scan.strings[j][0] + 1
         j = _skip_ws(masked, j)
         if odd or j >= len(masked) or masked[j] != "(":
+            if fn in declared:
+                continue  # the file's own variable; calling it is caught per test
             problems.append(
                 f"line {line(m.start())}: uses {fn!r} other than as a direct call, so which "
                 "tests run cannot be read from the source"
@@ -753,14 +779,8 @@ def _parse(text: str) -> _File:
         if k in scan.strings:
             end, title = scan.strings[k]
             k = end + 1
-        body, options = _callback_body(masked, k, close)
-        if options is not None:
-            unsafe = set(_idents(options)) - _SAFE_OPTIONS - _LITERAL_WORDS
-            if unsafe:
-                problems.append(
-                    f"line {line(m.start())}: an options argument ({', '.join(sorted(unsafe))}) "
-                    "can skip tests or mark them only or failing"
-                )
+        body, arg_problems = _call_args(masked, k, close)
+        problems += [f"line {line(m.start())}: {x}" for x in arg_problems]
         while suites and not (
             blocks[suites[-1]].body
             and blocks[suites[-1]].body[0] <= m.start() < blocks[suites[-1]].body[1]
@@ -768,6 +788,7 @@ def _parse(text: str) -> _File:
             suites.pop()
         blocks.append(
             _Block(
+                fn=fn,
                 is_suite=fn in _SUITE_FNS,
                 title=title,
                 mods=frozenset(mods),
@@ -783,7 +804,7 @@ def _parse(text: str) -> _File:
             suites.append(len(blocks) - 1)
 
     probe = _File(
-        text, masked, bytes(scan.code), tuple(blocks), (), False, (), (), (), (), newlines
+        text, masked, bytes(scan.code), tuple(blocks), (), False, (), (), (), (), (), (), newlines
     )
     unregistered = _registration(probe)
 
@@ -812,13 +833,26 @@ def _parse(text: str) -> _File:
             )
         )
 
-    problems += _shadowing(text, masked, scan, imports)
     heads = [(b.start, b.head_end) for b in blocks]
-    for m in _SKIP_WORD_RE.finditer(masked):
-        if not any(a <= m.start() < e for a, e in heads):
+    for rx in _RUNTIME_SKIP_RES:
+        hit = next(
+            (x for x in rx.finditer(masked) if not any(a <= x.start() < e for a, e in heads)), None
+        )
+        if hit:
+            problems.append(f"line {line(hit.start())}: skips tests at runtime")
+    for rx in _GLOBAL_WRITE_RES:
+        for hit in rx.finditer(masked):
             problems.append(
-                f"line {line(m.start())}: skips tests at runtime (skip outside a test's "
-                "declaration)"
+                f"line {line(hit.start())}: reaches globals or sets properties indirectly, which "
+                "can replace the test functions"
+            )
+            break
+    titles = {_skip_ws(masked, b.head_end + 1) for b in blocks}
+    for q, (_, value) in scan.strings.items():
+        if value in _INDIRECT_WORDS and q not in titles and not in_import(q):
+            problems.append(
+                f"line {line(q)}: names {value!r} in a string, which can reach test "
+                "functions or skip tests indirectly"
             )
             break
 
@@ -829,59 +863,106 @@ def _parse(text: str) -> _File:
         blocks=tuple(blocks),
         tests=tuple(tests),
         has_only=any("only" in b.mods for b in blocks),
-        problems=tuple(problems),
+        problems=tuple(dict.fromkeys(problems)),
+        shadowed=tuple(shadowed),
         imports=tuple(imports),
+        namespaces=tuple(namespaces),
         mocks=tuple(_mocks(masked, scan)),
         spies=tuple(_spies(masked)),
         newlines=newlines,
     )
 
 
-def _callback_body(masked: str, i: int, close: int):
-    """(body range or None, options-object text or None) of a test call's arguments."""
-    depth, options = 0, None
-    while i < close:
+def _call_args(masked: str, k: int, close: int):
+    """(callback body range or None, problems) for a test call's arguments after
+    the title. Only an options object with plain known keys and literal values,
+    a function literal and a number (a timeout) can be followed; anything else
+    (a variable, a quoted or computed key) could carry skip or only."""
+    args, depth, start = [], 0, k
+    for i in range(k, close):
         c = masked[i]
-        if depth == 0 and c == "{":
-            end = _match(masked, i)
-            options = (
-                masked[i + 1 : end] if options is None else options + " " + masked[i + 1 : end]
-            )
-            i = end + 1
-            continue
         if c in _OPEN:
             depth += 1
         elif c in _CLOSE:
             depth -= 1
-        elif depth == 0 and masked.startswith("=>", i):
-            q = _skip_ws(masked, i + 2)
-            if masked[q] == "{":
-                return (q + 1, _match(masked, q)), options
-            # Expression body: up to the next top-level comma or the call's close.
-            d, e = 0, q
-            while e < close:
-                if masked[e] in _OPEN:
-                    d += 1
-                elif masked[e] in _CLOSE:
-                    d -= 1
-                elif masked[e] == "," and d == 0:
-                    break
-                e += 1
-            return (q, e), options
-        elif (
-            depth == 0
-            and _FUNCTION_RE.match(masked, i)
-            and (i == 0 or not (masked[i - 1].isalnum() or masked[i - 1] in "_$"))
-        ):
-            p = masked.find("(", i)
-            if p < 0 or p > close:
-                return None, options
-            q = _skip_ws(masked, _match(masked, p) + 1)
-            if q < close and masked[q] == "{":
-                return (q + 1, _match(masked, q)), options
-            return None, options
-        i += 1
-    return None, options
+        elif c == "," and depth == 0:
+            args.append((start, i))
+            start = i + 1
+    args.append((start, close))
+    body, problems = None, []
+    for a, e in args:
+        a = _skip_ws(masked, a)
+        text = masked[a:e].strip()
+        if not text:
+            continue
+        if text[0] == "{" and _match(masked, a) == a + len(text) - 1:
+            inner = text[1:-1]
+            keys = re.findall(r"(?:^|,)\s*([^,:]*?)\s*:", inner)
+            plain = all(_IDENT_RE.fullmatch(x) for x in keys) and "..." not in inner
+            values = set(_idents(inner)) - set(keys)
+            if (
+                not plain
+                or set(keys) - _SAFE_OPTIONS
+                or values - _LITERAL_WORDS
+                or "'" in inner
+                or '"' in inner
+                or "`" in inner
+                or "[" in inner
+            ):
+                problems.append(
+                    "an options argument that is not plain known keys with literal values can "
+                    "skip tests or mark them only or failing"
+                )
+            continue
+        if re.fullmatch(r"\d[\d_]*", text):
+            continue
+        found = _function_body(masked, a, e)
+        if found is not None and body is None:
+            body = found
+            continue
+        problems.append(
+            f"passes an argument ({_normalize(text)[:40]}) the reader cannot follow; it could "
+            "carry skip or only"
+        )
+    return body, problems
+
+
+def _function_body(masked: str, a: int, e: int) -> tuple[int, int] | None:
+    """The body of the function literal spanning [a, e), or None if it is not one."""
+    head = re.match(
+        r"(?:async\s+)?(?:function\b[^(]*|[A-Za-z_$][\w$]*\s*(?==>)|(?=\())", masked[a:e]
+    )
+    if head is None:
+        return None
+    i = a + head.end()
+    if masked[i] == "(":
+        i = _skip_ws(masked, _match(masked, i) + 1)
+        if masked[i] == ":":  # a return type annotation
+            while i < e and not masked.startswith("=>", i) and masked[i] != "{":
+                i += 1
+    else:
+        i = _skip_ws(masked, i)
+    if masked.startswith("=>", i):
+        q = _skip_ws(masked, i + 2)
+        if masked[q] == "{":
+            end = _match(masked, q)
+            return (q + 1, end) if _skip_ws(masked, end + 1) >= e else None
+        return (q, e)
+    if masked[i] == "{" and "function" in masked[a:i]:
+        end = _match(masked, i)
+        return (i + 1, end) if _skip_ws(masked, end + 1) >= e else None
+    return None
+
+
+def _is_key(masked: str, start: int, end: int) -> bool:
+    """Whether the name at [start, end) is an object key or a type member."""
+    a = _skip_ws(masked, end)
+    if a >= len(masked) or masked[a] not in ":?":
+        return False
+    b = start - 1
+    while b >= 0 and masked[b] in _WS:
+        b -= 1
+    return b >= 0 and masked[b] in "{,;"
 
 
 _FUNCTION_RE = re.compile(r"function\b")
@@ -913,12 +994,12 @@ def _registration(f: _File) -> dict[int, list[str]]:
 
 def _walk(f: _File, start: int, queries: list[int]):
     """Walk the code from ``start`` and report, at each query position (sorted),
-    what encloses it and which return/throw statements before it can end the
-    enclosing body early.
+    what encloses it and which return statements before it can end the
+    enclosing body early (a throw fails the test instead).
 
     Each state is (stack, exits): stack holds "fn", "block" or "paren" for each
     open bracket (plus "fn" for an expression-bodied arrow), exits holds
-    (line, conditional) for each return or throw not inside a nested function.
+    (line, conditional) for each return not inside a nested function.
     A ``return`` immediately followed by the query position returns it and is
     not an early exit.
     """
@@ -949,8 +1030,10 @@ def _walk(f: _File, start: int, queries: list[int]):
             if not (i and m[i - 1] == "."):
                 if word == "function":
                     pending = len(stack)
-                elif word in ("return", "throw") and "fn" not in stack:
-                    exits.append((f.line(i), bool(stack), _skip_ws(m, j)))
+                elif word == "return" and "fn" not in stack:
+                    # A throw fails the test; only a return can end it early and green.
+                    cond = bool(stack) or _guard(f, start, i) is not None
+                    exits.append((f.line(i), cond, _skip_ws(m, j)))
             i = j
             continue
         if m.startswith("=>", i):
@@ -976,50 +1059,58 @@ def _walk(f: _File, start: int, queries: list[int]):
     return states
 
 
+_UNARY_WORDS = frozenset({"await", "return", "void", "typeof", "delete", "new", "yield"})
+_EXPR_WORDS = frozenset({"in", "instanceof", "of", "case", "extends", "throw"})
+
+
 def _guard(f: _File, floor: int, pos: int) -> str | None:
     """Why the statement at ``pos`` may not run even when the code before it
     does: it is not at the start of a statement but behind a condition, a
     loop header or an operator."""
     m = f.masked
     j = pos - 1
-    while j >= floor and m[j] in _WS:
-        j -= 1
-    if j < floor:
-        return None
-    c = m[j]
-    if c in ";{}":
-        return None
-    if c == ")":
-        k = _match_back(m, j, floor)
-        if k < 0:
-            return "follows an unmatched parenthesis"
-        w = k - 1
-        while w >= floor and m[w] in _WS:
-            w -= 1
-        word, _ = _word_before(m, w, floor)
-        if word in ("if", "for", "while", "with"):
-            return f"runs only when its `{word}` condition holds"
-        return None  # the end of the previous statement, without a semicolon
-    if c.isalnum() or c in "_$":
-        word, s = _word_before(m, j, floor)
-        if word in ("await", "return", "void"):
-            return _guard(f, floor, s)
-        if word in ("else", "do"):
-            return f"is in an `{word}` branch"
-        return None  # the end of the previous statement, without a semicolon
-    if c in "]":
-        return None
-    return f"is part of an expression after `{c}`, so it may not run"
+    while True:
+        while j >= floor and m[j] in _WS:
+            j -= 1
+        if j < floor:
+            return None
+        c = m[j]
+        if c in ";{}":
+            return None
+        if c == ")":
+            k = _match_back(m, j, floor)
+            if k < 0:
+                return "follows an unmatched parenthesis"
+            w = k - 1
+            while w >= floor and m[w] in _WS:
+                w -= 1
+            word, _ = _word_before(m, w, floor)
+            if word in ("if", "for", "while", "with"):
+                return f"runs only when its `{word}` condition holds"
+            return None  # the end of the previous statement, without a semicolon
+        if c.isalnum() or c in "_$":
+            word, s = _word_before(m, j, floor)
+            if word in _UNARY_WORDS:
+                j = s - 1  # step back over the keyword and look again
+                continue
+            if word in ("else", "do"):
+                return f"is in an `{word}` branch"
+            if word in _EXPR_WORDS:
+                return f"is part of an expression after `{word}`, so it may not run"
+            return None  # the end of the previous statement, without a semicolon
+        if c == "]":
+            return None
+        return f"is part of an expression after `{c}`, so it may not run"
 
 
-def _shadowing(text, masked, scan, imports) -> list[str]:
+def _shadowing(masked, imports) -> list[tuple[str, str]]:
     out = []
     for local, spec in imports:
         if re.fullmatch(_GUARDED, local) and spec != "vitest":
-            out.append(f"imports {local!r} from {spec!r} instead of vitest")
+            out.append((local, f"imports {local!r} from {spec!r} instead of vitest"))
     for rx in _SHADOW_RES:
         for m in rx.finditer(masked):
-            out.append(f"redefines {m.group(1)!r}")
+            out.append((m.group(1), f"redefines {m.group(1)!r}"))
     for m in _DESTRUCTURE_RE.finditer(masked):
         try:
             inner = masked[m.start(1) + 1 : _match(masked, m.start(1))]
@@ -1027,10 +1118,10 @@ def _shadowing(text, masked, scan, imports) -> list[str]:
             continue
         for name in _idents(inner):
             if re.fullmatch(_GUARDED, name):
-                out.append(f"redefines {name!r}")
+                out.append((name, f"redefines {name!r}"))
     for m in re.finditer(rf"\.\s*({_GUARDED})\s*=(?![=>])", masked):
-        out.append(f"assigns {m.group(1)!r} on an object")
-    return [f"{x}, so its test calls cannot be trusted" for x in dict.fromkeys(out)]
+        out.append((m.group(1), f"assigns {m.group(1)!r} on an object"))
+    return list(dict.fromkeys(out))
 
 
 _IMPORT_RE = re.compile(
@@ -1039,7 +1130,7 @@ _IMPORT_RE = re.compile(
 
 
 def _imports(text: str, scan: _Scanner):
-    out, spans = [], []
+    out, namespaces, spans = [], [], []
     for m in _IMPORT_RE.finditer(text):
         if not scan.code[m.start()] or m.end() not in scan.strings:
             continue
@@ -1054,7 +1145,9 @@ def _imports(text: str, scan: _Scanner):
             local = part.split(" as ")[-1].strip()
             if _IDENT_RE.fullmatch(local):
                 out.append((local, spec))
-    return out, spans
+                if part.startswith("*"):
+                    namespaces.append(local)
+    return out, namespaces, spans
 
 
 _MOCK_RE = re.compile(r"(?<![\w$.])vi\s*\.\s*(?:mock|doMock)\s*\(")
@@ -1110,7 +1203,9 @@ def _idents(masked: str) -> list[str]:
     return out
 
 
-_ASSERT_RE = re.compile(r"(?<![\w$.])(expect(?:\s*\.\s*soft)?|assert(?:\s*\.\s*\w+)?)\s*\(")
+_ASSERT_RE = re.compile(
+    r"(?<![\w$.])(expect(?:\s*\.\s*soft)?|assert(?:\s*\.\s*\w+)?)\s*(?:<[^()]*>\s*)?\("
+)
 _MATCHER_RE = re.compile(
     r"(?P<mods>(?:\s*\.\s*(?:not|resolves|rejects))*)\s*\.\s*(?P<name>\w+)\s*\("
 )
@@ -1118,12 +1213,10 @@ _LITERAL_WORDS = frozenset({"true", "false", "null", "undefined", "NaN", "Infini
 _WEAK_MATCHERS = frozenset(
     {
         "toBeDefined",
-        "toBeUndefined",
         "toBeTruthy",
         "toBeFalsy",
-        "toBeNull",
-        "toBeNaN",
         "toBeInstanceOf",
+        "toSatisfy",
         "toBeTypeOf",
         "toHaveBeenCalled",
         "toMatchSnapshot",
@@ -1156,6 +1249,10 @@ def _assertion_at(f: _File, i: int, limit: int) -> _Assertion | None:
         subject = f.masked[open_ + 1 : close]
         call = re.sub(r"\s", "", m.group(1))
         if call.startswith("assert"):
+            args = _split_args(subject)
+            comparing = re.fullmatch(r"assert\.(?!not)\w*(?:[Ee]qual|[Ss]ame)\w*", call)
+            if comparing and len(args) >= 2:
+                return _Assertion(m.start(), close + 1, call, args[0], args[1], call, False)
             return _Assertion(m.start(), close + 1, call, subject, None, None, False)
         mm = _MATCHER_RE.match(f.masked, close + 1)
         if not mm:
@@ -1170,6 +1267,38 @@ def _assertion_at(f: _File, i: int, limit: int) -> _Assertion | None:
             mm.group("name"),
             "not" in mm.group("mods"),
         )
+    return None
+
+
+def _split_args(masked: str) -> list[str]:
+    out, depth, start = [], 0, 0
+    for i, c in enumerate(masked):
+        if c in _OPEN:
+            depth += 1
+        elif c in _CLOSE:
+            depth -= 1
+        elif c == "," and depth == 0:
+            out.append(masked[start:i])
+            start = i + 1
+    out.append(masked[start:])
+    return [x for x in out if x.strip()]
+
+
+def _top_level_operator(masked: str) -> str | None:
+    depth = 0
+    for i, c in enumerate(masked):
+        if c in _OPEN:
+            depth += 1
+        elif c in _CLOSE:
+            depth -= 1
+        elif depth == 0:
+            for op in ("&&", "||", "??"):
+                if masked.startswith(op, i):
+                    return op
+            if c == "?" and masked[i + 1 : i + 2] not in (".", "?") and masked[i - 1 : i] != "?":
+                return "?"
+            if c == ",":
+                return ","
     return None
 
 
@@ -1229,12 +1358,19 @@ def _bindings(f: _File, t: _Test) -> dict[str, list[str]]:
     while p is not None:
         own.add(p)
         p = f.blocks[p].parent
-    hidden = [
+    merged: list[list[int]] = []
+    for a, e in sorted(
         (b.start, b.end) for i, b in enumerate(f.blocks) if i not in own and b.body is not None
-    ]
+    ):
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([a, e])
+    starts = [a for a, _ in merged]
 
     def visible(pos: int) -> bool:
-        return not any(a <= pos <= e for a, e in hidden)
+        k = bisect.bisect_right(starts, pos) - 1
+        return k < 0 or pos > merged[k][1]
 
     def expr_from(i: int) -> str:
         depth, j = 0, i
@@ -1276,31 +1412,73 @@ def _bindings(f: _File, t: _Test) -> dict[str, list[str]]:
         if not visible(a.start()):
             continue
         out.setdefault(a.group(1), []).append(expr_from(a.end()))
+    for fn in _FUNCTION_DECL_RE.finditer(m):
+        if not visible(fn.start()):
+            continue
+        p = m.find("(", fn.end())
+        if p < 0:
+            continue
+        try:
+            q = _match(m, p)
+            b = m.find("{", q)
+            out.setdefault(fn.group(1), []).append(m[b : _match(m, b) + 1] if b >= 0 else "")
+        except ParseError:
+            continue
     return out
 
 
-def _reach(masked_expr: str, product: set[str], bindings, depth: int = 4) -> set[str]:
-    """Product names an expression uses, directly or through assigned names."""
-    found: set[str] = set()
-    seen: set[str] = set()
-    todo = [(masked_expr, depth)]
-    while todo:
-        expr, d = todo.pop()
-        for name in _idents(expr):
-            if name in product:
-                found.add(name)
-            elif d > 0 and name in bindings and name not in seen:
-                seen.add(name)
-                todo += [(v, d - 1) for v in bindings[name]]
-    return found
+_FUNCTION_DECL_RE = re.compile(r"(?<![\w$.])function\s*\*?\s*([A-Za-z_$][\w$]*)")
+_TYPEOF_RE = re.compile(r"(?<![\w$.])typeof\s+[\w$.]+")
 
 
-def _called(masked_expr: str, names: set[str]) -> set[str]:
-    return {
-        n
-        for n in names
-        if re.search(rf"(?<![\w$.]){re.escape(n)}\s*(?:\.\s*[\w$]+\s*)?\(", masked_expr)
-    }
+def _traced(expr: str, product: set[str], bindings, depth: int = 4, seen=frozenset()) -> bool:
+    """Whether a value comes from product code: it uses a product name directly
+    (not just its ``typeof``), or uses a name every assignment of which does."""
+    expr = _TYPEOF_RE.sub(" ", expr)
+    names = _idents(expr)
+    if any(n in product for n in names):
+        return True
+    if depth == 0:
+        return False
+    for n in names:
+        values = bindings.get(n)
+        if n in seen or not values:
+            continue
+        if all(_traced(v, product, bindings, depth - 1, seen | {n}) for v in values):
+            return True
+    return False
+
+
+_CALL_SITE_RE = re.compile(
+    r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*(?:\.\s*([A-Za-z_$][\w$]*)\s*)?(?:<[^()]*>\s*)?\("
+)
+
+
+def _calls(expr: str, product: set[str], namespaces: set[str], aliases) -> set[str]:
+    """The product functions an expression calls, by their exported names."""
+    out = set()
+    for m in _CALL_SITE_RE.finditer(expr):
+        a, b = m.group(1), m.group(2)
+        if a in namespaces and b:
+            out.add(b)
+        elif not b and a in aliases:
+            out.add(aliases[a])
+        elif not b and a in product:
+            out.add(a)
+    return out
+
+
+def _aliases(product: set[str], namespaces: set[str], bindings) -> dict[str, str]:
+    out = {}
+    for name, values in bindings.items():
+        for v in values:
+            v = _normalize(v)
+            ns = re.fullmatch(r"([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)", v)
+            if v in product and v not in namespaces:
+                out[name] = v
+            elif ns and ns.group(1) in namespaces:
+                out[name] = ns.group(2)
+    return out
 
 
 def _assertion_count(f: _File, t: _Test) -> int:
@@ -1765,6 +1943,11 @@ def _check_link(link: AssertionLink, command: str, head, parse, policy):
     if len(matches) > 1:
         return None, ["more than one test has that full name"], []
     t = matches[0]
+    fns = {t.block.fn, "vi"}
+    p = t.block.parent
+    while p is not None:
+        fns.add(f.blocks[p].fn)
+        p = f.blocks[p].parent
     problems = list(t.unregistered)
     if t.skipped:
         problems.append("the test is skipped, todo, expected to fail or has no body")
@@ -1796,10 +1979,14 @@ def _check_link(link: AssertionLink, command: str, head, parse, policy):
             [],
         )
     a = found
+    fns.add(a.call.split(".")[0])
+    shadowed = [why for name, why in f.shadowed if name in fns]
+    if shadowed:
+        return None, [f"{why}, so this test cannot be trusted" for why in shadowed], []
     [(stack, exits)] = _walk(f, s, [a.start])
     hard_exits = [ln for ln, cond in exits if not cond]
     if hard_exits:
-        return None, [f"line {hard_exits[0]}: returns or throws before the assertion"], []
+        return None, [f"line {hard_exits[0]}: returns before the assertion"], []
 
     subject = f"{link.path}{_SEP}{link.test}"
     flags = []
@@ -1808,7 +1995,7 @@ def _check_link(link: AssertionLink, command: str, head, parse, policy):
             Flag(
                 FlagKind.MAY_NOT_RUN,
                 subject,
-                f"line {ln}: a conditional return or throw before the assertion can skip it",
+                f"line {ln}: a conditional return before the assertion can skip it",
             )
         )
     if "fn" in stack:
@@ -1832,11 +2019,15 @@ def _check_link(link: AssertionLink, command: str, head, parse, policy):
         flags.append(Flag(FlagKind.MAY_NOT_RUN, subject, f"the assertion {guard}"))
 
     product = {name for name, spec in f.imports if _is_product(link.path, spec)}
+    namespaces = set(f.namespaces) & product
     bindings = _bindings(f, t)
-    reached = _reach(a.subject, product, bindings)
+    aliases = _aliases(product, namespaces, bindings)
     if _is_literal(a.subject):
         flags.append(Flag(FlagKind.FIXTURE_ONLY, subject, "the assertion checks a literal value"))
-    elif not reached:
+    elif not (
+        _traced(a.subject, product, bindings)
+        or _passed_to_product(f, s, a.start, a.subject, product | set(aliases), namespaces)
+    ):
         flags.append(
             Flag(
                 FlagKind.FIXTURE_ONLY,
@@ -1867,16 +2058,18 @@ def _check_link(link: AssertionLink, command: str, head, parse, policy):
         flags.append(Flag(FlagKind.WEAK_ASSERTION, subject, weak))
 
     if a.expected is not None:
-        primary = _called(a.subject, product)
-        mirrored = primary & (
-            _called(a.expected, product)
-            | {
-                n
-                for name in _idents(a.expected)
-                for v in bindings.get(name, ())
-                for n in _called(v, primary)
-            }
-        )
+        if _normalize(a.subject) and _normalize(a.subject) == _normalize(a.expected):
+            flags.append(
+                Flag(FlagKind.MIRRORS_CODE, subject, "the assertion compares a value with itself")
+            )
+        primary = _calls(a.subject, product, namespaces, aliases)
+        expected = _calls(a.expected, product, namespaces, aliases) | {
+            n
+            for name in _idents(a.expected)
+            for v in bindings.get(name, ())
+            for n in _calls(v, product, namespaces, aliases)
+        }
+        mirrored = primary & expected
         if mirrored:
             flags.append(
                 Flag(
@@ -1903,7 +2096,29 @@ def _check_link(link: AssertionLink, command: str, head, parse, policy):
     )
 
 
+def _passed_to_product(f, start, pos, subject, product, namespaces) -> bool:
+    """Whether a name in the asserted value was handed to product code earlier in
+    the test, as in "does not change its input": expect(books).toEqual(before)."""
+    names = set(_idents(subject)) - product
+    if not names:
+        return False
+    for m in _CALL_SITE_RE.finditer(f.masked, start, pos):
+        a, b = m.group(1), m.group(2)
+        if not ((a in namespaces and b) or (not b and a in product)):
+            continue
+        try:
+            args = f.masked[m.end() : _match(f.masked, m.end() - 1)]
+        except ParseError:
+            continue
+        if names & set(_idents(args)):
+            return True
+    return False
+
+
 def _weakness(a: _Assertion) -> str | None:
+    op = _top_level_operator(a.subject)
+    if op:
+        return f"the asserted value is combined with other values by `{op}`"
     if a.expected is None:
         if a.call in _WEAK_ASSERTS:
             return f"`{a.call}(...)` only checks that the value is truthy"
@@ -1914,8 +2129,13 @@ def _weakness(a: _Assertion) -> str | None:
         return f"`{a.matcher}` does not pin the value down"
     if a.matcher in ("toThrow", "toThrowError") and not a.expected.strip():
         return f"`{a.matcher}()` with no expected error passes on any error"
-    if re.search(r"(?<![\w$.])expect\s*\.\s*(?:any|anything)\s*\(", a.expected):
-        return "the expected value uses expect.any/expect.anything"
+    if a.matcher == "toHaveProperty" and len(_split_args(a.expected)) < 2:
+        return "`toHaveProperty` without a value only checks the property exists"
+    if a.matcher == "toMatchObject" and re.fullmatch(r"\s*\{\s*\}\s*", a.expected):
+        return "`toMatchObject({})` matches any object"
+    asym = re.search(r"(?<![\w$.])expect\s*\.\s*(?:not\s*\.\s*)?([A-Za-z]+)\s*\(", a.expected)
+    if asym:
+        return f"the expected value uses expect.{asym.group(1)}; confirm it pins the value down"
     return None
 
 
@@ -2023,10 +2243,12 @@ def _apply_clearances(flags, clearances, candidate, coverage, policy, ignored):
 def render(report: AssertionReport) -> str:
     """The report as Markdown, for a PR comment or Rolando's review.
 
-    Every supplied string is put on one line, so nothing in a test name, note
-    or reason can start a line of its own (such as a fake "ready" line).
+    Every supplied string is put on one line and has its Markdown and HTML
+    escaped (or sits in a code span), so nothing in a test name, note or reason
+    can start a line of its own, such as a fake "ready" line, or hide the rest
+    of the report.
     """
-    o = _one_line
+    o = _md
     lines = [
         "## Assertion map",
         "",
@@ -2042,20 +2264,20 @@ def render(report: AssertionReport) -> str:
     for c in report.criteria:
         if c.status is Coverage.COVERED and c.assertions:
             shown = "; ".join(
-                f"{a.path}:{a.line} {_code(a.test)} {_code(a.assertion)}" for a in c.assertions
+                f"{o(a.path)}:{a.line} {_code(a.test)} {_code(a.assertion)}" for a in c.assertions
             )
         elif c.status is Coverage.COVERED:
-            shown = "; ".join(x.detail.splitlines()[0] for x in c.observations if x.detail)
+            shown = o("; ".join(x.detail.splitlines()[0] for x in c.observations if x.detail))
         else:
-            shown = "; ".join(c.reasons)
+            shown = o("; ".join(c.reasons))
         lines.append(
-            f"| {o(c.criterion)} | {c.status.value} | {_cell(o(shown))} | `{c.commit[:12]}` |"
+            f"| {o(c.criterion)} | {c.status.value} | {_cell(shown)} | `{c.commit[:12]}` |"
         )
     if report.flags:
         lines += ["", "### Needs review", ""]
         for f in report.flags:
             state = f"cleared by {o(f.cleared_by)}: {o(f.note)}" if f.cleared_by else "open"
-            lines.append(f"- {_code(o(f.key))} ({state}): {o(f.detail)}")
+            lines.append(f"- {_code(f.key)} ({state}): {o(f.detail)}")
     lines += ["", "### Gates", ""]
     lines += [f"- {'ok' if g.ok else 'BLOCKED'}: {o(g.name)}: {o(g.detail)}" for g in report.gates]
     lines.append(
@@ -2068,7 +2290,7 @@ def render(report: AssertionReport) -> str:
         lines += ["", f"### {o(c.criterion)}: {c.status.value}", "", o(c.statement)]
         for a in c.assertions:
             lines.append(
-                f"- {o(a.path)}:{a.line} {_code(o(a.test))}, mapped by {o(a.mapper)}: {o(a.why)}"
+                f"- {o(a.path)}:{a.line} {_code(a.test)}, mapped by {o(a.mapper)}: {o(a.why)}"
             )
         lines += [f"- Limit: {o(x)}" for x in c.limits]
     if report.ignored:
@@ -2082,6 +2304,16 @@ _LINE_BREAKS = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+")
 
 def _one_line(text: str) -> str:
     return _LINE_BREAKS.sub(" ", str(text))
+
+
+_MD_SPECIAL = re.compile(r"([\\`*_\[\]#~!])")
+_HTML = {"&": "&amp;", "<": "&lt;", ">": "&gt;"}
+
+
+def _md(text: str) -> str:
+    """Supplied text made inert: one line, Markdown escaped, HTML as entities."""
+    text = _MD_SPECIAL.sub(r"\\\1", _one_line(text))
+    return re.sub(r"[&<>]", lambda m: _HTML[m.group(0)], text)
 
 
 def _code(text: str) -> str:
