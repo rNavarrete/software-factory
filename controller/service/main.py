@@ -39,8 +39,10 @@ Linear:
 
 ``--live`` sets all three to ``linear`` and needs no fixture folder. Whether
 anything is taken on is still the onboarding file's ``intake_enabled``, which
-is off unless set. The reviewer (ENG-156) and repairs (ENG-160) are still
-fixtures. A real worker is fired only with ``--real-runtime``.
+is off unless set. The independent review (ENG-156) runs when its workflow
+is configured (``--review-dispatcher``, ``--review-model``), and repairs
+(ENG-160) read its verdicts; each Todo move's repair allowance is 0 unless the
+onboarding file sets one. A real worker is fired only with ``--real-runtime``.
 
 Before its first round, a service that uses Linear checks what it needs and
 does not start without it: the ``linear-key`` and ``github-token`` secrets,
@@ -278,12 +280,13 @@ def build(args: argparse.Namespace):
                 for p in sorted((fixture_dir / "contracts").glob("*.json"))
             }
         )
+    reviewer = _reviewer(args, secrets, store, root)
     integrations = Integrations(
         source=source,
         preparer=preparer,
         reporter=_reporter(args, secrets, forbidden),
-        reviewer=_reviewer(args, secrets, store, root) or fixtures.RecordingReviewer(),
-        repair=fixtures.NoRepair(),
+        reviewer=reviewer or fixtures.RecordingReviewer(),
+        repair=_repair(reviewer),
         authorizer=_authorizer(socket_path) if args.source == "linear" else None,
     )
     service = Service(
@@ -567,6 +570,18 @@ def _reviewer(args: argparse.Namespace, secrets, store, root: Path):
         repo=PILOT_REPO,
         results=WorkflowResults(HttpGitHubApi(token), config),
     )
+
+
+def _repair(reviewer):
+    """What repairs (ENG-160) read: the real review's recorded "failed"
+    verdicts, or nothing with the stand-in reviewer (docs/repair.md)."""
+    from controller.service import fixtures
+
+    if reviewer is None:
+        return fixtures.NoRepair()
+    from controller.repair.review import ReviewFailures
+
+    return ReviewFailures(reviewer)
 
 
 def _reporter(args: argparse.Namespace, secrets, forbidden: Callable[[], frozenset[str]]):

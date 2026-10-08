@@ -39,8 +39,8 @@ The signer writes the allowance into the move's signed approval and keeps it in 
 
 ## Before turning it on
 
-1. The independent review (ENG-156) is merged and wired in, so the service reads real verdicts. Until then the service uses a fixture that never reports a failure.
-2. The routine's saved prompt is replaced with `controller/adapter/routine_prompt.md` from this change. The old prompt refuses a task message with a `repair` part, so a repair would stop at the worker.
+1. The independent review is configured on the service (`--review-dispatcher` and `--review-model`, see docs/review.md). Repairs read its recorded verdicts; while the service runs the stand-in reviewer, nothing ever reports a failure, so no repair starts. A second repair also needs the review's `extra_passes`, because by default a task gets one full review and one verification pass.
+2. The routine's saved prompt is replaced with the current `controller/adapter/routine_prompt.md`. The old prompt refuses a task message with a `repair` part, so a repair would stop at the worker.
 3. The live demonstrations in ENG-163: one successful repair, and one capped repair that ends with the report.
 4. Rolando sets `repair_allowance` and `repair_allowance_since` in the onboarding file.
 
