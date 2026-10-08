@@ -8,7 +8,7 @@
     "Follow addBook's rule for a missing title or author: throw an Error."
   ],
   "repository": "rNavarrete/factory-pilot-demo",
-  "base_commit": "6c6badb8f086b7c4a3eaf3ba43317854e87e9b96",
+  "base_commit": "cab3d1a31626a89e6f5dd253acacf27ba7681a56",
   "permitted_paths": [
     "src/books.ts",
     "tests/books.test.ts"
