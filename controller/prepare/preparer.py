@@ -29,9 +29,11 @@ Standard library only. All I/O is through the injected reader and GitHub API.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from controller import contract as contracts
 from controller.loop.collect import GitHubApi
@@ -63,6 +65,7 @@ query PrepareIssue($id: String!) {
     id identifier title description trashed archivedAt
     project { id } team { id } parent { id }
     labels(first: 50) { nodes { name } }
+    attachments(first: 50) { nodes { url } pageInfo { hasNextPage } }
   }
 }
 """
@@ -86,6 +89,27 @@ class LinearTicketReader:
             return v.get("id") if isinstance(v, Mapping) and isinstance(v.get("id"), str) else None
 
         labels = (issue.get("labels") or {}).get("nodes") or []
+        attachments = issue.get("attachments")
+        urls = ()
+        complete = False
+        if attachments is not None:
+            if isinstance(attachments, Mapping):
+                nodes = attachments.get("nodes")
+                page = attachments.get("pageInfo")
+                complete = (
+                    isinstance(nodes, list | tuple)
+                    and isinstance(page, Mapping)
+                    and page.get("hasNextPage") is False
+                )
+                if isinstance(nodes, list | tuple):
+                    urls = tuple(
+                        str(n.get("url") or "unreadable attachment")
+                        if isinstance(n, Mapping)
+                        else "unreadable attachment"
+                        for n in nodes
+                    )
+            else:
+                complete = False
         return Snapshot(
             id=str(issue.get("id") or ""),
             key=str(issue.get("identifier") or ""),
@@ -95,6 +119,8 @@ class LinearTicketReader:
             team_id=nid("team"),
             parent_id=nid("parent"),
             labels=tuple(str(n.get("name")) for n in labels if isinstance(n, Mapping)),
+            attachments=urls,
+            attachments_complete=complete,
         )
 
 
@@ -163,6 +189,15 @@ class Preparer:
             # Far too long to be one task: say so without parsing it at all.
             stop = too_long(len(full_text), policy)
             return ask(authorization, stop.text, stop.kind)
+        if needs_captured_context(snap):
+            return ask(
+                authorization,
+                "This ticket includes linked product context or design attachments that the"
+                " factory has not yet captured and checked. It has stopped before drafting"
+                " so that content is not silently omitted. This is a factory integration"
+                " limitation; no product answer or sample material is needed from you.",
+                "factory",
+            )
         reading = read(snap)
         stop = screen(reading, full_text, policy)
         if stop is not None:
@@ -211,6 +246,75 @@ class Preparer:
                 "factory",
             )
         return Prepared(contract, summarize(reading, draft, base, project, policy))
+
+
+_CONTEXT_HOSTS = ("notion.so", "notion.site", "notion.com", "figma.com", "uploads.linear.app")
+_LINK_RE = re.compile(r"(?:https?://|//|(?<![\w@./:-])(?:[\w-]+\.)+)[^\s<>\[\]()\"'`]+", re.I)
+"""URLs and bare domains, without starting inside an email address or another path."""
+_IMAGE_LINK_RE = re.compile(
+    r"(?:https?://|//|(?<![\w@./:-])(?:[\w-]+\.)+)[^\s<>]*"
+    r"\.(?:png|jpe?g|gif|webp|svg)(?:[?#\s)>]|$)",
+    re.I,
+)
+"""Also catch valid image paths containing parentheses, e.g. design(v2).png."""
+
+
+def _github_delivery_attachment(url: str) -> bool:
+    """Only GitHub PR/commit attachments are delivery records, not design sources.
+
+    Keep unknown GitHub links (including blobs and uploaded assets) under the hold.
+    This classification neither reads the URL nor changes its authority.
+    """
+    try:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in {"github.com", "www.github.com"}
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return False
+        return bool(
+            re.fullmatch(
+                r"/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/"
+                r"(?:pull/[1-9][0-9]*|commit/[0-9a-fA-F]{7,40})/?",
+                parsed.path,
+            )
+        )
+    except ValueError:
+        return False
+
+
+def needs_captured_context(snap: Snapshot) -> bool:
+    """Conservative guard until source assessment and hosted delivery are qualified.
+
+    Recognize references; never fetch them here or mistake a URL for its contents.
+    Attachments remain separate from intake's ticket-text authorization formula.
+    """
+    text = f"{snap.title}\n{snap.description}"
+    linked_context = False
+    for url in _LINK_RE.findall(text):
+        try:
+            if "://" not in url:
+                url = "https:" + url if url.startswith("//") else "https://" + url
+            parsed = urlsplit(url)
+            host = (parsed.hostname or "").lower().rstrip(".")
+        except ValueError:
+            linked_context = True  # malformed reference cannot establish complete context
+            break
+        if any(host == d or host.endswith("." + d) for d in _CONTEXT_HOSTS) or re.search(
+            r"\.(?:png|jpe?g|gif|webp|svg)$", parsed.path, re.I
+        ):
+            linked_context = True
+            break
+    return bool(
+        any(not _github_delivery_attachment(url) for url in snap.attachments)
+        or not snap.attachments_complete
+        or linked_context
+        or re.search(r"!\[|<img\b", text, re.I)
+        or _IMAGE_LINK_RE.search(text)
+    )
 
 
 def ask(authorization: Authorization, text: str, kind: str) -> Question:
