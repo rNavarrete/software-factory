@@ -145,17 +145,44 @@ class Recovery:
                 return s
         raise RecoveryRefused(f"{attempt} was never started")
 
-    def blocks(self, now: datetime) -> tuple[Notice, ...]:
+    def blocks(self, now: datetime, *, automatic_repair: bool = False) -> tuple[Notice, ...]:
         """Reasons no new fire may start, factory-wide, beyond the gate's own.
 
         Dispatch adds these to ``Approvals.check`` and ``AttemptGate.reserve``:
         a launch interrupted and not yet recovered, a signed clearing that does
         not meet ADR 0002 section 6.1 (for instance written straight through
         ``Approvals.record_clearing`` with the wrong session), and work on
-        GitHub for an attempt none of whose fires launched.
+        GitHub for an attempt none of whose fires launched. Automatic repairs
+        additionally require qualified clearing for every possible writer;
+        Rolando's accepted-uncertainty exception remains manual-only.
         """
         _aware(now)
-        return st.blocks(self._trusted(), now, self._wait)
+        trusted = self._trusted()
+        if automatic_repair:
+            # Accepting an unknown writer is a human exception, not proof
+            # that the writer stopped. Automatic replacements cannot inherit
+            # it. Keep all other evidence, including later qualified clearing.
+            trusted = [
+                item
+                for item in trusted
+                if not (
+                    item.event.kind == gate_events.ATTEMPT_CLEARED
+                    and item.event.data.get("basis")
+                    == gate_events.ClearingBasis.UNRESOLVED_ACCEPTED.value
+                )
+            ]
+        blocks = list(st.blocks(trusted, now, self._wait))
+        if automatic_repair:
+            blocks.extend(
+                Notice(
+                    "repair-writer-not-cleared",
+                    f"Attempt {status.attempt} has no qualified writer clearing;"
+                    " an automatic repair cannot inherit an accepted unknown-writer risk.",
+                )
+                for status in st.attempt_statuses(trusted, now, self._wait)
+                if not status.writer_cleared
+            )
+        return tuple(blocks)
 
     def may_restore_bot_access(self, now: datetime) -> tuple[bool, tuple[str, ...]]:
         """ADR 0002 section 6.1: give the bot its push access back only once every

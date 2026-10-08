@@ -138,7 +138,7 @@ class SignedAllowanceTests(AuthorizerCase):
         self.config = repair_config(1)
         self.assertTrue(self.refused(eid).final)
 
-    def test_positive_allowance_is_pinned_to_its_policy_and_ticket_revision(self):
+    def test_positive_allowance_is_pinned_to_its_repair_settings_and_ticket_revision(self):
         self.config = repair_config(1)
         eid = self.move()
         first = self.authorize(eid)
@@ -146,7 +146,12 @@ class SignedAllowanceTests(AuthorizerCase):
         again = self.authorize(eid)
         self.assertEqual(first.data["repair_allowance"], again.data["repair_allowance"])
         self.assertNotEqual(first.data["decision_id"], again.data["decision_id"])
+        # An unrelated onboarding edit doesn't block renewing a queued move.
         self.config["projects"][0]["skip_labels"] = ["baseline", "manual"]
+        self.authorize(eid)
+        self.config["projects"][0]["repair_allowance_since"] = (
+            NOW - timedelta(minutes=30)
+        ).isoformat()
         self.assertTrue(self.refused(eid).final)
         self.config = repair_config(1)
         self.world.find("ENG-187")["description"] = "Quietly different"

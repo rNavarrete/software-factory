@@ -414,6 +414,7 @@ def run_signer(args: argparse.Namespace) -> int:
     from controller.approval import StaticKey
     from controller.service.secrets import FileSecrets, approval_key_bytes
     from controller.signer import SignerServer, drop_privileges
+    from controller.signer.signer import REPAIR_OP
 
     secrets_dir = os.environ.get(SECRETS_DIR_ENV)
     if not secrets_dir:
@@ -429,7 +430,9 @@ def run_signer(args: argparse.Namespace) -> int:
             # Todo move can be approved. Typed approvals work as before.
             log.warning("no linear-key: Todo-move approval is off")
         else:
-            extra["authorize"] = _todo_move_handler(args, key, linear_key)
+            handler = _todo_move_handler(args, key, linear_key)
+            extra["authorize"] = handler
+            extra[REPAIR_OP] = handler
     signer = pwd.getpwnam(args.user)
     client = pwd.getpwnam(args.client_user)
     group = grp.getgrgid(client.pw_gid).gr_gid

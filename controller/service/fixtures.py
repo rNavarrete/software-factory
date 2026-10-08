@@ -19,6 +19,7 @@ from controller.service.seams import (
     Answer,
     Authorization,
     Control,
+    FailureReport,
     IntakeBatch,
     Prepared,
     PullRequestRef,
@@ -142,8 +143,26 @@ class FixtureDecisions:
 
 
 class NoRepair:
-    def advise(self, attempt: AttemptId, detail: str) -> str | None:
+    """No failure is ever reported, so nothing is repaired automatically."""
+
+    def failure(self, attempt: AttemptId) -> FailureReport | None:
         return None
+
+
+class FixtureFailures:
+    """Failure reports by attempt, as a review would give them."""
+
+    def __init__(self, by_attempt: Mapping[AttemptId, FailureReport] | None = None) -> None:
+        self.by_attempt = dict(by_attempt or {})
+        self.calls: list[AttemptId] = []
+        self.fail_next: Exception | None = None
+
+    def failure(self, attempt: AttemptId) -> FailureReport | None:
+        self.calls.append(attempt)
+        if self.fail_next is not None:
+            e, self.fail_next = self.fail_next, None
+            raise e
+        return self.by_attempt.get(attempt)
 
 
 def load_events(path: Path) -> list[Authorization | Refusal | Control]:
@@ -166,6 +185,7 @@ def load_events(path: Path) -> list[Authorization | Refusal | Control]:
 
 __all__ = [
     "FixtureDecisions",
+    "FixtureFailures",
     "FixturePreparer",
     "FixtureSource",
     "LogReporter",

@@ -13,8 +13,9 @@ can be built and tested on its own against the fixtures in ``fixtures.py``:
   or into a product question for Rolando.
 - ``Reporter``: ENG-178. Posts the service's messages on Linear tickets.
 - ``ReviewStarter``: ENG-156. Starts the independent review of a worker PR.
-- ``RepairAdvisor``: ENG-160. Says whether a failed attempt should be
-  repaired, and why. It never authorizes the repair itself.
+- ``FailureSource``: ENG-160. What independently failed on an attempt's
+  latest candidate (the review's verdict, CI as the review read it), for the
+  bounded automatic repair. It never authorizes the repair itself.
 
 Nothing here approves a contract. The service fires only a contract that
 already has Rolando's signed approval in the ledger (``Approvals.check``).
@@ -34,9 +35,11 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from controller.interfaces import AttemptId, TaskId
+from controller.repair.findings import RepairFinding
 
 _ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-[1-9][0-9]*$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
 """Linear ids (UUIDs) and the like. Kept plain so the ledger's redaction can
 never change an id the service later compares."""
@@ -343,14 +346,40 @@ class ReviewStarter(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class FailureReport:
+    """A final, independently observed failure of one exact candidate."""
+
+    attempt: AttemptId
+    pr: int
+    head: str
+    """The exact commit the findings were raised on (40 hex)."""
+    findings: Sequence[RepairFinding]
+    """Open findings, blocking or not, as the review routed them."""
+    source: str
+    """Where it comes from, for the record: the review's request key."""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.head, str) or not _COMMIT_RE.fullmatch(self.head):
+            raise ValueError("head must be a 40-character commit id")
+        if not isinstance(self.pr, int) or isinstance(self.pr, bool) or self.pr < 1:
+            raise ValueError("pr must be a pull request number")
+        _text(self.source, "source")
+
+
 @runtime_checkable
-class RepairAdvisor(Protocol):
+class FailureSource(Protocol):
     """ENG-160."""
 
-    def advise(self, attempt: AttemptId, detail: str) -> str | None:
-        """The failure a repair should fix, or None for no repair. The service
-        only reports the advice; a repair still needs its signed go-ahead."""
+    def failure(self, attempt: AttemptId) -> FailureReport | None:
+        """The attempt's latest candidate's final failed verdict, or None while
+        there is none (still running, passed, waiting on CI, unknown, or only
+        Rolando can settle it). Raise to have the service try again next round."""
         ...
+
+
+RepairAdvisor = FailureSource
+"""The seam's earlier name."""
 
 
 class AuthorizationRefused(Exception):
@@ -375,15 +404,38 @@ class Authorizer(Protocol):
         ...
 
 
+@runtime_checkable
+class RepairAuthorizer(Protocol):
+    """ENG-160. The repair allowance of Rolando's Todo move, exercised: on the
+    host the signer checks the move with Linear again and signs a
+    ``source-repair-authorized`` record for exactly one attempt. The service
+    never signs anything."""
+
+    def use_repair_allowance(
+        self,
+        authorization: Authorization,
+        contract: Mapping[str, object],
+        attempt: AttemptId,
+        prior_pr: int,
+        prior_head: str,
+        failure: str,
+        findings: Sequence[Mapping[str, str]],
+    ):
+        """The signed ledger event to append, or raise AuthorizationRefused."""
+        ...
+
+
 @dataclass(frozen=True)
 class Integrations:
     source: AuthorizationSource
     preparer: ContractPreparer
     reporter: Reporter
     reviewer: ReviewStarter
-    repair: RepairAdvisor
+    repair: FailureSource
     authorizer: Authorizer | None = None
-    """None: only Rolando's typed approvals count (the qualification run)."""
+    """None: only Rolando's typed approvals count (the qualification run). An
+    authorizer that also has ``use_repair_allowance`` (``RepairAuthorizer``)
+    lets the service use the Todo move's repair allowance."""
     decisions: DecisionReader | None = None
     """For the preparer (ENG-175); None until it is wired."""
 
@@ -398,6 +450,8 @@ __all__ = [
     "Authorizer",
     "ContractPreparer",
     "Control",
+    "FailureReport",
+    "FailureSource",
     "DecisionReader",
     "IntakeBatch",
     "Integrations",
@@ -407,6 +461,8 @@ __all__ = [
     "Question",
     "Refusal",
     "RepairAdvisor",
+    "RepairAuthorizer",
+    "RepairFinding",
     "Standing",
     "ReportFailed",
     "Reporter",

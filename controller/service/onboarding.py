@@ -92,7 +92,9 @@ class Project:
     """Paths a Todo move alone can't approve a change to (ENG-174)."""
     repair_allowance: int = 0
     """Corrections included in the total attempt budget (ENG-160), not extra
-    attempts. Recording this allowance does not enable automatic dispatch."""
+    attempts. The factory may start that many repair attempts on its own after
+    an independently found routine failure; zero means every repair needs
+    Rolando's typed go-ahead (docs/repair.md)."""
     repair_allowance_since: datetime | None = None
     """Only Todo moves at or after this policy activation may include repairs."""
 
