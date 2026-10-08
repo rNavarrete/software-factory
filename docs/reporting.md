@@ -13,7 +13,7 @@ Every entry the factory posts opens with a bold stage:
 | Queued | The Todo move was accepted |
 | Waiting | It can't start yet; the entry says what it is waiting for (approval, a cap, a hold, a provider) |
 | Working | The worker started |
-| Reviewing | The worker's PR is up and the independent review started |
+| Reviewing | CI is pending for the current revision, or independent review is running |
 | Repairing | An automatic repair actually started (posted only after the worker launched). Before that, a Waiting entry says the fix is eligible and how many repairs are left |
 | Needs your decision | A product question, an observation request, or a suggested repair |
 | Ready for your review | What changed, what was checked, the limitations and the exact reviewed commit |
@@ -31,7 +31,11 @@ The factory does not change the team's states or add labels. It must not overwri
 
 Every message has a unique key in the service's outbox. The reporter turns the key into the comment's id, so the same message always has the same id. Before creating a comment it asks Linear whether that id exists. If it does, an earlier try worked and nothing more is posted. A restart, a crash between posting and saving, a timeout or a lost answer therefore never shows the same message twice. Once a message is recorded as posted it is never posted again, even if someone deletes the comment.
 
-When Linear is down or rate limiting the factory, the reporter says so and the service stops posting for that round. The messages wait in the ledger and go out later, with growing waits between tries. Retrying a message never repeats a launch. A ticket's comments always go out in the order they were written. While an older one waits to be retried, newer ones for the same ticket wait behind it, so the newest comment is always the current stage.
+When Linear is down or rate limiting the factory, the reporter says so and the service stops posting for that round. The messages wait in the ledger and go out later, with growing waits between tries. Retrying a message never repeats a launch. Remaining messages go out in order for each ticket, with obsolete queued readiness reports discarded as described below.
+
+Readiness messages are bound to the attempt and complete review revision, including the contract, head and base. Before sending one, the service requires a passing check from the current work round. If that check is unreadable, delivery waits. A changed review, withdrawn task, newer attempt or closed item discards the queued readiness message and records why; merge closeout can still be delivered. Delivery does not start reviews itself. Old queued readiness messages without revision bindings are discarded during upgrade; active tasks receive a freshly checked report.
+
+When CI is pending after a new push or base change, a Reviewing entry explicitly says the revision is not ready and earlier readiness does not apply. Review transitions are recorded in the ledger, so a restored pass is reported even on the same commit, while repeated polls and restarts stay quiet. Already posted comments remain history. Messages describe the last successful check; a push after that check can only be reflected in a subsequent round.
 
 The factory posts as its own Linear user. Whose key it is gets checked for each key value before that key is used, so replacing the secret takes effect at once and can't skip the check. If the key acts as Rolando, nothing is posted, and the reason is recorded every round, because a comment that looked like his could pass for his decision.
 
