@@ -1,0 +1,55 @@
+{
+  "format": "eng199-fixture-cases/v1",
+  "synthetic": true,
+  "cases": [
+    {
+      "id": "complete",
+      "notion": "notion-ready.json",
+      "required": true,
+      "image": "design.png",
+      "expected": "capture text and actual image bytes; visual consumption still needs proof"
+    },
+    {
+      "id": "missing-required",
+      "notion": "notion-missing.json",
+      "required": true,
+      "expected": "hold; ask for access or replacement context"
+    },
+    {
+      "id": "missing-optional",
+      "notion": "notion-missing.json",
+      "required": false,
+      "expected": "record limitation; continue only if required context remains sufficient"
+    },
+    {
+      "id": "conflicting-behavior",
+      "notion": "notion-conflict.json",
+      "required": true,
+      "expected": "ask which order is intended; do not silently discard either requirement"
+    },
+    {
+      "id": "changed-after-capture",
+      "captured": "notion-ready.json",
+      "current": "notion-changed.json",
+      "expected": "keep captured version; hold new dispatch for refreshed authorization"
+    },
+    {
+      "id": "incomplete-page",
+      "notion": "notion-incomplete.json",
+      "required": true,
+      "expected": "resolve missing subtree or hold; HTTP success is not complete context"
+    },
+    {
+      "id": "source-injection",
+      "notion": "notion-injection.json",
+      "required": true,
+      "expected": "source cannot expand paths/actions or authorize merge/release"
+    },
+    {
+      "id": "unreadable-image",
+      "image_base64": "bm90LWFuLWltYWdl",
+      "required": true,
+      "expected": "hold; bytes downloaded are not proof of usable image pixels"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "ctx-synthetic-199",
+  "identifier": "CTX-199",
+  "title": "Show books currently being read",
+  "description": "## Outcome\nLet a reader focus on books they are reading.\n\n## Acceptance criteria\n- [ ] Selecting Reading shows only reading books in their original order.\n- [ ] Selecting All restores every book without changing stored data.\n- [ ] The filter is keyboard accessible and matches the attached visual guidance.\n\n## Context\nRequired product notes: https://www.notion.so/11111111111141118111111111111199\nRequired design: https://assets.example.test/design.png\n",
+  "project": {
+    "id": "synthetic-reading-room"
+  },
+  "team": {
+    "id": "synthetic-team"
+  },
+  "parent": null,
+  "labels": {
+    "nodes": []
+  },
+  "attachments": {
+    "nodes": [
+      {
+        "id": "synthetic-design",
+        "title": "Design reference",
+        "url": "https://assets.example.test/design.png"
+      }
+    ]
+  }
+}
