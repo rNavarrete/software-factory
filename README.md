@@ -33,6 +33,9 @@ Each directory belongs to one ticket so parallel work never edits the same files
 | `controller/dispatch/` | ENG-176 | The dispatch path |
 | `controller/cli.py`, `controller/__main__.py`, `[project.scripts]` in `pyproject.toml` | ENG-176 | The `factory` command. Other tickets expose plain functions; ENG-176 wires them to subcommands (`dispatch`, `status`, `reconcile`, `hold`, `resume`, `snapshot`) |
 | `verify/` | ENG-156, ENG-157 | Criterion verifier and assertion mapper |
+| `controller/loop/collect.py`, `verify/review.py` | ENG-145 | Reading a worker PR's evidence from GitHub, and the independent mapper's review comment |
+| `controller/loop/` | ENG-145 | `python3 -m controller.loop run <contract.json>`: one task from contract to a PR ready for Rolando's review |
+| `tasks/samples/` | ENG-145 | The sample task contracts for the first full runs |
 | `redteam/` | ENG-158 | Red-team checks |
 | `docs/adr/0001-operating-model.md` | ENG-134 | Operating model and human authority |
 | `docs/adr/0002-runtime-controller-identity.md` | ENG-136 (ENG-183 owns section 11) | Runtime and controller |

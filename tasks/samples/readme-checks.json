@@ -1,0 +1,39 @@
+{
+  "format": "factory-contract/v1",
+  "task_id": "readme-checks",
+  "version": "1",
+  "goal": "Tell a new contributor, in the README, the one command to run before pushing and what it checks.",
+  "inputs": [
+    "package.json defines npm run check; scripts/check.mjs is what it runs.",
+    "docs/checks.md describes the check in detail; link to it rather than repeating it."
+  ],
+  "repository": "rNavarrete/factory-pilot-demo",
+  "base_commit": "6c6badb8f086b7c4a3eaf3ba43317854e87e9b96",
+  "permitted_paths": [
+    "README.md"
+  ],
+  "permitted_actions": [
+    "modify-files"
+  ],
+  "risk_markers": [],
+  "acceptance_criteria": [
+    {
+      "id": "ac1",
+      "statement": "README.md has a short section titled 'Before you push' that says to run npm run check, lists what it checks (format, lint, typecheck, tests and build) and links to docs/checks.md.",
+      "evidence": {
+        "type": "observable-behavior",
+        "steps": "Open README.md on the PR branch and read the 'Before you push' section.",
+        "expected": "The section names npm run check, lists format, lint, typecheck, tests and build, and its link to docs/checks.md opens that file."
+      },
+      "status": "ready"
+    }
+  ],
+  "verification_commands": [
+    "npm run typecheck",
+    "npm test",
+    "npm run build"
+  ],
+  "attempt_budget": 2,
+  "escalate_to": "rNavarrete",
+  "depends_on": []
+}
