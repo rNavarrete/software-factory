@@ -200,6 +200,29 @@ class LedgerEventTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             event.data["a"] = 3
 
+    def test_nested_data_is_copied_and_frozen(self):
+        data = {"approval": {"by": "rolando", "checks": ["ci"]}, "files": [{"path": "a"}]}
+        event = LedgerEvent("x", AT, data=data)
+        data["approval"]["by"] = "someone else"
+        data["approval"]["checks"].append("extra")
+        data["files"][0]["path"] = "b"
+        data["files"].append({"path": "c"})
+        self.assertEqual(event.data["approval"]["by"], "rolando")
+        self.assertEqual(event.data["approval"]["checks"], ("ci",))
+        self.assertEqual(event.data["files"][0]["path"], "a")
+        self.assertEqual(len(event.data["files"]), 1)
+        with self.assertRaises(TypeError):
+            event.data["approval"]["by"] = "someone else"
+        with self.assertRaises(TypeError):
+            event.data["files"][0]["path"] = "b"
+        with self.assertRaises(AttributeError):
+            event.data["approval"]["checks"].append("extra")
+
+    def test_data_rejects_non_json_values(self):
+        for data in [{"a": {1, 2}}, {"a": object()}, {"a": {1: "x"}}, {"a": [b"x"]}]:
+            with self.assertRaises(ValueError, msg=data):
+                LedgerEvent("x", AT, data=data)
+
 
 if __name__ == "__main__":
     unittest.main()

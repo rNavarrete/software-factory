@@ -235,12 +235,27 @@ class RuntimeAdapter(Protocol):
 # --- Ledger store -------------------------------------------------------------
 
 
+def _freeze_json(value: object) -> object:
+    """A deep, immutable copy of a JSON value; rejects anything else."""
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Mapping):
+        if not all(isinstance(k, str) for k in value):
+            raise ValueError("ledger event data keys must be strings")
+        return MappingProxyType({k: _freeze_json(v) for k, v in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_json(v) for v in value)
+    raise ValueError(f"ledger event data must be JSON values, got {type(value).__name__}")
+
+
 @dataclass(frozen=True)
 class LedgerEvent:
     """One append-only ledger entry. ``kind`` values are defined by ledger/ (ENG-147).
 
     ``task`` is None for factory-wide events (holds, usage snapshots, rate-limit
-    waits). ``data`` values must be JSON-serializable; it is copied and frozen.
+    waits). ``data`` must hold only JSON values (str keys; str, int, float, bool,
+    None, lists and dicts). It is deep-copied and frozen: dicts become read-only
+    mappings and lists become tuples, so nothing can change after creation.
     """
 
     kind: str
@@ -257,7 +272,7 @@ class LedgerEvent:
             raise ValueError("event run does not belong to its attempt")
         if self.attempt is not None and self.attempt.task != self.task:
             raise ValueError("event attempt does not belong to its task")
-        object.__setattr__(self, "data", MappingProxyType(dict(self.data)))
+        object.__setattr__(self, "data", _freeze_json(dict(self.data)))
 
 
 @dataclass(frozen=True)
