@@ -257,8 +257,9 @@ class AttemptGateTests(unittest.TestCase):
         self.assertEqual(len(self.kinds(ev.FIRE_INTENT)), 6)
         self.refused("task-fire-cap", "attempt-cap")
         self.refused("task-fire-cap", "attempt-cap")
-        dedups = sorted(e.data["dedup"] for e in self.kinds(ev.ESCALATION))
-        self.assertEqual(dedups, ["pilot-1:attempt-cap", "pilot-1:task-fire-cap"])
+        escalations = self.kinds(ev.ESCALATION)
+        self.assertEqual(len(escalations), 1)
+        self.assertEqual(set(escalations[0].data["caps"]), {"attempt-cap", "task-fire-cap"})
 
     # --- G-C3: survives restart ---
 
@@ -325,6 +326,40 @@ class AttemptGateTests(unittest.TestCase):
         )
         self.refused("unresolved-attempt", task=OTHER)
 
+    def test_a_clearing_record_does_not_cover_a_later_refire(self):
+        first = self.run_attempt(TASK, not_launched(400))
+        self.clear(TASK, 1, ev.ClearingBasis.UNRESOLVED_ACCEPTED, "never found")
+        self.append(ev.refire_authorized(first, "Rolando", NOW))
+        second = self.gate.reserve(TASK, DIGEST, NOW, refire_of=first)
+        self.gate.record_launch(second, LOST, NOW)
+        self.refused("unresolved-attempt", task=OTHER)
+
+    def test_decisions_without_a_named_person_grant_nothing(self):
+        first = self.run_attempt(TASK, not_launched(400))
+        self.append(
+            LedgerEvent(ev.REFIRE_AUTHORIZED, NOW, TASK, first.attempt, first, {"by": None}),
+            LedgerEvent(
+                ev.REPAIR_AUTHORIZED,
+                NOW,
+                TASK,
+                AttemptId(TASK, 2),
+                data={"failure": None, "by": None},
+            ),
+        )
+        self.refused("refire-not-authorized", refire_of=first)
+        self.refused("repair-not-authorized")
+        run = self.run_attempt(OTHER, launched())
+        self.append(
+            LedgerEvent(
+                ev.ATTEMPT_CLEARED,
+                NOW,
+                OTHER,
+                run.attempt,
+                data={"basis": "completed", "session_url": "https://x", "by": None},
+            )
+        )
+        self.refused("unresolved-attempt", task=TaskId("third"))
+
     def test_repair_authorization_does_not_clear_an_unresolved_attempt(self):
         self.run_attempt(TASK, launched())
         self.authorize_repair(TASK, 2)
@@ -378,6 +413,55 @@ class AttemptGateTests(unittest.TestCase):
             self.gate.resume("  ", NOW)
         self.gate.resume("new week", NOW)
         self.gate.reserve(TASK, DIGEST, NOW)
+
+    def test_hold_cleared_without_a_note_or_reason_does_not_clear(self):
+        self.gate.hold("manual", "n", NOW)
+        self.append(
+            LedgerEvent(ev.HOLD_CLEARED, NOW, data={}),
+            LedgerEvent(ev.HOLD_CLEARED, NOW, data={"reason": "manual", "note": " "}),
+        )
+        self.refused("hold")
+
+    def test_exhaustion_does_not_lift_a_manual_hold(self):
+        self.gate.hold("upkeep cap", "2h used", NOW)
+        self.gate.resume("check", NOW)
+        self.run_attempt(TASK, not_launched(400, body="usage limit reached"))
+        self.gate.hold("upkeep cap", "2h used", NOW)
+        with self.assertRaises(ValueError):
+            self.gate.resume("reset", NOW)
+        self.gate.resume("reset", NOW, reason=ev.SUBSCRIPTION_EXHAUSTED)
+        self.refused("hold")
+        self.gate.resume("new week", NOW)
+        self.gate.decide(TASK, DIGEST, NOW)
+
+    def test_future_dated_snapshot_counts_for_nothing(self):
+        store = self.make_store()
+        gate = AttemptGate(store)
+        with store.writer_lock():
+            store.append(
+                LedgerEvent(
+                    ev.USAGE_SNAPSHOT,
+                    NOW,
+                    data={
+                        "taken_at": (NOW + timedelta(days=365)).isoformat(),
+                        "session_pct": 0,
+                        "weekly_pct": 0,
+                        "credits_spent": 0,
+                    },
+                )
+            )
+        blocks = {b.code for b in gate.decide(TASK, DIGEST, NOW + timedelta(days=30)).blocks}
+        self.assertIn("usage-snapshot-missing", blocks)
+
+    def test_snapshot_rejects_bad_numbers(self):
+        for args in ((0, 101, 0), (0, 10, float("nan")), (0, 10, -1)):
+            with self.assertRaises(ValueError):
+                self.gate.record_snapshot(NOW, *args, NOW)
+
+    def test_absurd_retry_after_is_still_recorded(self):
+        self.run_attempt(TASK, not_launched(429, retry_after=10**12))
+        self.assertEqual(len(self.kinds(ev.FIRE_RESULT)), 1)
+        self.refused("rate-limited", task=OTHER, at=NOW + timedelta(days=300))
 
     def test_automated_repair_is_refused(self):
         self.refused("automated-repair-deferred", automated=True)

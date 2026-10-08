@@ -6,6 +6,7 @@ session that is already running, so run-time signals are alerts (G-C9).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -87,7 +88,8 @@ class LedgerView:
 
     attempts: dict[AttemptId, AttemptState] = field(default_factory=dict)
     all_fires: list[Fire] = field(default_factory=list)
-    hold: Mapping[str, object] | None = None
+    holds: dict[str, Mapping[str, object]] = field(default_factory=dict)
+    """Open holds by reason. Each reason is cleared on its own."""
     retry_not_before: datetime | None = None
     snapshot: Snapshot | None = None
     repairs: set[AttemptId] = field(default_factory=set)
@@ -117,6 +119,8 @@ class LedgerView:
         elif e.kind == ev.FIRE_INTENT and e.run is not None:
             state = self.attempts.setdefault(e.run.attempt, AttemptState(e.run.attempt, "", e.at))
             fire = Fire(e.run, e.at, None)
+            # A clearing record covers the fires before it, never a later re-fire.
+            state.cleared = None
             fires_by_run[e.run] = len(self.all_fires)
             self.all_fires.append(fire)
             state.fires.append(fire)
@@ -140,18 +144,21 @@ class LedgerView:
         elif e.kind == ev.ATTEMPT_CLEARED and e.attempt in self.attempts:
             basis = ev.ClearingBasis(d["basis"])
             evidence = d[ev.clearing_evidence_field(basis)]
-            if isinstance(evidence, str) and evidence.strip() and str(d.get("by", "")).strip():
+            if _text(evidence) and _text(d.get("by")):
                 self.attempts[e.attempt].cleared = basis
         elif e.kind == ev.REPAIR_AUTHORIZED and e.attempt is not None:
-            if e.attempt.number >= 2 and str(d["failure"]).strip() and str(d["by"]).strip():
+            if e.attempt.number >= 2 and _text(d.get("failure")) and _text(d.get("by")):
                 self.repairs.add(e.attempt)
         elif e.kind == ev.REFIRE_AUTHORIZED and e.run is not None:
-            if str(d["by"]).strip():
+            if _text(d.get("by")):
                 self.refires.add(e.run)
         elif e.kind == ev.HOLD_SET:
-            self.hold = d
+            # A hold with a malformed reason still holds, under a placeholder.
+            reason = d.get("reason")
+            self.holds[reason if _text(reason) else "unnamed hold"] = d
         elif e.kind == ev.HOLD_CLEARED:
-            self.hold = None
+            if _text(d.get("note")) and _text(d.get("reason")):
+                self.holds.pop(d["reason"], None)
         elif e.kind == ev.RATE_LIMIT_WAIT:
             until = _aware(d["not_before"])
             if self.retry_not_before is None or until > self.retry_not_before:
@@ -163,6 +170,8 @@ class LedgerView:
                 _pct(d["weekly_pct"]),
                 _number(d["credits_spent"]),
             )
+            if snap.taken_at > e.at:
+                raise ValueError("a snapshot cannot be from after it was recorded")
             if self.snapshot is None or snap.taken_at >= self.snapshot.taken_at:
                 self.snapshot = snap
         elif e.kind == ev.ESCALATION:
@@ -199,7 +208,14 @@ def _aware(value: object) -> datetime:
 def _number(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise TypeError("expected a number")
+    if not math.isfinite(value):
+        raise ValueError("expected a finite number")
     return float(value)
+
+
+def _text(value: object) -> bool:
+    """True for a non-blank string. Anything else counts as missing."""
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _pct(value: object) -> float:
@@ -252,8 +268,8 @@ def check_dispatch(
                 "Automated repair stays off until ENG-177 proves a running worker can be stopped.",
             )
         )
-    if view.hold is not None:
-        blocks.append(Notice("hold", f"Factory is on hold: {view.hold.get('reason', '?')}."))
+    if view.holds:
+        blocks.append(Notice("hold", f"Factory is on hold: {', '.join(sorted(view.holds))}."))
     if view.retry_not_before is not None and now < view.retry_not_before:
         blocks.append(
             Notice("rate-limited", f"No fire before {view.retry_not_before.isoformat()} (429).")

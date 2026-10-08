@@ -11,6 +11,7 @@ restart sees exactly what the old one saw (G-C3).
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, timedelta
 
@@ -36,6 +37,7 @@ from controller.interfaces import (
 )
 
 # docs/limits.md section 5: a non-200 body that mentions one of these limits.
+_MAX_RETRY_AFTER = 365 * 24 * 3600
 _EXHAUSTED_RE = re.compile(r"\b(usage|session|weekly|spend(ing)?)[\s_-]+limit", re.IGNORECASE)
 
 
@@ -131,20 +133,17 @@ class AttemptGate:
                 },
             )
         ]
+        caps = [b.code for b in decision.blocks if b.code in ESCALATING_BLOCKS]
         view = LedgerView.build(stored)
-        for block in decision.blocks:
-            if block.code not in ESCALATING_BLOCKS:
-                continue
-            dedup = f"{decision.task}:{block.code}"
-            if dedup in view.escalations:
-                continue
-            view.escalations.add(dedup)
+        # One escalation per task at its cap, however many caps it hits (G-C5).
+        dedup = f"{decision.task}:cap"
+        if caps and dedup not in view.escalations:
             out.append(
                 LedgerEvent(
                     ev.ESCALATION,
                     now,
                     decision.task,
-                    data=escalation_data(view, decision.task, dedup, block.code),
+                    data=escalation_data(view, decision.task, dedup, caps[0]) | {"caps": caps},
                 )
             )
         return out
@@ -185,7 +184,9 @@ class AttemptGate:
             ]
             if result.http_status == 429:
                 if result.retry_after_seconds is not None:
-                    wait = timedelta(seconds=max(result.retry_after_seconds, 0))
+                    # Clamped only so an absurd header cannot overflow the clock.
+                    seconds = min(max(result.retry_after_seconds, 0), _MAX_RETRY_AFTER)
+                    wait = timedelta(seconds=seconds)
                 else:
                     streak = view.trailing_rate_limits() + 1
                     wait = min(
@@ -210,9 +211,8 @@ class AttemptGate:
     def _exhausted(
         self, view: LedgerView, run: RunId, result: LaunchResult, now: datetime
     ) -> list[LedgerEvent]:
-        if view.hold is not None and view.hold.get("reason") == ev.SUBSCRIPTION_EXHAUSTED:
+        if ev.SUBSCRIPTION_EXHAUSTED in view.holds:
             return []
-        view.hold = {"reason": ev.SUBSCRIPTION_EXHAUSTED}
         dedup = f"{ev.SUBSCRIPTION_EXHAUSTED}:{now.isoformat()}"
         error = f"{run}: HTTP {result.http_status}: {result.response_body}"
         return [
@@ -246,14 +246,27 @@ class AttemptGate:
                 )
             )
 
-    def resume(self, note: str, now: datetime) -> None:
-        """``factory resume``: clears the hold. Needs Rolando's note."""
+    def resume(self, note: str, now: datetime, reason: str | None = None) -> None:
+        """``factory resume``: clears one hold. Needs Rolando's note.
+
+        With several holds open, ``reason`` must say which one, so clearing one
+        (say, an exhausted subscription) never silently lifts another.
+        """
         if not note.strip():
             raise ValueError("resuming needs a note saying why")
         with self._store.writer_lock():
-            if LedgerView.build(self._store.events()).hold is None:
+            holds = LedgerView.build(self._store.events()).holds
+            if not holds:
                 raise ValueError("the factory is not on hold")
-            self._store.append(LedgerEvent(ev.HOLD_CLEARED, now, data={"note": note}))
+            if reason is None:
+                if len(holds) > 1:
+                    raise ValueError(f"several holds are open, name one: {sorted(holds)}")
+                (reason,) = holds
+            if reason not in holds:
+                raise ValueError(f"no open hold named {reason!r}")
+            self._store.append(
+                LedgerEvent(ev.HOLD_CLEARED, now, data={"reason": reason, "note": note})
+            )
 
     def record_snapshot(
         self,
@@ -271,7 +284,7 @@ class AttemptGate:
         for pct in (session_pct, weekly_pct):
             if not 0 <= pct <= 100:
                 raise ValueError("percentages are 0 to 100")
-        if credits_spent < 0:
+        if not math.isfinite(credits_spent) or credits_spent < 0:
             raise ValueError("credit spend cannot be negative")
         with self._store.writer_lock():
             self._store.append(
