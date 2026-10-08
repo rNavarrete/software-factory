@@ -54,6 +54,7 @@ from controller.interfaces import (
     LedgerLocked,
     LedgerStore,
 )
+from controller.ledger.redact import redact
 from controller.recovery import FINISHED, Recovery, State
 from controller.service import queue as q
 from controller.service.onboarding import Onboarding, OnboardingError
@@ -159,6 +160,9 @@ class Service:
         self._backup = backup
         self._instance = instance
         self._started = False
+        # Read once, before any round can overwrite it, so an outage is
+        # reported even if the first round fails to record the start.
+        self._last_beat = heartbeat.read() if heartbeat is not None else None
         self._last_reconcile: dict[AttemptId, datetime] = {}
         self._last_try: dict[str, datetime] = {}
         self._config: Onboarding | None = None
@@ -179,7 +183,7 @@ class Service:
         r.wrote = self._last_seq() != before
         if r.wrote and self._backup is not None:
             self._step(r, "backup", lambda: self._backup(self._now()))
-        if self._heartbeat is not None:
+        if self._heartbeat is not None and self._started:
             self._step(r, "heartbeat", lambda: self._heartbeat.write(self._now()))
         return r
 
@@ -189,8 +193,9 @@ class Service:
         except LedgerLocked:
             r.errors.append(f"{name}: the ledger is busy (a controller command is writing)")
         except Exception as e:  # each step stands alone; the next round retries it
-            r.errors.append(f"{name}: {type(e).__name__}: {e}")
-            log.warning("%s failed: %s: %s", name, type(e).__name__, e)
+            text = _error(e)
+            r.errors.append(f"{name}: {text}")
+            log.warning("%s failed: %s", name, text)
 
     def _last_seq(self) -> int:
         return max((s.seq for s in self._store.events()), default=0)
@@ -208,7 +213,7 @@ class Service:
     def _start(self, now: datetime) -> None:
         if self._started:
             return
-        last = self._heartbeat.read() if self._heartbeat is not None else None
+        last = self._last_beat
         gap = None if last is None else now - last
         events = [
             q.started(
@@ -358,8 +363,8 @@ class Service:
             except LedgerLocked:
                 raise
             except Exception as e:
-                r.errors.append(f"{item.issue_key}: {type(e).__name__}: {e}")
-                log.warning("%s: %s: %s", item.issue_key, type(e).__name__, e)
+                r.errors.append(f"{item.issue_key}: {_error(e)}")
+                log.warning("%s: %s", item.issue_key, _error(e))
 
     def _advance(self, item: q.Item, r: TickReport, *, may_fire: bool) -> bool:
         now = self._now()
@@ -372,6 +377,19 @@ class Service:
         }
         attempts = LedgerView.build(stored).task_attempts(item.task)
         mine = [a for a in attempts if a.attempt in owned]
+        if len(mine) < len(attempts) and not mine:
+            # v1: one ticket is one task with one attempt budget. Work from an
+            # earlier Todo move of this ticket can't be started over here.
+            self._close(
+                item,
+                "ticket-already-worked",
+                now,
+                "The factory already worked on this ticket"
+                f" ({attempts[-1].attempt}, {attempts[-1].state}), so it won't start it again."
+                " For new work, write a new ticket and move that one to Todo.",
+            )
+            r.closed.append(item.issue_key)
+            return False
         if mine:
             status = self._recovery.attempt_status(mine[-1].attempt, now)
             if status.state in _WATCHED and not _waiting_to_refire(status, mine[-1]):
@@ -395,22 +413,26 @@ class Service:
                     )
                     r.closed.append(item.issue_key)
                     return False
-                self._notice(
+                # The repair needs Rolando's signed go-ahead (ENG-160); the item
+                # closes so the queue isn't held waiting for it.
+                self._close(
                     item,
-                    f"repair:{status.attempt}",
+                    "repair-suggested",
+                    now,
                     f"Attempt {status.attempt} ended as {status.state.value}. A repair is"
                     f" suggested: {advice}. It needs your go-ahead before it starts.",
-                    now,
                 )
+                r.closed.append(item.issue_key)
+                return False
         if not may_fire:
             return False
         last = self._last_try.get(item.event_id)
         if last is not None and now - last < self._s.retry_every:
             return False
         self._last_try[item.event_id] = now
-        return self._dispatch(item, r, first=not mine)
+        return self._dispatch(item, r)
 
-    def _dispatch(self, item: q.Item, r: TickReport, *, first: bool) -> bool:
+    def _dispatch(self, item: q.Item, r: TickReport) -> bool:
         now = self._now()
         assert self._config is not None
         project = self._config.project(item.project_id)
@@ -423,12 +445,11 @@ class Service:
             )
             r.closed.append(item.issue_key)
             return False
-        if first:
-            reason = self._x.source.revalidate(item.authorization())
-            if reason is not None:
-                self._close(item, "authorization-withdrawn", now, f"The factory stopped: {reason}")
-                r.closed.append(item.issue_key)
-                return False
+        reason = self._x.source.revalidate(item.authorization())
+        if reason is not None:
+            self._close(item, "authorization-withdrawn", now, f"The factory stopped: {reason}")
+            r.closed.append(item.issue_key)
+            return False
         contract = self._contract(item, project.as_mapping(), project, r)
         if contract is None:
             return False
@@ -459,7 +480,8 @@ class Service:
     ) -> Mapping[str, object] | None:
         now = self._now()
         if item.digest is not None:
-            return self._contracts.load(ContractDigest(item.digest))
+            contract = self._contracts.load(ContractDigest(item.digest))
+            return self._within(item, project, contract, r, now)
         out = self._x.preparer.prepare(item.authorization(), entry)
         if isinstance(out, Question):
             self._close(
@@ -472,20 +494,28 @@ class Service:
             r.closed.append(item.issue_key)
             return None
         assert isinstance(out, Prepared)
-        problems = project.contract_problems(out.contract, item.task.value)
-        if problems:
-            self._close(
-                item,
-                "contract-outside-onboarding",
-                now,
-                "The factory drafted a task it isn't allowed to run here: " + "; ".join(problems),
-            )
-            r.closed.append(item.issue_key)
+        if self._within(item, project, out.contract, r, now) is None:
             return None
         contract = contracts.freeze(out.contract)
         digest = self._contracts.save(contract)
         self._append(q.item_contract(item, digest.value, now))
         return contract
+
+    def _within(
+        self, item: q.Item, project, contract: Mapping[str, object], r: TickReport, now
+    ) -> Mapping[str, object] | None:
+        """The contract, if the project's onboarding entry (as it is now) allows it."""
+        problems = project.contract_problems(contract, item.task.value)
+        if not problems:
+            return contract
+        self._close(
+            item,
+            "contract-outside-onboarding",
+            now,
+            "The factory has a task it isn't allowed to run here: " + "; ".join(problems),
+        )
+        r.closed.append(item.issue_key)
+        return None
 
     def _watch(self, item: q.Item, status, now: datetime) -> None:
         attempt = status.attempt
@@ -552,7 +582,7 @@ class Service:
             try:
                 self._x.reporter.post(m.issue_id, m.key, m.text)
             except Exception as e:
-                self._append(q.send_failed(m.key, f"{type(e).__name__}: {e}", now))
+                self._append(q.send_failed(m.key, _error(e), now))
                 continue
             self._append(q.sent(m.key, now))
             r.sent += 1
@@ -579,6 +609,11 @@ def _fired_text(result) -> str:
     if result.outcome == "not-launched":
         return f"The worker did not start ({result.message}). The factory will try again later."
     return f"It is unclear whether the worker started: {result.message}"
+
+
+def _error(e: BaseException) -> str:
+    """An exception for the log and the ledger, with anything secret-looking blanked."""
+    return redact(f"{type(e).__name__}: {e}")[:500]
 
 
 def _when(t: datetime | None) -> str:

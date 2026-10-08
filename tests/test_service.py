@@ -24,7 +24,7 @@ from controller.attempts import AttemptGate
 from controller.attempts import events as ev
 from controller.attempts.policy import LedgerView
 from controller.dispatch import Dispatcher
-from controller.interfaces import AttemptId, TaskId
+from controller.interfaces import AttemptId, LedgerLocked, TaskId
 from controller.ledger import SqliteLedgerStore
 from controller.recovery import Recovery, State
 from controller.service import main as service_main
@@ -471,6 +471,78 @@ class ServiceTests(ServiceCase):
         self.assertIn("budget", LedgerView.build(self.store.events()).holds)
         self.assertEqual(self.adapter.requests, [])
 
+    def test_second_todo_move_after_finished_work_closes_clearly(self):
+        self.rolando_approves()
+        self.tick()
+        a1 = AttemptId(self.task(), 1)
+        self.github.branches[a1.branch] = SHA_A
+        self.github.pulls = [self.pr(state="closed", merged=True, merge_commit="c" * 40)]
+        self.tick(minutes=6)
+        self.assertEqual(self.view().items["evt-1"].closed, "merged")
+        self.source.events.append(move(2))
+        self.tick(minutes=6)
+        self.assertEqual(self.view().items["evt-2"].closed, "ticket-already-worked")
+        # A third move is not locked out as "already queued".
+        self.source.events.append(move(3))
+        self.tick(minutes=6)
+        self.assertIn("evt-3", self.view().items)
+        self.assertEqual(len(self.adapter.requests), 1)
+
+    def test_repair_advice_closes_the_item_and_asks(self):
+        class Advise:
+            def advise(self, attempt, detail):
+                return "the tests failed"
+
+        self.service._x = Integrations(
+            self.source, self.preparer, self.reporter, self.reviewer, Advise()
+        )
+        self.rolando_approves()
+        self.tick()
+        a1 = AttemptId(self.task(), 1)
+        self.github.branches[a1.branch] = SHA_A
+        self.github.pulls = [self.pr(state="closed")]
+        self.tick(minutes=6)
+        self.recovery_close(a1)
+        self.tick(minutes=6)
+        self.assertEqual(self.view().items["evt-1"].closed, "repair-suggested")
+        self.assertTrue(any("go-ahead" in t for t in self.reporter.texts()))
+        self.assertEqual(len(self.adapter.requests), 1)
+
+    def recovery_close(self, attempt):
+        rec = Recovery(
+            self.store,
+            Approvals(self.store, KEY, confirm=yes, os_user="rolando"),
+            self.github,
+            worker_logins=frozenset({BOT}),
+            gate=self.gate,
+            confirm=yes,
+        )
+        rec.close_attempt(attempt, State.FAILED, "tests failed", self.now)
+
+    def test_outage_reported_even_if_the_first_round_cannot_record_it(self):
+        self.rolando_approves()
+        self.tick()
+        self.now += timedelta(hours=3)
+        self.build()
+        with mock.patch.object(self.service, "_append", side_effect=LedgerLocked("busy")):
+            self.assertTrue(self.tick().errors)
+        self.tick(minutes=1)
+        self.assertTrue(any("was not running" in t for t in self.reporter.texts()))
+
+    def test_narrowed_onboarding_stops_a_drafted_contract(self):
+        self.tick()  # contract drafted, waiting for approval
+        self.assertIsNotNone(self.view().items["evt-1"].digest)
+        self.config["projects"][0]["allowed_actions"] = ["modify-files"]
+        self.rolando_approves()
+        self.tick(minutes=6)
+        self.assertEqual(self.view().items["evt-1"].closed, "contract-outside-onboarding")
+        self.assertEqual(self.adapter.requests, [])
+
+    def test_event_ids_must_be_plain(self):
+        for bad in ("token=abc", "a b", "", "x" * 101):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                Authorization(bad, "i", "ENG-1", "p", "R", NOW, "0" * 64, "e")
+
     # --- config ---
 
     def test_bad_onboarding_file_stops_intake_and_dispatch(self):
@@ -523,6 +595,14 @@ class SqliteServiceTests(ServiceTests):
         self.tick()
         raw = self.store.path.read_bytes()
         self.assertNotIn(START_KEY.encode(), raw)
+
+
+class RedactionTests(unittest.TestCase):
+    def test_linear_keys_are_redacted(self):
+        from controller.ledger.redact import redact
+
+        key = "lin_api_" + "Ab1" * 10
+        self.assertNotIn(key, redact(f"Linear said no for {key}"))
 
 
 class OnboardingTests(unittest.TestCase):
@@ -714,8 +794,11 @@ class HttpGhTests(unittest.TestCase):
         self.assertNotIn(GH_TOKEN, out.stderr)
 
     def test_network_failure_is_an_os_error(self):
-        with self.assertRaises(OSError):
-            self.runner(urllib.error.URLError("down"))(["gh", "api", f"repos/{REPO}/pulls"])
+        import http.client
+
+        for e in (urllib.error.URLError("down"), http.client.IncompleteRead(b"x")):
+            with self.subTest(type(e).__name__), self.assertRaises(OSError):
+                self.runner(e)(["gh", "api", f"repos/{REPO}/pulls"])
 
 
 class _Resp:

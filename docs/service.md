@@ -117,3 +117,10 @@ The service posts this on the ticket: "It is unclear whether worker … started"
 | `RepairAdvisor.advise(attempt, detail)` | ENG-160 | Suggests a repair. The service only posts the suggestion; a repair still needs its signed go-ahead. |
 
 ENG-174 also has to settle how a verified Todo move becomes a signed contract approval. That is a change to the approval rules, and it needs Rolando's sign-off.
+
+## Known limits
+
+- **The machine holds the approval key, and the same key that checks an approval can create one.** The signatures are HMAC, so whoever can check them can also sign. The service process never writes a decision, because every confirmation it gives says no and a test makes sure it never calls the approval writers. But any code in the same process could forge one, and that will include the Linear integrations, which read untrusted ticket text. Python's standard library has no public-key signatures, so this can't be closed without adding a dependency. ENG-174 should decide how to handle it: either run the Linear-reading code in a separate process that doesn't have the key, or accept the risk and record it in the governance map.
+- **Each ticket gets one task and one attempt budget for its whole life.** If a ticket the factory already worked on is moved to Todo again, the service says so and does nothing. New work needs a new ticket.
+- **A suggested repair closes the ticket's queue entry.** A repair still needs Rolando's signed go-ahead. How that go-ahead puts the work back in the queue is ENG-160's job.
+- **The GitHub token expires.** Fine-grained tokens last at most a year. When it expires, the service can't read GitHub and says so every round. Renewing it is one `fly secrets import` (see the setup steps in the PR).

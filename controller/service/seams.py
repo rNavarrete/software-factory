@@ -37,12 +37,20 @@ from controller.interfaces import AttemptId, TaskId
 
 _ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-[1-9][0-9]*$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
+"""Linear ids (UUIDs) and the like. Kept plain so the ledger's redaction can
+never change an id the service later compares."""
 CONTROLS = ("pause", "resume")
 
 
 def _text(value: object, what: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{what} must be non-empty text")
+
+
+def _id(value: object, what: str) -> None:
+    if not isinstance(value, str) or not _ID_RE.fullmatch(value):
+        raise ValueError(f"{what} must be letters, digits, - or _, got {value!r}")
 
 
 def _aware(value: datetime, what: str) -> None:
@@ -69,7 +77,9 @@ class Authorization:
     """How the source verified it, in plain words, for the record."""
 
     def __post_init__(self) -> None:
-        for name in ("event_id", "issue_id", "project_id", "actor", "evidence"):
+        for name in ("event_id", "issue_id", "project_id"):
+            _id(getattr(self, name), name)
+        for name in ("actor", "evidence"):
             _text(getattr(self, name), name)
         if not _ISSUE_KEY_RE.fullmatch(self.issue_key):
             raise ValueError(f"not a Linear issue key: {self.issue_key!r}")
@@ -93,8 +103,9 @@ class Refusal:
     reason: str
 
     def __post_init__(self) -> None:
-        for name in ("event_id", "issue_id", "reason"):
-            _text(getattr(self, name), name)
+        for name in ("event_id", "issue_id"):
+            _id(getattr(self, name), name)
+        _text(self.reason, "reason")
 
 
 @dataclass(frozen=True)
@@ -112,7 +123,10 @@ class Control:
     def __post_init__(self) -> None:
         if self.action not in CONTROLS:
             raise ValueError(f"control must be one of {CONTROLS}, got {self.action!r}")
-        for name in ("event_id", "actor", "note"):
+        _id(self.event_id, "event_id")
+        if self.issue_id is not None:
+            _id(self.issue_id, "issue_id")
+        for name in ("actor", "note"):
             _text(getattr(self, name), name)
         _aware(self.at, "at")
 

@@ -10,6 +10,7 @@ never put in what it returns.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import subprocess
@@ -60,7 +61,7 @@ class HttpGhRunner:
             return subprocess.CompletedProcess(argv, 0, body, "")
         except urllib.error.HTTPError as e:
             return subprocess.CompletedProcess(argv, 1, "", _message(e, token))
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, http.client.HTTPException) as e:
             # Same shape as gh failing to run: the reader turns it into "unreadable".
             raise OSError(f"GitHub request failed: {type(e).__name__}") from None
 

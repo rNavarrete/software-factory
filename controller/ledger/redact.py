@@ -18,6 +18,8 @@ _PATTERNS = [
     # GitHub tokens: classic (ghp_, gho_, ghu_, ghs_, ghr_) and fine-grained.
     r"\bgh[pousr]_[A-Za-z0-9]{20,}",
     r"\bgithub_pat_[A-Za-z0-9_]{20,}",
+    # Linear API keys.
+    r"\blin_(?:api|oauth)_[A-Za-z0-9]{20,}",
     # AWS access key ids.
     r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
     # Slack tokens.
