@@ -10,8 +10,8 @@ mkdir -p "$HOME/.software-factory"
 python3 -s -m controller.service install-secrets "$FACTORY_SECRETS_DIR"
 # The service's copy: never the approval key.
 python3 -s -m controller.service install-secrets /run/factory-service-secrets \
-    --only routine-token,github-token,linear-key --owner factory
-for name in APPROVAL_KEY ROUTINE_TOKEN GITHUB_TOKEN LINEAR_KEY; do
+    --only routine-token,github-token,linear-key,reviewer-token --owner factory
+for name in APPROVAL_KEY ROUTINE_TOKEN GITHUB_TOKEN LINEAR_KEY REVIEWER_TOKEN; do
     unset "FACTORY_$name"
 done
 chown -R factory:factory "$HOME"
@@ -32,11 +32,17 @@ until [ -S /run/factory-signer/signer.sock ]; do
 done
 # Until the Linear integrations land, the service runs the qualification
 # fixture with the fake worker: it never starts a real worker.
+# The independent reviewer runs only once its routine and account are set
+# (deploy/fly/setup-reviewer.sh); neither value is secret.
+set --
+if [ -n "${FACTORY_REVIEWER_ROUTINE:-}" ] && [ -n "${FACTORY_REVIEWER_LOGIN:-}" ]; then
+    set -- --reviewer-routine "$FACTORY_REVIEWER_ROUTINE" --reviewer-login "$FACTORY_REVIEWER_LOGIN"
+fi
 env FACTORY_SECRETS_DIR=/run/factory-service-secrets \
     FACTORY_SIGNER_SOCKET=/run/factory-signer/signer.sock \
     python3 -s -m controller.service run --user factory \
     --fixtures /app/deploy/qualification \
-    --onboarding "$ONBOARDING" &
+    --onboarding "$ONBOARDING" "$@" &
 service=$!
 # A stop request lets the service finish its round. If either process ends,
 # both stop and the machine exits, so Fly starts it again with both.

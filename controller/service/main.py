@@ -224,7 +224,7 @@ def build(args: argparse.Namespace):
         source=source,
         preparer=fixtures.FixturePreparer(contracts_by_issue),
         reporter=_reporter(args, secrets),
-        reviewer=fixtures.RecordingReviewer(),
+        reviewer=_reviewer(args, secrets, store, root) or fixtures.RecordingReviewer(),
         repair=fixtures.NoRepair(),
         authorizer=_authorizer(socket_path) if args.source == "linear" else None,
     )
@@ -372,6 +372,35 @@ ROLANDO_LINEAR_ID = "cd9ec650-f957-4f25-b5f0-9c14bcae49c8"
 """Rolando's Linear user. The factory never posts as this user."""
 
 
+def _reviewer(args: argparse.Namespace, secrets, store, root: Path):
+    """The independent review (ENG-156), when a reviewer routine is set up:
+    ``--reviewer-routine`` and ``--reviewer-login`` (docs/review.md). Without
+    them the stand-in reviewer is used and no review job is ever launched."""
+    if not (args.reviewer_routine or args.reviewer_login):
+        return None
+    if not (args.reviewer_routine and args.reviewer_login):
+        raise SystemExit("--reviewer-routine and --reviewer-login go together")
+    from controller.adapter.routine import RoutineAdapter
+    from controller.approval import ContractStore
+    from controller.recovery import PILOT_REPO
+    from controller.review.reviewer import AutoReviewer, ReviewPolicy, ledger_contracts
+    from controller.review.runtime import RoutineReviewRuntime
+    from controller.service.github_http import HttpGitHubApi
+
+    policy = ReviewPolicy(reviewers=frozenset({args.reviewer_login}))
+    adapter = RoutineAdapter(
+        args.reviewer_routine, start_key=lambda trig: secrets.get("reviewer-token")
+    )
+    return AutoReviewer(
+        store,
+        HttpGitHubApi(lambda: secrets.get("github-token")),
+        RoutineReviewRuntime(adapter),
+        ledger_contracts(store, ContractStore(root / "contracts").load),
+        policy=policy,
+        repo=PILOT_REPO,
+    )
+
+
 def _reporter(args: argparse.Namespace, secrets):
     from controller.service import fixtures
 
@@ -398,6 +427,8 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--reporter", choices=("log", "linear"), default="log")
         s.add_argument("--approver-linear-id", default=ROLANDO_LINEAR_ID)
         s.add_argument("--source", choices=("fixtures", "linear"), default="fixtures")
+        s.add_argument("--reviewer-routine", help="the reviewer routine's trig_ id (ENG-156)")
+        s.add_argument("--reviewer-login", help="the reviewer's GitHub account (ENG-156)")
         s.add_argument("--user", help="become this user before starting (on the host)")
     sub.add_parser("status")
     s = sub.add_parser("install-secrets")

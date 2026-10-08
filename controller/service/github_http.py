@@ -15,6 +15,7 @@ import json
 import re
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 
@@ -76,4 +77,95 @@ def _message(e: urllib.error.HTTPError, token: str) -> str:
     return text.replace(token, "[redacted]") if token else text
 
 
-__all__ = ["HttpGhRunner"]
+# Where GitHub sends an artifact download (a short-lived signed link). The
+# token is never sent there: the link carries its own permission.
+_ARTIFACT_HOSTS = re.compile(
+    r"^(?:[a-z0-9-]+\.blob\.core\.windows\.net|pipelines\.actions\.githubusercontent\.com"
+    r"|[a-z0-9-]+\.actions\.githubusercontent\.com)$"
+)
+_ARTIFACT_ZIP = re.compile(r"^repos/[A-Za-z0-9-]+/[A-Za-z0-9._-]+/actions/artifacts/\d+/zip$")
+MAX_RAW_BYTES = 20 * 1024 * 1024
+
+
+class HttpGitHubApi:
+    """``GitHubApi`` (controller.loop.collect) over HTTPS with the read-only
+    token, for the independent review on the host (ENG-156). Only GET, only
+    ``repos/...`` paths on api.github.com. The one redirect followed is an
+    artifact download's, to GitHub's storage, without the token."""
+
+    def __init__(
+        self,
+        token: Callable[[], str],
+        opener: Callable[..., object] | None = None,
+        timeout: float = 60,
+    ) -> None:
+        self._token = token
+        self._open = opener or urllib.request.build_opener(_NoRedirect()).open
+        self._timeout = timeout
+
+    def json(self, path: str) -> object:
+        body = self._get(path, "application/vnd.github+json")
+        try:
+            return json.loads(body)
+        except ValueError as e:
+            raise _unreadable(f"{path}: unreadable JSON") from e
+
+    def raw(self, path: str) -> bytes:
+        return self._get(path, "application/vnd.github.raw")
+
+    def _get(self, path: str, accept: str) -> bytes:
+        from controller.loop.collect import NotFound
+
+        bad = not _PATH_RE.fullmatch(path) or ".." in path.split("?")[0].split("/")
+        if bad:
+            raise _unreadable(f"refused GitHub path {path!r}")
+        token = self._token()
+        req = urllib.request.Request(
+            API + path,
+            headers={
+                "Accept": accept,
+                "Authorization": f"Bearer {token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "software-factory-service",
+            },
+            method="GET",
+        )
+        try:
+            with self._open(req, timeout=self._timeout) as resp:  # type: ignore[attr-defined]
+                return _read(resp)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise NotFound(f"{path}: not found") from None
+            location = e.headers.get("Location", "") if e.code in (301, 302, 307) else ""
+            if location and _ARTIFACT_ZIP.fullmatch(path):
+                return self._download(location)
+            raise _unreadable(f"{path}: {_message(e, token)}") from None
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            raise _unreadable(f"{path}: request failed: {type(e).__name__}") from None
+
+    def _download(self, url: str) -> bytes:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != "https" or not _ARTIFACT_HOSTS.fullmatch(parts.hostname or ""):
+            raise _unreadable("artifact download redirected somewhere unexpected")
+        req = urllib.request.Request(url, headers={"User-Agent": "software-factory-service"})
+        try:
+            with self._open(req, timeout=self._timeout) as resp:  # type: ignore[attr-defined]
+                return _read(resp)
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            raise _unreadable(f"artifact download failed: {type(e).__name__}") from None
+
+
+def _read(resp: object) -> bytes:
+    data = resp.read(MAX_RAW_BYTES + 1)  # type: ignore[attr-defined]
+    if len(data) > MAX_RAW_BYTES:
+        raise _unreadable("GitHub's answer is too large")
+    return data
+
+
+def _unreadable(text: str) -> Exception:
+    from controller.loop.collect import GitHubUnreadable
+
+    return GitHubUnreadable(text)
+
+
+__all__ = ["HttpGhRunner", "HttpGitHubApi"]
