@@ -16,6 +16,7 @@ shows him, and he can add time spent elsewhere (reading a PR on GitHub) with
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,6 +33,43 @@ SCOPE = "candidate-review"
 ``contract-dispatch``) and never as a PR approval, merge or release."""
 OBSERVED, CLEARED = "observed", "cleared-flag"
 MIN_MINUTES = 0.01
+_SEP = " > "
+
+
+def flag_names(flag: str) -> tuple[str, ...]:
+    """The names a note clearing ``flag`` may use to say what was looked at.
+
+    A flag's key is ``<kind>:<subject>``, and its subject is a file path, a
+    test (``<path> > <describe> > <test>``), a criterion id or ``ci-report``.
+    Its names are the whole subject, each path and its file name, the test's
+    own title and the criterion id. A note that names none of them is about
+    something else (in the first live run a note about a button cleared a
+    test-file flag), so it never clears the flag.
+    """
+    _, _, subject = flag.partition(":")
+    subject = subject.strip()
+    names = {subject}
+    parts = [p.strip() for p in subject.split(_SEP) if p.strip()]
+    if parts:
+        first = parts[0]
+        if "/" in first or "." in first:
+            names.add(first)
+            names.add(first.rsplit("/", 1)[-1])
+        if len(parts) > 1:
+            names.add(parts[-1])
+    if subject == "ci-report":
+        names.update({"ci", "control-change report"})
+    return tuple(sorted(n for n in names if n))
+
+
+def names_flag(flag: str, note: str) -> bool:
+    """Whether ``note`` names what ``flag`` points at (see ``flag_names``)."""
+    text = note.lower()
+    for name in flag_names(flag):
+        rx = r"(?<![A-Za-z0-9_])" + re.escape(name.lower()) + r"(?![A-Za-z0-9_])"
+        if re.search(rx, text):
+            return True
+    return False
 
 
 class ReviewDecisions:
@@ -82,6 +120,11 @@ class ReviewDecisions:
         note: str,
         now: datetime,
     ) -> None:
+        if not names_flag(flag, note):
+            raise ApprovalRefused(
+                f"the note doesn't name what the flag points at ({_or(flag_names(flag))}),"
+                " so it can't clear it"
+            )
         self._write(attempt, digest, candidate, CLEARED, now, flag=flag, note=note)
 
     def observations(
@@ -113,6 +156,7 @@ class ReviewDecisions:
                 note=b["note"],
             )
             for b in self._bindings(attempt, digest, candidate, CLEARED)
+            if names_flag(str(b.get("flag", "")), str(b.get("note", "")))
         )
 
     def _write(self, attempt, digest, candidate, decision, now, **fields) -> None:
@@ -174,6 +218,11 @@ class ReviewDecisions:
                 continue
             out.append(dict(b))
         return out
+
+
+def _or(names: Sequence[str]) -> str:
+    quoted = [f"'{n}'" for n in names]
+    return quoted[0] if len(quoted) == 1 else ", ".join(quoted[:-1]) + " or " + quoted[-1]
 
 
 @dataclass

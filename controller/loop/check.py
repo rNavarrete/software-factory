@@ -63,6 +63,20 @@ class Assessment:
             out += self.criteria.blockers
         if self.assertions is not None:
             out += self.assertions.blockers
+        # A behavior only Rolando can look at is not a gap in the evidence:
+        # the verifiers word it as one that "cannot be cleared", which sent
+        # him the wrong way in the first live run. Say what is really missing.
+        owed = sorted(self._owed())
+        if owed:
+            stale = tuple(
+                f"{prefix}{c} is unknown" for c in owed for prefix in ("", "criterion check: ")
+            )
+            out = [b for b in out if not b.startswith(stale)]
+            out += [
+                f"{c} needs your own look: nothing you saw is recorded for this commit yet"
+                " (run this same command again to give it)"
+                for c in owed
+            ]
         return tuple(dict.fromkeys(out))
 
     @property

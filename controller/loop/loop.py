@@ -33,6 +33,7 @@ Every prompt it shows Rolando is timed into the ledger as his active minutes.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,15 +41,17 @@ from pathlib import Path
 from typing import TextIO
 
 from controller import contract as contracts
+from controller.approval import ApprovalRefused
 from controller.attempts.events import ClearingBasis
 from controller.attempts.policy import LedgerView
 from controller.dispatch import Dispatcher
 from controller.interfaces import AttemptId, ContractDigest, LedgerStore, TaskId
+from controller.ledger import kinds, records
 from controller.loop.check import CHECK_NAME, Assessment, assess, render
 from controller.loop.collect import GitHubApi, GitHubUnreadable, collect
-from controller.loop.decisions import ReviewDecisions, Timer
+from controller.loop.decisions import ReviewDecisions, Timer, flag_names, names_flag
 from controller.recovery import FINISHED, PILOT_REPO, Recovery, RecoveryRefused, State
-from verify.criteria import Verdict
+from verify.criteria import Verdict, _permitted
 
 POLL_SECONDS = 60
 DEFAULT_WAIT_MINUTES = 90
@@ -121,6 +124,11 @@ class Loop:
     def _run(self, contract: Mapping[str, object], task: TaskId, wait_minutes: float) -> int:
         digest = contracts.digest(contract)
         self.timer.task = task
+        if latest_attempt(self.store, task) is None:
+            stop = self._stale_base(contract)
+            if stop is not None:
+                self.say(stop)
+                return EXIT_STOPPED
         try:
             result = self.dispatcher.dispatch(contract)
         except KeyboardInterrupt:
@@ -214,10 +222,15 @@ class Loop:
         assessment = self._assess(contract, digest, attempt, collected)
         if assessment.waiting_on_review:
             self._record(assessment, status.latest_run, now)
-            return None, (
+            said = (
                 f"PR #{number} passed collection; waiting for the independent review comment"
                 f" on {collected.pr_url}."
             )
+            # A review that no longer counts (main moved, a new push, an edit)
+            # is said out loud, never dropped in silence.
+            for why in assessment.review.ignored:
+                said += f"\n  Not used: {_plain_ignored(why)}"
+            return None, said
         if assessment.conclusion() == "action_required":
             # Only Rolando's inputs are missing; anything else wrong needs a repair first.
             assessment = self._ask_rolando(contract, digest, attempt, assessment)
@@ -237,8 +250,16 @@ class Loop:
         self.say(f"PR #{number} (commit {head[:12]}) is not ready for review:")
         for b in assessment.blockers:
             self.say(f"  - {b}")
+        for why in assessment.review.ignored:
+            self.say(f"  Review comment not used: {_plain_ignored(why)}")
         self.say(f"Full report: {path}")
-        if assessment.conclusion() == "action_required":
+        if any(_base_moved(why) for why in assessment.review.ignored):
+            self.say(
+                "Main moved after this PR was checked. That is not the worker's fault: bring"
+                " main into the PR branch on GitHub (Update branch) so CI runs again, have the"
+                " review posted again for the new main, then run this same command again."
+            )
+        elif assessment.conclusion() == "action_required":
             self.say("Only your answers are missing: run this same command again to give them.")
         else:
             self.say(_repair_hint(contract))
@@ -274,10 +295,7 @@ class Loop:
         asked = False
         owed = a.owed_observations(contract)
         if owed:
-            self.say(
-                f"\nTo look at it yourself, in your pilot checkout run:\n"
-                f"git fetch origin && git checkout {cand.head_commit} && npm ci && npm run dev\n"
-            )
+            self.say(_look_hint(self.repo, cand))
         for c in owed:
             ev = c["evidence"]
             steps = ev.get("steps") or ev.get("what") or ""
@@ -293,6 +311,18 @@ class Loop:
                 continue
             seen = self.asker.ask("What did you see? (Enter: exactly what was expected) ") or ""
             verdict = Verdict.PASS if answer.lower() == "y" else Verdict.FAIL
+            if seen and verdict is Verdict.PASS and not _about(seen, c):
+                seen = (
+                    self.asker.ask(
+                        "That doesn't mention anything from the step or the expected result."
+                        " Say what you saw, or press Enter to record exactly what was"
+                        " expected: "
+                    )
+                    or ""
+                )
+                if seen and not _about(seen, c):
+                    self.say(f"Skipped {c['id']}: what you saw needs to be about this check.")
+                    continue
             if not seen:
                 seen = f"Saw what was expected: {expected}" if verdict is Verdict.PASS else ""
             if not seen:
@@ -323,7 +353,17 @@ class Loop:
             if answer.lower().strip(" .!") in _NOT_A_NOTE or len(answer) < MIN_NOTE:
                 self.say("Left open: say in a few words what you checked to clear it.")
                 continue
-            self.decisions.clear(attempt, digest, cand, f.key, answer, self.now())
+            if not names_flag(f.key, answer):
+                self.say(
+                    "Left open: a note clears only the thing it names, and this one names"
+                    f" none of: {', '.join(flag_names(f.key))}."
+                )
+                continue
+            try:
+                self.decisions.clear(attempt, digest, cand, f.key, answer, self.now())
+            except ApprovalRefused as e:
+                self.say(f"Left open: {e}")
+                continue
             asked = True
         if not asked:
             return a
@@ -359,6 +399,7 @@ class Loop:
 
     def _finish(self, attempt: AttemptId, status) -> int:
         self.say(f"{attempt}: {status.detail}")
+        self._merged_before_ready(attempt, status)
         if status.writer_cleared:
             self.say("This task is already closed out. The lane is free.")
             return EXIT_READY
@@ -399,6 +440,182 @@ class Loop:
             break
         self.say("Done. The lane is free for the next task.")
         return EXIT_READY
+
+    def _merged_before_ready(self, attempt: AttemptId, status) -> None:
+        """Say so, every time, when the merged commit never got the loop's ready.
+
+        Nothing on GitHub stops a merge before the loop's verdict: merging
+        stays Rolando's. So close-out checks the merged PR's head against the
+        loop's own records and, the first time it finds no ready verdict for
+        that exact commit, records it in the ledger, where the pilot's numbers
+        count it.
+        """
+        heads = []
+        for n in status.pull_requests:
+            try:
+                pr = self.api.json(f"repos/{self.repo}/pulls/{n}")
+            except GitHubUnreadable as e:
+                self.say(f"Warning: couldn't read PR #{n} to check it was ready when merged ({e}).")
+                return
+            if isinstance(pr, Mapping) and pr.get("merged_at"):
+                sha = (pr.get("head") or {}).get("sha")
+                if isinstance(sha, str):
+                    heads.append((n, sha))
+        if not heads:
+            return
+        events = self.store.events(attempt.task)
+        ready = {
+            s.event.data.get("revision")
+            for s in events
+            if s.event.kind == kinds.CHECKS
+            and s.event.attempt == attempt
+            and any(
+                r.get("name") == CHECK_NAME and r.get("conclusion") == "success"
+                for r in s.event.data.get("results", ())
+            )
+        }
+        for n, sha in heads:
+            if sha in ready:
+                continue
+            last = _last_verdict(events, attempt, sha)
+            self.say(
+                f"Note: PR #{n} was merged at commit {sha[:12]} before this loop said it was"
+                f" ready ({last}). That is recorded so the pilot's results count it."
+            )
+            stage = "merged-before-ready"
+            if any(
+                s.event.kind == kinds.FAILURE
+                and s.event.attempt == attempt
+                and s.event.data.get("stage") == stage
+                and sha in s.event.data.get("detail", "")
+                for s in events
+            ):
+                continue
+            event = records.failure(
+                stage,
+                f"PR #{n} merged at {sha} with no ready verdict from the loop for that"
+                f" commit ({last})",
+                self.now(),
+                task=attempt.task,
+                attempt=attempt,
+                run=status.latest_run,
+            )
+            with self.store.writer_lock():
+                self.store.append(event)
+
+    def _stale_base(self, contract: Mapping[str, object]) -> str | None:
+        """Before a task's first attempt: has main changed, since the contract's
+        base, any file the task may change? Then the worker's PR would start
+        from old code there and likely conflict (the second sample in the first
+        live run had to be re-based). Advisory: it never decides anything
+        alone, and an unreadable GitHub only warns."""
+        base = str(contract.get("base_commit", ""))
+        try:
+            cmp = self.api.json(f"repos/{self.repo}/compare/{base}...main")
+        except GitHubUnreadable as e:
+            self.say(f"Warning: couldn't check whether main moved since the contract's base ({e}).")
+            return None
+        files = cmp.get("files") if isinstance(cmp, Mapping) else None
+        if not isinstance(files, list):
+            self.say("Warning: couldn't read what changed on main since the contract's base.")
+            return None
+        permitted = [str(p) for p in contract.get("permitted_paths", ())]
+        touched = sorted(
+            {
+                f["filename"]
+                for f in files
+                if isinstance(f, Mapping)
+                and isinstance(f.get("filename"), str)
+                and _permitted(f["filename"], permitted)
+            }
+        )
+        if not touched:
+            return None
+        self.say(
+            f"Main has changed since this contract's base ({base[:12]}) in files this task"
+            f" may change: {', '.join(touched)}. The worker would start from the old"
+            " version of them, and its PR would likely conflict. A contract on a newer base"
+            " needs its own approval."
+        )
+        answer = self.timer.timed(
+            lambda: self.asker.ask("Start it on the old base anyway? y / Enter to stop: "),
+            f"decided whether to start {contract.get('task_id')} on an old base",
+        )
+        if answer is not None and answer.lower() == "y":
+            return None
+        return "Not started. Nothing was sent and nothing was recorded."
+
+
+def _last_verdict(events, attempt: AttemptId, sha: str) -> str:
+    for s in reversed(list(events)):
+        e = s.event
+        if e.kind == kinds.CHECKS and e.attempt == attempt and e.data.get("revision") == sha:
+            for r in e.data.get("results", ()):
+                if r.get("name") == CHECK_NAME:
+                    return f"its last check said {r.get('conclusion')}"
+    return "the loop never checked that commit"
+
+
+_STOP = frozenset(
+    "that this with from then them they their there when what have only into each"
+    " were your will just like page once".split()
+)
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9']{4,}", text.lower()) if w not in _STOP}
+
+
+def _about(seen: str, criterion: Mapping[str, object]) -> bool:
+    """Whether what Rolando typed shares a real word with the check he followed.
+
+    In the first live run "the new code changes" counted as having watched a
+    button work. This only catches a note about something else; whether he
+    really saw it is his word, as it always was."""
+    ev = criterion.get("evidence") or {}
+    source = " ".join(
+        str(x)
+        for x in (
+            criterion.get("statement", ""),
+            ev.get("steps", "") if isinstance(ev, Mapping) else "",
+            ev.get("expected", "") if isinstance(ev, Mapping) else "",
+            ev.get("what", "") if isinstance(ev, Mapping) else "",
+        )
+    )
+    return bool(_words(seen) & _words(source))
+
+
+_APP_PATHS = ("src/", "index.html", "public/")
+
+
+def _look_hint(repo: str, cand) -> str:
+    """How to look at the candidate: on GitHub always; run the app only when
+    the change touches it (a README-only change needs no dev server)."""
+    lines = [
+        "\nTo look at it yourself, the files at this exact commit are at:",
+        f"https://github.com/{repo}/tree/{cand.head_commit}",
+    ]
+    if any(p.startswith(_APP_PATHS) or p in _APP_PATHS for p in cand.changed_paths):
+        lines += [
+            "To try the app, in a checkout of the pilot repo run:",
+            f"git fetch origin && git checkout {cand.head_commit} && npm ci && npm run dev",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def _base_moved(why: str) -> bool:
+    return why.startswith("stale:") and "its base_commit is" in why
+
+
+def _plain_ignored(why: str) -> str:
+    """A review comment the check didn't use, in plain words."""
+    if _base_moved(why):
+        return (
+            why.removeprefix("stale: ")
+            + " (main moved after the review was posted; the review needs a new comment"
+            " for the current main)"
+        )
+    return why
 
 
 def _same(a, b) -> bool:

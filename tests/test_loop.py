@@ -292,7 +292,9 @@ class DecisionsTests(unittest.TestCase):
         )
 
     def clear(self, cand=None, attempt=ATTEMPT, digest=fx.DIGEST):
-        self.decisions.clear(attempt, digest, cand or self.cand, fx.FILE_FLAG, "read it", NOW)
+        self.decisions.clear(
+            attempt, digest, cand or self.cand, fx.FILE_FLAG, "read books.test.ts", NOW
+        )
 
     def test_round_trip_for_the_same_revision(self):
         self.observe()
@@ -306,7 +308,7 @@ class DecisionsTests(unittest.TestCase):
         self.assertEqual((c.flag, c.commit, c.base_commit), (fx.FILE_FLAG, fx.HEAD, fx.MAIN))
         self.assertEqual(c.by, "rNavarrete")
         self.assertEqual(c.contract_digest, str(fx.DIGEST))
-        self.assertEqual(c.note, "read it")
+        self.assertEqual(c.note, "read books.test.ts")
 
     def test_records_are_signed_candidate_review_decisions(self):
         self.observe()
@@ -661,6 +663,7 @@ class LoopCase(unittest.TestCase):
         self.gh.branches[ATTEMPT.branch] = pr["head"]["sha"]
         if merged:
             self.world.pr["state"] = "closed"
+            self.world.pr["merged_at"] = "2026-10-08T16:00:00Z"
 
     def text(self):
         return "\n".join(self.said)
@@ -691,7 +694,7 @@ class LoopTests(LoopCase):
             lambda: None,  # nothing changes: polling records nothing new
             self.review_posted,
         ]
-        code = self.run_loop("y\n\nRead the diff: import and new tests only.\n")
+        code = self.run_loop("y\n\nRead books.test.ts: import and new tests only.\n")
         self.assertEqual(code, EXIT_READY, self.text())
         self.assertEqual(self.slept, 4)
         self.assertEqual(len(self.adapter.requests), 1)
@@ -710,7 +713,7 @@ class LoopTests(LoopCase):
         self.assertIn("Saw what was expected", o.seen)
         (c,) = decisions.clearances(ATTEMPT, fx.DIGEST, cand)
         self.assertEqual(c.flag, fx.FILE_FLAG)
-        self.assertEqual(c.note, "Read the diff: import and new tests only.")
+        self.assertEqual(c.note, "Read books.test.ts: import and new tests only.")
 
         # One pending record while waiting on review, one success; nothing per poll.
         checks = self.checks()
@@ -752,7 +755,7 @@ class LoopTests(LoopCase):
         self.ci_done()
         self.review_posted()
         self.said.clear()
-        code = self.run_loop("y\n\nRead the diff: only the filterByStatus import changed.\n")
+        code = self.run_loop("y\n\nRead books.test.ts: only the filterByStatus import changed.\n")
         self.assertEqual(code, EXIT_READY, self.text())
         self.assertEqual(len(self.adapter.requests), 1)
         self.assertEqual(len(self.events("fire-intent")), 1)
@@ -784,7 +787,7 @@ class LoopTests(LoopCase):
         self.ci_done()
         self.review_posted()
         self.world.jobs[RUN_ID][1]["conclusion"] = "failure"
-        code = self.run_loop("y\n\nRead the diff: only the filterByStatus import changed.\n")
+        code = self.run_loop("y\n\nRead books.test.ts: only the filterByStatus import changed.\n")
         self.assertEqual(code, EXIT_STOPPED, self.text())
         text = self.text()
         self.assertIn(f"PR #{NUMBER} (commit {fx.HEAD[:12]}) is not ready for review:", text)
@@ -793,7 +796,7 @@ class LoopTests(LoopCase):
         self.assertIn("python3 -m controller repair", text)
         # Collection problems: Rolando is not asked for anything.
         self.assertEqual(
-            self.stdin.read(), "y\n\nRead the diff: only the filterByStatus import changed.\n"
+            self.stdin.read(), "y\n\nRead books.test.ts: only the filterByStatus import changed.\n"
         )
         (e,) = self.checks()
         results = {r["name"]: r["conclusion"] for r in e.data["results"]}
@@ -806,7 +809,7 @@ class LoopTests(LoopCase):
         self.review_posted()
         code = self.run_loop("\n\n")
         self.assertEqual(code, EXIT_STOPPED, self.text())
-        self.assertIn("ac3 is unknown", self.text())
+        self.assertIn("ac3 needs your own look", self.text())
         self.assertEqual(
             ReviewDecisions(self.store, KEY).observations(
                 ATTEMPT, fx.DIGEST, collected().candidate
@@ -827,7 +830,7 @@ class LoopTests(LoopCase):
         self.ci_done()
         self.review_posted()
         code = self.run_loop(
-            "n\nThe filter did nothing.\nRead the diff: only the filterByStatus import changed.\n"
+            "n\nThe filter did nothing.\nRead books.test.ts: only the import changed.\n"
         )
         self.assertEqual(code, EXIT_STOPPED, self.text())
         (e,) = self.checks()
@@ -839,9 +842,9 @@ class LoopTests(LoopCase):
         self.open_pr()
         self.ci_done()
         self.review_posted()
-        self.loop = self.build("y\n\nRead the diff: only the filterByStatus import changed.\n")
+        self.loop = self.build("y\n\nRead books.test.ts: only the filterByStatus import changed.\n")
         self.loop.asker = Asker(
-            io.StringIO("y\n\nRead the diff: only the filterByStatus import changed.\n"),
+            io.StringIO("y\n\nRead books.test.ts: only the filterByStatus import changed.\n"),
             io.StringIO(),
         )
         self.assertEqual(self.loop.run(self.contract), EXIT_STOPPED)
@@ -857,7 +860,7 @@ class LoopTests(LoopCase):
         self.open_pr()
         self.ci_done()
         self.review_posted()
-        self.assertEqual(self.run_loop("y\n\nRead the diff: import only.\n"), EXIT_READY)
+        self.assertEqual(self.run_loop("y\n\nRead books.test.ts: import only.\n"), EXIT_READY)
         self.assertIn(f"Checked commit: {fx.HEAD}", self.text())
 
     def test_only_answers_missing_says_so_instead_of_the_repair_hint(self):
@@ -888,18 +891,21 @@ class LoopTests(LoopCase):
                 self.assertEqual(decisions.clearances(ATTEMPT, fx.DIGEST, cand), ())
                 self.assertEqual(len(decisions.observations(ATTEMPT, fx.DIGEST, cand)), 1)
 
-    def test_eight_character_note_clears(self):
-        self.open_pr()
-        self.ci_done()
-        self.review_posted()
-        self.assertEqual(self.run_loop("y\n\nread it!\n"), EXIT_READY, self.text())
+    def test_note_naming_the_file_clears(self):
+        for note in ("books.test.ts ok", "Read tests/books.test.ts.", "BOOKS.TEST.TS is fine"):
+            with self.subTest(note=note):
+                self.setUp()
+                self.open_pr()
+                self.ci_done()
+                self.review_posted()
+                self.assertEqual(self.run_loop(f"y\n\n{note}\n"), EXIT_READY, self.text())
 
     def test_scope_violation_asks_nothing_even_with_open_flags(self):
         outside_scope(self.world)
         self.open_pr()
         self.ci_done()
         self.review_posted()
-        answers = "y\n\nRead the diff: it is fine.\nRead it too, fine.\n"
+        answers = "y\n\nRead books.test.ts: it is fine.\nRead it too, fine.\n"
         code = self.run_loop(answers)
         self.assertEqual(code, EXIT_STOPPED, self.text())
         self.assertEqual(self.stdin.read(), answers)
@@ -926,11 +932,11 @@ class LoopTests(LoopCase):
         self.review_posted()
         # Same author on GitHub, but edited after it was posted.
         self.world.comments[0]["updated_at"] = "2026-10-08T15:45:00Z"
-        code = self.run_loop("y\n\nRead the diff: import only.\n", wait=2)
+        code = self.run_loop("y\n\nRead books.test.ts: import only.\n", wait=2)
         self.assertEqual(code, EXIT_WAITING, self.text())
         self.assertIn("waiting for the independent review comment", self.text())
         self.assertNotIn("Ready for your review", self.text())
-        self.assertEqual(self.stdin.read(), "y\n\nRead the diff: import only.\n")
+        self.assertEqual(self.stdin.read(), "y\n\nRead books.test.ts: import only.\n")
 
     def test_attempt_from_another_contract_version_stops(self):
         self.assertEqual(self.run_loop(wait=0), EXIT_WAITING)
@@ -939,7 +945,7 @@ class LoopTests(LoopCase):
         self.open_pr()
         self.ci_done()
         self.review_posted()
-        code = self.run_loop("y\n\nRead the diff: import only.\n")
+        code = self.run_loop("y\n\nRead books.test.ts: import only.\n")
         self.assertEqual(code, EXIT_STOPPED, self.text())
         self.assertIn("was started from another version of this contract", self.text())
         self.assertIn(fx.DIGEST.short, self.text())
@@ -958,7 +964,7 @@ class LoopTests(LoopCase):
         self.open_pr()
         self.ci_done()
         self.review_posted()
-        self.loop = self.build("y\n\nRead the diff: import only.\n")
+        self.loop = self.build("y\n\nRead books.test.ts: import only.\n")
         self.loop.timer.interactive = lambda: False
         self.assertEqual(self.loop.run(self.contract), EXIT_READY, self.text())
         timed = [e for e in self.events(kinds.HUMAN_TIME) if e.data["entered_by"] != "Rolando"]
@@ -969,7 +975,7 @@ class LoopTests(LoopCase):
         self.ci_done()
         self.review_posted()
         self.assertEqual(
-            self.run_loop("y\n\nRead the diff: only the filterByStatus import changed.\n"),
+            self.run_loop("y\n\nRead books.test.ts: only the filterByStatus import changed.\n"),
             EXIT_READY,
         )
         # The worker pushes again: new head, new CI run, and a new review.
@@ -1008,7 +1014,7 @@ class LoopTests(LoopCase):
         self.open_pr()
         self.said.clear()
         self.assertEqual(self.run_loop("\n\n"), EXIT_STOPPED, self.text())
-        self.assertIn("ac3 is unknown", self.text())
+        self.assertIn("ac3 needs your own look", self.text())
         self.assertIn(f"(commit {fx.NEW_HEAD[:12]})", self.text())
         self.assertIn("Only your answers are missing", self.text())
 
@@ -1191,7 +1197,7 @@ class ReviewIsNotAwaitedForAKnownFailure(LoopCase):
 class BackupTests(LoopCase):
     def test_every_write_of_a_run_is_backed_up(self):
         self.on_sleep = [self.open_pr]
-        code = self.run_loop("y\n\nRead the diff: import and new tests only.\n")
+        code = self.run_loop("y\n\nRead books.test.ts: import and new tests only.\n")
         self.assertEqual(code, EXIT_READY, self.text())
         last = max(s.seq for s in self.store.events())
         # The final backup holds the last write (Rolando's answers, the checks
@@ -1204,7 +1210,7 @@ class BackupTests(LoopCase):
 
     def test_a_run_that_writes_nothing_makes_no_extra_backup(self):
         self.on_sleep = [self.open_pr]
-        self.run_loop("y\n\nRead the diff: import and new tests only.\n")
+        self.run_loop("y\n\nRead books.test.ts: import and new tests only.\n")
         before = len(self.backups)
         self.assertEqual(self.run_loop("", wait=0), EXIT_READY, self.text())
         self.assertEqual(len(self.backups), before)
