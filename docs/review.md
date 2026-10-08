@@ -59,7 +59,18 @@ Until a reviewer account is configured, nothing is launched and the review repor
 1. **A reviewer GitHub account.** It must be a plain user account that is not the worker's bot and not Rolando's, and it must have no access to the pilot repository. It can still comment, because the repository is public. Check it with `python3 -m controller.review qualify-identity <login>`.
 2. **A reviewer routine** with the saved prompt in `controller/review/reviewer_prompt.md`. It needs its own start key, kept in the service's secrets like the worker's. Its GitHub access must be the reviewer account. The cleanest option is a separate claude.ai account linked to the reviewer GitHub account. Running it on the factory account would post as the worker's bot, and those comments are ignored.
 3. **Rolando's answers.** The review needs his recorded observations of behavior only a person can check, and his clearances of protected-control changes. Until it is given a source for them (the Linear observation replies from the progress-reporting work), a task with either stays at "needs Rolando".
-4. **Service wiring.** Today the service calls `start` once when it first sees an attempt's PR. It also needs to call `check` each round, and pass the latest `evidence` into the merge record (ENG-178's `ReviewEvidence`, whose `reviewed_commit` is the verdict's exact commit). This lands after the ENG-178 PR merges. Until then the service's "review started" message only means a review was asked for.
+4. **Turning it on in the service.** The service already calls the review each round and reports on the ticket (below). `controller/service/main.py` still plugs in a stand-in reviewer, so swapping in `AutoReviewer` with the reviewer routine's runtime is the switch, once steps 1 and 2 are done.
+
+## What Rolando sees on the ticket
+
+Each round the service asks the review where it stands (`check`). It posts each new verdict on each revision once, using the progress-reporting messages (`controller/review/report.py`):
+
+- **Passed:** "Ready for your review", naming the exact commit.
+- **Failed:** what the repair step has to fix. Nothing is asked of Rolando.
+- **Needs your decision:** one observation request per behavior only he can check, bound to that commit, plus one note listing anything else only he can settle.
+- **Waiting, Unclear or Notice:** the review is blocked, its result is lost, or the PR can't be reviewed as it is.
+
+When the PR is merged, the merge record compares the review's commit with the PR's last commit as GitHub shows it. It counts as verified work only when the review passed on exactly that commit; anything else is recorded as an exception that says what is missing.
 
 ## Trying it without starting anything
 

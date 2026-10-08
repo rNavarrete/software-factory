@@ -71,8 +71,8 @@ These belong to the qualification run in ENG-163.
 
 ## Not built yet
 
-- **Asking questions while the worker runs, and observation requests.** The texts are ready (`messages.observation_request`), but the service only asks a question while drafting. Nothing calls the observation request yet.
-- **Ready-for-review, repair, provider-switch and release entries.** The texts are ready, but the service doesn't yet hold the review result (ENG-156), repairs (ENG-160), a second provider or release records to fill them.
+- **Asking questions while the worker runs.** The service only asks a question while drafting. The independent review (ENG-156, docs/review.md) now posts the ready-for-review entry, observation requests and the merge record's review evidence.
+- **Repair, provider-switch and release entries.** The texts are ready, but the service doesn't yet hold repairs (ENG-160), a second provider or release records to fill them.
 - **Pause and resume from Linear.** Intake (ENG-174) reads them; this posts the acknowledgement. Recovery and escalation still run over `fly ssh console`, because clearing an unclear worker needs a signed record that a comment can't give.
 - **Ignored replies are returned, not yet posted.** `LinearDecisions.read` returns why each reply was ignored; posting that on the ticket is left to whoever wires the reader into drafting.
 

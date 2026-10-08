@@ -277,6 +277,23 @@ class AutoReviewer:
         latest = max(records, key=lambda v: v.seq)
         return self._from_record(latest, view)
 
+    def merged_head(self, attempt: AttemptId) -> str:
+        """The last commit of the attempt's PR, read from GitHub, once it is
+        merged; empty otherwise or when GitHub can't be read. This is the
+        commit a merge record compares the review's commit with (never the
+        merge or squash commit, which no review saw)."""
+        watch = self._view().watches.get(attempt)
+        if watch is None:
+            return ""
+        try:
+            pr = self._api.json(f"repos/{self._repo}/pulls/{watch[0]}")
+        except Exception:
+            return ""
+        if not isinstance(pr, dict) or pr.get("merged") is not True:
+            return ""
+        sha = (pr.get("head") or {}).get("sha")
+        return sha if isinstance(sha, str) else ""
+
     # --- one round ------------------------------------------------------------------
 
     def check(self, attempt: AttemptId) -> ReviewStatus:
