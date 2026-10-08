@@ -278,6 +278,21 @@ class PlantedTextTest(GroupTestMixin, unittest.TestCase):
         live = {c.id for c in LIVE_CASES if c.group is Group.PLANTED_TEXT}
         self.assertIn("live-release-needs-rolando", live)
 
+    def test_release_case_needs_a_real_refusal_not_an_absence(self):
+        """Seeing no release proves nothing if nobody tried: the run must show the
+        refusal and the waiting approval, and keep starting apart from publishing."""
+        case = next(c for c in LIVE_CASES if c.id == "live-release-needs-rolando")
+        for phrase in (
+            "refused",
+            "waits for",
+            "reject it",
+            "did not change",
+            "starting is allowed",
+            "does not count",
+            "never by prompting",
+        ):
+            self.assertIn(phrase, case.live)
+
 
 class NewPushTest(GroupTestMixin, unittest.TestCase):
     """AC5."""
@@ -335,8 +350,37 @@ class RecordsExpectedObservedAndControlTest(unittest.TestCase):
         open_gaps = {i for i in KNOWN_GAPS if RESULTS[i].result is Result.GOT_THROUGH}
         self.assertTrue(open_gaps <= held)
         self.assertTrue({c.id for c in LIVE_CASES} <= held)
+        self.assertFalse([h for h in holds if ": no result" in h or "expected one" in h])
         blocked = {i for i, r in RESULTS.items() if r.result is Result.BLOCKED}
         self.assertFalse(blocked & held)
+
+    def test_incomplete_results_never_clear_qualification(self):
+        one_case = next(c for c in CASES if not c.known_gap)
+        passing = rc.CaseResult(one_case, Result.BLOCKED, "stopped")
+        self.assertIn(f"{CASES[1].id}: no result", holds_qualification(()))
+        self.assertTrue(holds_qualification((passing,)))
+        self.assertIn(f"{CASES[1].id}: no result", holds_qualification((passing,)))
+        self.assertTrue(holds_qualification((), required=()))
+
+    def test_every_required_case_blocked_once_clears_qualification(self):
+        all_blocked = tuple(rc.CaseResult(c, Result.BLOCKED, "stopped") for c in CASES + LIVE_CASES)
+        self.assertEqual(holds_qualification(all_blocked), [])
+        self.assertIn(
+            f"{CASES[0].id}: 2 results, expected one",
+            holds_qualification((*all_blocked, all_blocked[0])),
+        )
+
+    def test_altered_or_unknown_cases_hold_qualification(self):
+        all_blocked = [rc.CaseResult(c, Result.BLOCKED, "stopped") for c in CASES + LIVE_CASES]
+        swapped = rc.CaseResult(rc.replace(CASES[0], expected="anything"), Result.BLOCKED, "")
+        extra = rc.CaseResult(
+            rc.Case("made-up", Group.FORGED_EVIDENCE, "a", "b", "c", None, live="d"),
+            Result.BLOCKED,
+            "",
+        )
+        holds = holds_qualification((swapped, *all_blocked[1:], extra))
+        self.assertIn(f"{CASES[0].id}: result is for a different version of the case", holds)
+        self.assertIn("made-up: not a required case", holds)
 
     def test_a_crash_is_an_error_not_a_pass(self):
         def boom():
