@@ -39,11 +39,15 @@ that Rolando approves again, which has a new digest, so all evidence must be
 collected afresh.
 
 Flags are things a person must look at before the result counts: control
-changes; deleted, weakened or changed existing tests; assertions on fixtures
-rather than product code; weak matchers; expected values computed by the code
-under test; assertions that may not run; and checks never shown to fail
-without the change. Each flag holds readiness until a reviewer clears it on
-this exact revision.
+changes; deleted, weakened or changed existing tests; changed imports, kept
+apart from other changes outside tests (shared values, hooks, helpers) so that
+clearing the import change an honest task makes never clears those; comments
+that switch checks off (``@ts-nocheck``, ``eslint-disable``...) added in any
+changed file whose text was supplied; assertions on fixtures rather than
+product code; weak matchers and bounds; expected values computed by the code
+under test or worked out with array methods; assertions that may not run; and
+checks never shown to fail without the change. Each flag holds readiness
+until a reviewer clears it on this exact revision.
 
 The reading of test files is deliberately suspicious: anything it cannot
 follow with confidence (shadowed or aliased test functions, runtime skips,
@@ -61,6 +65,7 @@ Rolando to review". Standard library only.
 from __future__ import annotations
 
 import bisect
+import difflib
 import posixpath
 import re
 from collections.abc import Iterable, Mapping
@@ -326,6 +331,8 @@ class FlagKind(Enum):
     DELETED_TEST = "deleted-test"
     WEAKENED_TEST = "weakened-test"
     CHANGED_TEST = "changed-test"
+    CHANGED_SETUP = "changed-setup"
+    SUPPRESSION = "check-suppression"
     FIXTURE_ONLY = "fixture-only"
     WEAK_ASSERTION = "weak-assertion"
     MIRRORS_CODE = "mirrors-code"
@@ -713,6 +720,8 @@ class _File:
     """(local name, module specifier) for every value import."""
     namespaces: tuple[str, ...]
     """Local names of ``import * as name`` imports."""
+    import_spans: tuple[tuple[int, int], ...]
+    """(start, end) of every ``import ... from '...'`` statement."""
     mocks: tuple[str, ...]
     """Module specifiers mocked with vi.mock/vi.doMock; "?" if not a plain string."""
     spies: tuple[str, ...]
@@ -807,7 +816,20 @@ def _parse(text: str) -> _File:
             suites.append(len(blocks) - 1)
 
     probe = _File(
-        text, masked, bytes(scan.code), tuple(blocks), (), False, (), (), (), (), (), (), newlines
+        text=text,
+        masked=masked,
+        code=bytes(scan.code),
+        blocks=tuple(blocks),
+        tests=(),
+        has_only=False,
+        problems=(),
+        shadowed=(),
+        imports=(),
+        namespaces=(),
+        import_spans=(),
+        mocks=(),
+        spies=(),
+        newlines=newlines,
     )
     unregistered = _registration(probe)
 
@@ -890,6 +912,7 @@ def _parse(text: str) -> _File:
         shadowed=tuple(shadowed),
         imports=tuple(imports),
         namespaces=tuple(namespaces),
+        import_spans=tuple(import_spans),
         mocks=tuple(_mocks(masked, scan)),
         spies=tuple(_spies(masked)),
         newlines=newlines,
@@ -1254,6 +1277,9 @@ _WEAK_MATCHERS = frozenset(
         "toMatchInlineSnapshot",
         "toMatchFileSnapshot",
     }
+)
+_BOUND_MATCHERS = frozenset(
+    {"toBeGreaterThan", "toBeGreaterThanOrEqual", "toBeLessThan", "toBeLessThanOrEqual"}
 )
 _WEAK_ASSERTS = frozenset({"assert", "assert.ok", "assert.isOk", "assert.exists"})
 
@@ -1633,6 +1659,8 @@ def map_assertions(
         flag(f)
     for f in _test_change_flags(candidate, head, base, parse):
         flag(f)
+    for f in _suppression_flags(candidate, head, base):
+        flag(f)
 
     by_id = {v.criterion: v for v in verification.criteria}
     coverage = []
@@ -1729,6 +1757,47 @@ def _control_flags(candidate, report, policy, ignored):
         )
 
 
+# Comments that switch a check off for a line or a whole file.
+_SUPPRESSION_RE = re.compile(
+    r"@ts-nocheck|@ts-ignore|@ts-expect-error|eslint-disable(?:-next-line|-line)?|"
+    r"(?:istanbul|c8|v8)\s+ignore|biome-ignore|prettier-ignore|oxlint-disable"
+)
+
+
+def _suppression_flags(candidate, head, base):
+    """Check suppressions added in any changed file whose text was supplied. A file
+    with no text at the merge base (new, or not supplied) has every one counted."""
+    for path in candidate.changed_paths:
+        after = head.get(path)
+        if after is None or after.text is None:
+            continue
+        before = base.get(path)
+        old = _suppressions(before.text if before is not None and before.text else "")
+        new = _suppressions(after.text)
+        added = [
+            f"{word} from {len(old.get(word, ()))} to {len(lines)} "
+            f"(now on line {', '.join(map(str, lines))})"
+            for word, lines in new.items()
+            if len(lines) > len(old.get(word, ()))
+        ]
+        if added:
+            yield Flag(
+                FlagKind.SUPPRESSION,
+                path,
+                "adds comments that switch checks off, so passing typecheck, lint or "
+                "coverage may no longer mean what it did: " + ", ".join(added),
+            )
+
+
+def _suppressions(text: str) -> dict[str, list[int]]:
+    """Each suppression comment found, with the lines it is on."""
+    out: dict[str, list[int]] = {}
+    for m in _SUPPRESSION_RE.finditer(text):
+        word = re.sub(r"\s+", " ", m.group(0))
+        out.setdefault(word, []).append(text.count("\n", 0, m.start()) + 1)
+    return out
+
+
 def _is_test_path(path: str) -> bool:
     return path.startswith("tests/") or bool(_TEST_NAME_RE.search(path))
 
@@ -1819,16 +1888,24 @@ def _compare_tests(path, old: _File, new: _File):
                 f"changes the existing test {name!r}; an edit can weaken a test without "
                 "removing an assertion",
             )
-    before_lines, after_lines = _outside_tests(old), _outside_tests(new)
-    if before_lines != after_lines:
-        removed = [x for x in before_lines if x not in after_lines]
-        added = [x for x in after_lines if x not in before_lines]
-        sample = [f"-{x}" for x in removed[:3]] + [f"+{x}" for x in added[:3]]
+    known = _suite_paths(old)
+    old_imports, old_setup = _outside_tests(old, known)
+    new_imports, new_setup = _outside_tests(new, known)
+    if old_imports != new_imports:
         yield Flag(
             FlagKind.CHANGED_TEST,
             path,
-            "changes an existing test file outside its tests (imports, shared fixtures, "
-            "setup or helpers)" + (": " + " | ".join(sample) if sample else ""),
+            "changes the imports of an existing test file: " + _line_diff(old_imports, new_imports),
+        )
+    if old_setup != new_setup:
+        # Kept apart from the import change an honest task always makes, so clearing
+        # that never clears a new hook, a changed shared value or a changed helper.
+        yield Flag(
+            FlagKind.CHANGED_SETUP,
+            path,
+            "changes an existing test file outside its tests (shared values, hooks, helpers "
+            "or setup), which can change what every test in it checks: "
+            + _line_diff(old_setup, new_setup),
         )
     if new.problems and set(new.problems) != set(old.problems):
         yield Flag(
@@ -1838,16 +1915,88 @@ def _compare_tests(path, old: _File, new: _File):
         )
 
 
-def _outside_tests(f: _File) -> list[str]:
-    """The file's lines with every test's own call removed (suite headers kept)."""
-    parts, i = [], 0
-    for b in sorted((b for b in f.blocks if not b.is_suite), key=lambda b: b.start):
-        if b.start < i:
+def _suite_paths(f: _File) -> set[tuple[str | None, ...]]:
+    return {_suite_path(f, i) for i, b in enumerate(f.blocks) if b.is_suite}
+
+
+def _suite_path(f: _File, i: int) -> tuple[str | None, ...]:
+    out = []
+    p: int | None = i
+    while p is not None:
+        out.append(f.blocks[p].title)
+        p = f.blocks[p].parent
+    return tuple(reversed(out))
+
+
+# Code in a new suite's body runs while tests are collected, and hooks or patches
+# there can reach tests outside it, so those lines still count as setup.
+_REACHING_RE = re.compile(
+    r"(?<![\w$])(?:vi|vitest|beforeEach|beforeAll|afterEach|afterAll|onTestFailed|"
+    r"onTestFinished|globalThis|global|window|self|document|process|prototype|__proto__|"
+    r"Object|Reflect|Proxy|eval|Function|require|import)(?![\w$])"
+)
+
+
+def _outside_tests(f: _File, known: set[tuple[str | None, ...]]) -> tuple[list[str], list[str]]:
+    """The file's import lines and its other lines, with every test's own call
+    removed. A suite that is not in ``known`` (the base's suites) is new: its
+    plain fixtures only reach the new tests in it, so of its lines only those
+    that can reach further (hooks, vi, globals, prototypes) are kept. Suite
+    headers and everything else outside tests are kept."""
+    n = len(f.text)
+    state = [0] * n  # 0 kept, 1 removed, 2 in a new suite
+    for i, b in enumerate(f.blocks):
+        if b.is_suite and (b.title is None or _suite_path(f, i) in known):
             continue
-        parts.append(f.text[i : b.start])
-        i = b.end + 1
-    parts.append(f.text[i:])
-    return [_normalize(x) for x in "\n".join(parts).splitlines() if x.strip()]
+        mark = 1 if not b.is_suite else 2
+        for k in range(b.start, b.end + 1):
+            if state[k] != 1:
+                state[k] = mark
+    in_import = [False] * n
+    for a, e in f.import_spans:
+        k = _skip_ws(f.masked, e)
+        if k < len(f.masked) and f.masked[k] == ";" and "\n" not in f.text[e:k]:
+            e = k + 1
+        in_import[a:e] = [True] * (e - a)
+    imports, other, fresh = [], [], []
+    for i, c in enumerate(f.text):
+        if c == "\n":
+            imports.append(c)
+            other.append(c)
+            fresh.append(c)
+        elif state[i] == 2:
+            fresh.append(c)
+            other.append(" ")
+        elif state[i] == 0:
+            (imports if in_import[i] else other).append(c)
+
+    def kept(chars: list[str]) -> list[str]:
+        return "".join(chars).split("\n")
+
+    out_imports = [_normalize(x) for x in kept(imports) if x.strip(" \t;")]
+    out_other = []
+    for x, y in zip(kept(other), kept(fresh), strict=True):
+        line = x if x.strip(" \t;") else ""
+        if _REACHING_RE.search(y):
+            line = f"{line} {y}" if line else y
+        if line.strip(" \t;"):
+            out_other.append(_normalize(line))
+    return out_imports, out_other
+
+
+_DIFF_LINES = 40
+
+
+def _line_diff(before: list[str], after: list[str]) -> str:
+    """Every removed (-) and added (+) line, in order, up to a limit."""
+    out = []
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    for op, a, b, c, d in matcher.get_opcodes():
+        if op != "equal":
+            out += [f"-{x}" for x in before[a:b]] + [f"+{x}" for x in after[c:d]]
+    more = len(out) - _DIFF_LINES
+    shown = " | ".join(out[:_DIFF_LINES])
+    return shown + (f" | ... and {more} more changed line(s)" if more > 0 else "")
 
 
 def _body_text(f: _File, t: _Test) -> str:
@@ -2101,6 +2250,17 @@ def _check_link(link: AssertionLink, command: str, head, parse, policy):
             for v in bindings.get(name, ())
             for n in _calls(v, product, namespaces, aliases)
         }
+        computed = _computed(a.expected, bindings)
+        if computed:
+            flags.append(
+                Flag(
+                    FlagKind.MIRRORS_CODE,
+                    subject,
+                    f"the expected value is worked out with `.{computed}(...)` instead of "
+                    "written out, so it may repeat the code's own logic and agree with it "
+                    "whatever it does",
+                )
+            )
         mirrored = primary & expected
         if mirrored:
             flags.append(
@@ -2126,6 +2286,22 @@ def _check_link(link: AssertionLink, command: str, head, parse, policy):
         [],
         flags,
     )
+
+
+_COMPUTING_RE = re.compile(
+    r"\.\s*(filter|map|flatMap|reduce|reduceRight|find|findLast|findIndex|findLastIndex|"
+    r"some|every|sort|toSorted|forEach)\s*\("
+)
+
+
+def _computed(expected: str, bindings) -> str | None:
+    """The array method an expected value is worked out with, directly or through
+    a variable it names, if any."""
+    for expr in (expected, *(v for n in _idents(expected) for v in bindings.get(n, ()))):
+        m = _COMPUTING_RE.search(expr)
+        if m:
+            return m.group(1)
+    return None
 
 
 def _passed_to_product(f, start, pos, subject, product, namespaces) -> bool:
@@ -2159,6 +2335,8 @@ def _weakness(a: _Assertion) -> str | None:
         return "a negated matcher passes for almost any wrong value"
     if a.matcher in _WEAK_MATCHERS:
         return f"`{a.matcher}` does not pin the value down"
+    if a.matcher in _BOUND_MATCHERS:
+        return f"`{a.matcher}` only checks a bound, so many wrong values pass"
     if a.matcher in ("toThrow", "toThrowError") and not a.expected.strip():
         return f"`{a.matcher}()` with no expected error passes on any error"
     if a.matcher == "toHaveProperty" and len(_split_args(a.expected)) < 2:
