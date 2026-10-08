@@ -105,12 +105,18 @@ class LogReporter:
 
 
 class RecordingReviewer:
+    """Starts at most one review per request key, as a real reviewer must."""
+
     def __init__(self) -> None:
         self.started: list[PullRequestRef] = []
+        self.calls: list[str] = []
 
-    def start(self, pr: PullRequestRef) -> str:
-        self.started.append(pr)
-        return f"fixture review of PR #{pr.number}"
+    def start(self, pr: PullRequestRef, key: str) -> str:
+        self.calls.append(key)
+        if key not in self.calls[:-1]:
+            self.started.append(pr)
+            return f"fixture review of PR #{pr.number}"
+        return f"fixture review of PR #{pr.number} (already started)"
 
 
 class NoRepair:

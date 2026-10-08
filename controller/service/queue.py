@@ -34,6 +34,7 @@ ITEM_CLOSED = "item-closed"
 OUTBOX_QUEUED = "outbox-queued"
 OUTBOX_SENT = "outbox-sent"
 OUTBOX_FAILED = "outbox-failed"
+REVIEW_REQUESTED = "review-requested"
 REVIEW_STARTED = "review-started"
 
 KINDS = frozenset(
@@ -49,6 +50,7 @@ KINDS = frozenset(
         OUTBOX_QUEUED,
         OUTBOX_SENT,
         OUTBOX_FAILED,
+        REVIEW_REQUESTED,
         REVIEW_STARTED,
     }
 )
@@ -102,8 +104,11 @@ class ServiceView:
     outbox: dict[str, Message] = field(default_factory=dict)
     """Queued and not yet sent, by key."""
     queued_keys: set[str] = field(default_factory=set)
+    review_requests: dict[str, tuple[int, str]] = field(default_factory=dict)
+    """Attempt -> (PR number, request key), recorded before the reviewer is
+    called, so a restart repeats the same request instead of a new one."""
     reviews: set[str] = field(default_factory=set)
-    """Attempts whose review was started."""
+    """Attempts whose review the reviewer confirmed started."""
 
     @classmethod
     def build(cls, stored: Iterable[StoredEvent]) -> ServiceView:
@@ -151,6 +156,8 @@ class ServiceView:
                 if m is not None:
                     m.failures += 1
                     m.last_failed_at = e.at
+            elif e.kind == REVIEW_REQUESTED and e.attempt is not None:
+                v.review_requests.setdefault(str(e.attempt), (int(d["pr"]), str(d["key"])))
             elif e.kind == REVIEW_STARTED and e.attempt is not None:
                 v.reviews.add(str(e.attempt))
         return v
@@ -237,6 +244,10 @@ def sent(key: str, now: datetime) -> LedgerEvent:
 
 def send_failed(key: str, error: str, now: datetime) -> LedgerEvent:
     return LedgerEvent(OUTBOX_FAILED, now, data={"key": key, "error": error[:500]})
+
+
+def review_requested(attempt, pr: int, key: str, now: datetime) -> LedgerEvent:
+    return LedgerEvent(REVIEW_REQUESTED, now, attempt.task, attempt, data={"pr": pr, "key": key})
 
 
 def started(data: Mapping[str, object], now: datetime) -> LedgerEvent:
