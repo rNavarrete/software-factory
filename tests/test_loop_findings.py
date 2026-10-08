@@ -44,11 +44,10 @@ class FlagNamesTests(unittest.TestCase):
                 "tests/books.test.ts > filterByStatus > keeps order",
                 "tests/books.test.ts",
                 "books.test.ts",
-                "keeps order",
             },
         )
         self.assertEqual(flag_names("passes-without-change:ac4"), ("ac4",))
-        self.assertIn("ci", flag_names("control-change:ci-report"))
+        self.assertEqual(flag_names("control-change:ci-report"), ("ci report", "ci-report"))
 
     def test_a_note_must_name_the_subject_as_a_whole_word(self):
         flag = "changed-test:tests/books.test.ts"
@@ -226,8 +225,8 @@ class StaleReviewTests(LoopFindingCase):
         text = self.text()
         self.assertIn("Review comment not used:", text)
         self.assertIn("main moved after the review was posted", text)
-        self.assertIn("posted again for the new main", text)
-        self.assertNotIn("python3 -m controller repair", text)  # not the worker's fault
+        self.assertIn("review posted again", text)
+        self.assertIn("not the worker's fault", text)
         self.assertNotIn("Ready for your review", text)
         self.assertEqual(self.stdin.read(), answers)  # nothing asked of him
 
@@ -271,7 +270,7 @@ class MergedBeforeReadyTests(LoopFindingCase):
         self.open_pr(merged=True)
         self.said.clear()
         self.assertEqual(self.run_loop("\n"), EXIT_READY, self.text())
-        self.assertIn("its last check said action_required", self.text())
+        self.assertIn("its last check before the merge said action_required", self.text())
         self.assertEqual(len(self.failures()), 1)
 
     def test_merge_after_ready_says_nothing_and_records_nothing(self):
@@ -356,3 +355,141 @@ class StaleBaseTests(LoopFindingCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- found by the review of the fixes above -------------------------------------
+
+
+class ReviewProbeTests(LoopFindingCase):
+    def failures(self):
+        return [
+            e for e in self.events(kinds.FAILURE) if e.data.get("stage") == "merged-before-ready"
+        ]
+
+    def test_generic_test_title_is_not_a_name(self):
+        flag = "weakened-test:tests/books.test.ts > filterByStatus > works"
+        self.assertFalse(names_flag(flag, "Clicked the filter button, it works."))
+
+    def test_ci_report_is_not_named_by_ci_inside_other_words(self):
+        for note in ("Read src/ci.ts and it is fine", "ci.yml is fine", "ci/cd looks fine"):
+            with self.subTest(note=note):
+                self.assertFalse(names_flag("control-change:ci-report", note))
+
+    def test_same_file_name_in_another_folder_is_not_a_name(self):
+        flag = "changed-test:tests/unit/books.test.ts"
+        self.assertFalse(names_flag(flag, "Read tests/e2e/books.test.ts, fine"))
+
+    def test_word_forms_and_short_words_count_as_about_the_check(self):
+        from controller.loop.loop import _about
+
+        c = fx.CONTRACT["acceptance_criteria"][2]
+        self.assertTrue(_about("Filtering worked: one row visible, then all rows came back", c))
+        self.assertFalse(_about("the new code changes", c))
+        self.assertFalse(_about("looks good to me", c))
+
+    def test_permitted_file_renamed_away_on_main_is_seen(self):
+        self.world.main_changes = [
+            {"filename": "src/lib/books.ts", "previous_filename": "src/books.ts"}
+        ]
+        self.assertEqual(self.run_loop("\n"), EXIT_STOPPED, self.text())
+        self.assertIn("src/books.ts", self.text())
+
+    def test_more_files_than_github_lists_asks_too(self):
+        self.world.main_changes = [{"filename": f"docs/{i}.md"} for i in range(300)]
+        self.assertEqual(self.run_loop("\n"), EXIT_STOPPED, self.text())
+        self.assertIn("can't be told", self.text())
+        self.assertEqual(self.adapter.requests, [])
+
+    def test_stop_message_does_not_claim_nothing_was_recorded(self):
+        self.world.main_changes = [{"filename": "src/books.ts"}]
+        self.run_loop("\n")
+        self.assertNotIn("nothing was recorded", self.text())
+        self.assertIn("only your time on this question was recorded", self.text())
+
+    def test_ctrl_c_at_the_stale_base_prompt_starts_nothing(self):
+        self.world.main_changes = [{"filename": "src/books.ts"}]
+        self.loop = self.build("")
+
+        class Interrupted:
+            def ask(self, prompt):
+                raise KeyboardInterrupt
+
+        self.loop.asker = Interrupted()
+        self.assertEqual(self.loop.run(self.contract, wait_minutes=0), EXIT_STOPPED)
+        self.assertEqual(self.adapter.requests, [])
+
+    def test_real_failure_still_gets_the_repair_hint_when_main_moved(self):
+        self.ready_world()
+        self.world.pr["base"]["sha"] = "e" * 40
+        self.world.files.append({"filename": "package.json", "status": "modified"})
+        self.world.pr["changed_files"] = len(self.world.files)
+        self.assertEqual(self.run_loop(f"y\n\n{GOOD_NOTE}\n", wait=0), EXIT_STOPPED)
+        self.assertIn("package.json", self.text())
+        self.assertIn("python3 -m controller repair", self.text())
+
+    def test_ready_later_withdrawn_then_merged_is_recorded(self):
+        self.open_pr()
+        self.assertEqual(self.run_loop(f"y\n\n{GOOD_NOTE}\n"), EXIT_READY)
+        self.world.comments[0]["updated_at"] = "2026-10-08T15:30:00Z"  # review edited
+        self.said.clear()
+        self.run_loop("", wait=0)
+        self.assertNotIn("Ready for your review", self.text())
+        self.open_pr(merged=True)
+        self.said.clear()
+        self.run_loop("\n")
+        self.assertEqual(len(self.failures()), 1, self.text())
+        self.assertIn("its last check before the merge said pending", self.text())
+
+    def test_ready_recorded_after_the_merge_does_not_count(self):
+        self.open_pr()
+        self.world.pr["merged_at"] = "2026-10-08T11:00:00Z"  # before the loop's clock
+        self.assertEqual(self.run_loop(f"y\n\n{GOOD_NOTE}\n"), EXIT_READY)
+        self.open_pr(merged=True)
+        self.world.pr["merged_at"] = "2026-10-08T11:00:00Z"
+        self.said.clear()
+        self.run_loop("\n")
+        self.assertEqual(len(self.failures()), 1, self.text())
+
+    def test_pr_merged_while_answering_is_not_called_ready(self):
+        self.open_pr()
+        self.loop = self.build(f"y\n\n{GOOD_NOTE}\n")
+        real = self.loop.asker.ask
+        world = self.world
+
+        def ask_then_merge(prompt):
+            answer = real(prompt)
+            if "Needs your eyes" in prompt:
+                world.pr["state"] = "closed"
+            return answer
+
+        self.loop.asker.ask = ask_then_merge
+        self.assertEqual(self.loop.run(self.contract), EXIT_STOPPED)
+        self.assertIn("no longer open", self.text())
+        self.assertNotIn("Ready for your review", self.text())
+
+    def test_dropped_old_clearance_is_mentioned(self):
+        self.open_pr()
+        self.run_loop("y\n\n\n")  # observe, leave the flag open
+        ReviewDecisions(self.store, KEY)._write(
+            ATTEMPT,
+            fx.DIGEST,
+            fx.candidate(),
+            CLEARED,
+            NOW,
+            flag=fx.FILE_FLAG,
+            note="The Clear finished button works.",
+        )
+        self.said.clear()
+        self.run_loop("\n")
+        self.assertIn("no longer counts", self.text())
+        self.assertIn("Clear finished button", self.text())
+
+    def test_concurrent_close_outs_record_the_merge_once(self):
+        self.open_pr(merged=True)
+        first, second = self.build("\n"), self.build("\n")
+        self.assertEqual(first.run(self.contract), EXIT_READY)
+        second.run(self.contract)
+        self.assertEqual(len(self.failures()), 1)
+        (f,) = self.failures()
+        self.assertEqual(f.data["revision"], fx.HEAD)
+        self.assertEqual(f.data["pr"], NUMBER)

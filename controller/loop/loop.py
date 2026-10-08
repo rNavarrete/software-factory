@@ -35,7 +35,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TextIO
@@ -58,6 +58,8 @@ DEFAULT_WAIT_MINUTES = 90
 
 EXIT_READY, EXIT_STOPPED, EXIT_WAITING = 0, 1, 3
 MAX_REVIEW_MINUTES = 8 * 60.0
+COMPARE_FILE_LIMIT = 300
+"""GitHub's compare lists at most this many files."""
 MIN_NOTE = 8
 _NOT_A_NOTE = frozenset({"y", "yes", "n", "no", "ok", "okay", "skip", "fine", "sure", "lgtm"})
 
@@ -125,7 +127,10 @@ class Loop:
         digest = contracts.digest(contract)
         self.timer.task = task
         if latest_attempt(self.store, task) is None:
-            stop = self._stale_base(contract)
+            try:
+                stop = self._stale_base(contract)
+            except KeyboardInterrupt:
+                stop = "\nNot started. Nothing was sent."
             if stop is not None:
                 self.say(stop)
                 return EXIT_STOPPED
@@ -234,9 +239,16 @@ class Loop:
         if assessment.conclusion() == "action_required":
             # Only Rolando's inputs are missing; anything else wrong needs a repair first.
             assessment = self._ask_rolando(contract, digest, attempt, assessment)
+            now = self.now()  # his answers can take minutes; record when they were done
         self._record(assessment, status.latest_run, now)
         path = self._write_report(attempt, assessment)
         head = collected.candidate.head_commit if collected.candidate else "?"
+        if assessment.ready and not self._still_open(number):
+            self.say(
+                f"PR #{number} is no longer open (merged or closed while this ran). Run this"
+                " same command again to close the task out."
+            )
+            return EXIT_STOPPED, ""
         if assessment.ready:
             self.say(f"Ready for your review: {collected.pr_url}")
             self.say(f"Checked commit: {head}")
@@ -256,16 +268,21 @@ class Loop:
         if any(_base_moved(why) for why in assessment.review.ignored):
             self.say(
                 "Main moved after this PR was checked, so its review (and any check bound to"
-                " main) is for the old main. That is not the worker's fault, and no repair is"
-                " needed: the review has to be posted again for the new main, and a check still"
-                " for the old main needs CI to run again on the new main. Then run this same"
-                " command again."
+                " main) is for the old main. Those need redoing for the new main: the review"
+                " posted again, and CI run again on the new main. That part is not the"
+                " worker's fault."
             )
-        elif assessment.conclusion() == "action_required":
+        if assessment.conclusion() == "action_required":
             self.say("Only your answers are missing: run this same command again to give them.")
         else:
             self.say(_repair_hint(contract))
         return EXIT_STOPPED, ""
+
+    def _still_open(self, number: int) -> bool:
+        try:
+            return self._open_prs([number]) == [number]
+        except GitHubUnreadable:
+            return False
 
     def _open_prs(self, numbers) -> list[int]:
         """Which of ``numbers`` are open now. An unreadable one raises: guessing
@@ -342,6 +359,11 @@ class Loop:
             )
             asked = True
         flags = a.open_flags()
+        for flag, note in self.decisions.unnamed_clearances(attempt, digest, cand):
+            self.say(
+                f'Your earlier note for {flag} ("{note[:80]}") doesn\'t name'
+                f" {flag_label(flag)}, so it no longer counts."
+            )
         if flags:
             self.say(
                 "\n---- Flags: each one is about the code or tests in the PR, not the"
@@ -468,48 +490,44 @@ class Loop:
                 return
             if isinstance(pr, Mapping) and pr.get("merged_at"):
                 sha = (pr.get("head") or {}).get("sha")
-                if isinstance(sha, str):
-                    heads.append((n, sha))
+                merged_at = _when(pr.get("merged_at"))
+                if isinstance(sha, str) and merged_at is not None:
+                    heads.append((n, sha, merged_at))
         if not heads:
             return
-        events = self.store.events(attempt.task)
-        ready = {
-            s.event.data.get("revision")
-            for s in events
-            if s.event.kind == kinds.CHECKS
-            and s.event.attempt == attempt
-            and any(
-                r.get("name") == CHECK_NAME and r.get("conclusion") == "success"
-                for r in s.event.data.get("results", ())
-            )
-        }
-        for n, sha in heads:
-            if sha in ready:
+        for n, sha, merged_at in heads:
+            last = _verdict_before(self.store.events(attempt.task), attempt, sha, merged_at)
+            if last == "success":
                 continue
-            last = _last_verdict(events, attempt, sha)
+            why = (
+                f"its last check before the merge said {last}"
+                if last
+                else "the loop never checked that commit before the merge"
+            )
             self.say(
                 f"Note: PR #{n} was merged at commit {sha[:12]} before this loop said it was"
-                f" ready ({last}). That is recorded so the pilot's results count it."
+                f" ready ({why}). That is recorded so the pilot's results count it."
             )
             stage = "merged-before-ready"
-            if any(
-                s.event.kind == kinds.FAILURE
-                and s.event.attempt == attempt
-                and s.event.data.get("stage") == stage
-                and sha in s.event.data.get("detail", "")
-                for s in events
-            ):
-                continue
-            event = records.failure(
-                stage,
-                f"PR #{n} merged at {sha} with no ready verdict from the loop for that"
-                f" commit ({last})",
-                self.now(),
-                task=attempt.task,
-                attempt=attempt,
-                run=status.latest_run,
-            )
             with self.store.writer_lock():
+                if any(
+                    s.event.kind == kinds.FAILURE
+                    and s.event.attempt == attempt
+                    and s.event.data.get("stage") == stage
+                    and s.event.data.get("revision") == sha
+                    for s in self.store.events(attempt.task)
+                ):
+                    continue
+                event = records.failure(
+                    stage,
+                    f"PR #{n} merged at {sha} with no ready verdict from the loop for that"
+                    f" commit ({why})",
+                    self.now(),
+                    task=attempt.task,
+                    attempt=attempt,
+                    run=status.latest_run,
+                )
+                event = replace(event, data={**event.data, "revision": sha, "pr": n})
                 self.store.append(event)
 
     def _stale_base(self, contract: Mapping[str, object]) -> str | None:
@@ -531,48 +549,75 @@ class Loop:
         permitted = [str(p) for p in contract.get("permitted_paths", ())]
         touched = sorted(
             {
-                f["filename"]
+                name
                 for f in files
                 if isinstance(f, Mapping)
-                and isinstance(f.get("filename"), str)
-                and _permitted(f["filename"], permitted)
+                for name in (f.get("filename"), f.get("previous_filename"))
+                if isinstance(name, str) and _permitted(name, permitted)
             }
         )
-        if not touched:
+        if len(files) >= COMPARE_FILE_LIMIT:
+            self.say(
+                f"Main has changed {len(files)} or more files since this contract's base"
+                f" ({base[:12]}), more than GitHub lists, so whether it changed files this task"
+                " may change can't be told. A contract on a newer base needs its own approval."
+            )
+        elif not touched:
             return None
-        self.say(
-            f"Main has changed since this contract's base ({base[:12]}) in files this task"
-            f" may change: {', '.join(touched)}. The worker would start from the old"
-            " version of them, and its PR would likely conflict. A contract on a newer base"
-            " needs its own approval."
-        )
+        else:
+            self.say(
+                f"Main has changed since this contract's base ({base[:12]}) in files this task"
+                f" may change: {', '.join(touched)}. The worker would start from the old"
+                " version of them, and its PR would likely conflict. A contract on a newer"
+                " base needs its own approval."
+            )
         answer = self.timer.timed(
             lambda: self.asker.ask("Start it on the old base anyway? y / Enter to stop: "),
             f"decided whether to start {contract.get('task_id')} on an old base",
         )
         if answer is not None and answer.lower() == "y":
             return None
-        return "Not started. Nothing was sent and nothing was recorded."
+        return "Not started. Nothing was sent; only your time on this question was recorded."
 
 
-def _last_verdict(events, attempt: AttemptId, sha: str) -> str:
-    for s in reversed(list(events)):
+def _when(text: object) -> datetime | None:
+    if not isinstance(text, str):
+        return None
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo is not None else None
+
+
+def _verdict_before(events, attempt: AttemptId, sha: str, merged_at: datetime) -> str | None:
+    """The loop's latest verdict on ``sha`` recorded before the merge, if any.
+    A ready that a later check withdrew, or one recorded after the merge,
+    doesn't count as ready when merged."""
+    last = None
+    for s in events:
         e = s.event
-        if e.kind == kinds.CHECKS and e.attempt == attempt and e.data.get("revision") == sha:
-            for r in e.data.get("results", ()):
-                if r.get("name") == CHECK_NAME:
-                    return f"its last check said {r.get('conclusion')}"
-    return "the loop never checked that commit"
+        if e.kind != kinds.CHECKS or e.attempt != attempt or e.data.get("revision") != sha:
+            continue
+        if e.at > merged_at:
+            continue
+        for r in e.data.get("results", ()):
+            if r.get("name") == CHECK_NAME:
+                last = str(r.get("conclusion"))
+    return last
 
 
 _STOP = frozenset(
-    "that this with from then them they their there when what have only into each"
-    " were your will just like page once".split()
+    "the and was for but are you has had its that this with from then them they their"
+    " there when what have only into each were your will just like once see saw new"
+    " code chang work fine good looks look okay".split()
 )
 
 
 def _words(text: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9']{4,}", text.lower()) if w not in _STOP}
+    """Word stems (first 5 letters) of 3 letters or more, minus filler."""
+    stems = {w[:5] for w in re.findall(r"[^\W_]{3,}", text.lower())}
+    return {w for w in stems if w not in _STOP}
 
 
 def _about(seen: str, criterion: Mapping[str, object]) -> bool:

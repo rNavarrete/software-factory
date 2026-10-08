@@ -41,24 +41,21 @@ def flag_names(flag: str) -> tuple[str, ...]:
 
     A flag's key is ``<kind>:<subject>``, and its subject is a file path, a
     test (``<path> > <describe> > <test>``), a criterion id or ``ci-report``.
-    Its names are the whole subject, each path and its file name, the test's
-    own title and the criterion id. A note that names none of them is about
-    something else (in the first live run a note about a button cleared a
-    test-file flag), so it never clears the flag.
+    Its names are the whole subject, the file's path and its file name, the
+    criterion id, or for ``ci-report`` "ci-report" or "CI report". A test's
+    own title is not one: titles are often everyday words ("works"). A note
+    that names none of them is about something else (in the first live run a
+    note about a button cleared a test-file flag), so it never clears the flag.
     """
     _, _, subject = flag.partition(":")
     subject = subject.strip()
     names = {subject}
-    parts = [p.strip() for p in subject.split(_SEP) if p.strip()]
-    if parts:
-        first = parts[0]
-        if "/" in first or "." in first:
-            names.add(first)
-            names.add(first.rsplit("/", 1)[-1])
-        if len(parts) > 1:
-            names.add(parts[-1])
+    first = subject.split(_SEP)[0].strip()
+    if "/" in first or "." in first:
+        names.add(first)
+        names.add(first.rsplit("/", 1)[-1])
     if subject == "ci-report":
-        names.update({"ci", "control-change report"})
+        names.add("ci report")
     return tuple(sorted(n for n in names if n))
 
 
@@ -73,12 +70,19 @@ def flag_label(flag: str) -> str:
     return subject.strip()
 
 
+# A name counts only as a whole word: not inside a longer path or file name
+# ("tests/e2e/books.test.ts" doesn't name "tests/unit/books.test.ts", and
+# "old-books.test.ts" doesn't name "books.test.ts"). A sentence's full stop
+# after it is fine.
+_BEFORE = r"(?<![\w./\\-])"
+_AFTER = r"(?![\w/\\-]|\.\w)"
+
+
 def names_flag(flag: str, note: str) -> bool:
     """Whether ``note`` names what ``flag`` points at (see ``flag_names``)."""
-    text = note.lower()
+    text = " ".join(note.lower().split())
     for name in flag_names(flag):
-        rx = r"(?<![A-Za-z0-9_])" + re.escape(name.lower()) + r"(?![A-Za-z0-9_])"
-        if re.search(rx, text):
+        if re.search(_BEFORE + re.escape(" ".join(name.lower().split())) + _AFTER, text):
             return True
     return False
 
@@ -170,6 +174,18 @@ class ReviewDecisions:
             if names_flag(str(b.get("flag", "")), str(b.get("note", "")))
         )
 
+    def unnamed_clearances(
+        self, attempt: AttemptId, digest: ContractDigest, candidate: Candidate
+    ) -> tuple[tuple[str, str], ...]:
+        """Signed clearings for this revision whose note doesn't name their
+        flag (written before notes had to), as (flag, note). They never count;
+        the loop says so instead of dropping them silently."""
+        return tuple(
+            (str(b.get("flag", "")), str(b.get("note", "")))
+            for b in self._bindings(attempt, digest, candidate, CLEARED)
+            if not names_flag(str(b.get("flag", "")), str(b.get("note", "")))
+        )
+
     def _write(self, attempt, digest, candidate, decision, now, **fields) -> None:
         binding = {
             "digest": digest.value,
@@ -232,7 +248,7 @@ class ReviewDecisions:
 
 
 def _or(names: Sequence[str]) -> str:
-    quoted = [f"'{n}'" for n in names]
+    quoted = [f"'{n}'" for n in names] or ["(nothing)"]
     return quoted[0] if len(quoted) == 1 else ", ".join(quoted[:-1]) + " or " + quoted[-1]
 
 
