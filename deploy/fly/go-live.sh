@@ -60,14 +60,33 @@ on_host() {
 }
 secrets_now() { SECRETS=$(fly secrets list --app "$APP"); }
 have() { printf '%s\n' "$SECRETS" | grep -qw "$1"; }
+# Deploys exactly the commit on main: a clean export, so untracked files in
+# this folder never reach the image.
 deploy() {
-    fly deploy . --app "$APP" --config deploy/fly/fly.toml \
-        --dockerfile deploy/fly/Dockerfile --ha=false
+    BUILD=$(mktemp -d)
+    git archive --format=tar HEAD | (cd "$BUILD" && tar -xf -)
+    fly deploy "$BUILD" --app "$APP" --config "$BUILD/deploy/fly/fly.toml" \
+        --dockerfile "$BUILD/deploy/fly/Dockerfile" --ha=false
+    rm -rf "$BUILD"
 }
-# Ledger counts and the last line the service has for a ticket.
-starts() { on_host "/app/factory status" | sed -n 's/^Worker starts on record: //p'; }
-last_item() { on_host "/app/factory queue" | awk -v k="$1" '$1 == k { line = $0 } END { print line }'; }
-recorded() { [ "$(on_host "cat $RECORD/$1 2>/dev/null || true")" = "${2:-done}" ]; }
+# The running service's home: /data/factory once live mode is really running.
+# These are plain assignments, so a failed look stops the script.
+host_home() { HOME_NOW=$(on_host "cat /run/factory-home"); }
+# One look at the service: its status and its queue.
+look() {
+    STATUS_NOW=$(on_host "/app/factory status")
+    QUEUE_NOW=$(on_host "/app/factory queue")
+}
+# What that look says about fires: how many there are, and which launched a
+# worker with a session ("launched" plus its link) or didn't (refused, unknown).
+fires() { printf '%s\n' "$STATUS_NOW" | sed -n 's/^Fires on record: //p'; }
+launched() { printf '%s\n' "$STATUS_NOW" | grep -c "^Fire $1-a[0-9]*-f[0-9]*: launched https://" || true; }
+failed() { printf '%s\n' "$STATUS_NOW" | grep -E "^Fire $1-a[0-9]+-f[0-9]+: (not-launched|launch-outcome-unknown)" || true; }
+fired_for() { printf '%s\n' "$STATUS_NOW" | grep -c "^Fire $1-" || true; }
+last_item() { printf '%s\n' "$QUEUE_NOW" | awk -v k="$1" '$1 == k { line = $0 } END { print line }'; }
+# Fly runs a command without a shell, so anything with shell syntax goes
+# through sh -c.
+recorded() { [ "$(on_host "sh -c 'cat $RECORD/$1 2>/dev/null || true'")" = "${2:-done}" ]; }
 record() { on_host "sh -c 'mkdir -p $RECORD && echo ${2:-done} > $RECORD/$1'" >/dev/null; }
 
 say "Checking where you are"
@@ -85,6 +104,9 @@ CI=$(gh api "repos/$REPO/commits/$(git rev-parse HEAD)/check-runs" \
     --jq '[.check_runs[] | select(.name == "checks") | .conclusion] | first // "missing"')
 [ "$CI" = success ] || stop "CI on main isn't green yet (checks: $CI). Wait for it, then run this again."
 secrets_now
+for name in FACTORY_REVIEW_DISPATCHER FACTORY_REVIEW_MODEL FACTORY_REVIEW_TOKEN; do
+    have "$name" || stop "The Codex review isn't set up yet ($name is missing). Run first: sh deploy/fly/setup-reviewer.sh"
+done
 
 say "1. The factory's own Linear login"
 if have FACTORY_LINEAR_KEY; then
@@ -139,11 +161,12 @@ else
 fi
 
 say "3. The worker routine's instructions"
-PROMPT_SHA=$(awk 'f { print } /^---$/ { f = 1 }' controller/adapter/routine_prompt.md | shasum -a 256 | cut -c1-64)
+prompt() { git show HEAD:controller/adapter/routine_prompt.md | awk 'f { print } /^---$/ { f = 1 }'; }
+PROMPT_SHA=$(prompt | shasum -a 256 | cut -c1-64)
 if recorded routine-prompt "$PROMPT_SHA"; then
     echo "Already the current version."
 else
-    awk 'f { print } /^---$/ { f = 1 }' controller/adapter/routine_prompt.md | pbcopy
+    prompt | pbcopy
     cat <<'EOF'
 The routine's saved instructions predate repairs, so they would turn a repair away.
 The current text is now on your clipboard.
@@ -155,9 +178,15 @@ EOF
     record routine-prompt "$PROMPT_SHA"
 fi
 
-if have FACTORY_MODE; then
+host_home
+if [ "$HOME_NOW" = /data/factory ]; then
     echo
-    echo "The factory is already set to live."
+    echo "The factory is already running live."
+elif have FACTORY_MODE; then
+    # Set (perhaps only staged) by an earlier run that stopped before its
+    # deploy finished: the key checks already passed, so finish the switch.
+    say "5. Switching to live"
+    deploy
 else
     say "4. Checking the new keys, still in practice mode"
     deploy
@@ -181,7 +210,9 @@ fi
 
 say "6. Waiting for the live service"
 i=0
-until [ "$(on_host "cat /run/factory-home")" = /data/factory ]; do
+while :; do
+    host_home
+    [ "$HOME_NOW" != /data/factory ] || break
     i=$((i + 1))
     [ "$i" -le 20 ] || stop "The live service didn't come up. Check: fly logs --app $APP --no-tail"
     sleep 15
@@ -213,14 +244,19 @@ if printf '%s\n' "$STATUS" | grep -Eq '^(Blocks new work|Alert|Hold):'; then
 fi
 
 say "7. The first real ticket: $WORK"
-BEFORE=$(starts)
-if [ "$(last_item "$WORK")" = "" ] && [ "$BEFORE" = 0 ]; then
+TASK=$(printf '%s' "$WORK" | tr 'A-Z' 'a-z')
+look
+if [ "$(last_item "$WORK")" = "" ] && [ "$(fired_for "$TASK")" = 0 ]; then
     echo "In Linear itself (not through Claude), move $WORK, \"Show how many books are on the list\","
     echo "to Todo. The factory looks every minute and waits two minutes after a move."
 fi
 ASKED=""
 LOOKS=0
-while [ "$(starts)" = 0 ]; do
+while :; do
+    look
+    [ "$(launched "$TASK")" = 0 ] || break
+    BAD=$(failed "$TASK")
+    [ -z "$BAD" ] || stop "A worker start for $WORK didn't launch: $BAD. The ticket says what's next. Tell Claude in the thread."
     LOOKS=$((LOOKS + 1))
     if [ "$LOOKS" = 40 ]; then
         echo "Still waiting for a worker to start. The newest comment on $WORK says why."
@@ -240,32 +276,38 @@ while [ "$(starts)" = 0 ]; do
     esac
     sleep "$POLL"
 done
-echo "A worker started for $WORK."
+echo "A worker started for $WORK:"
+printf '%s\n' "$STATUS_NOW" | grep "^Fire $TASK-.*: launched"
 
 say "8. A restart starts nothing twice"
 if recorded restart-checked; then
     echo "Already checked."
 else
-    BEFORE=$(starts)
+    look
+    BEFORE=$(fires)
     fly apps restart "$APP"
     sleep "$RESTART_WAIT"
-    AFTER=$(starts)
+    look
+    AFTER=$(fires)
     [ "$AFTER" = "$BEFORE" ] || stop "Another worker started after the restart ($BEFORE, now $AFTER). Tell Claude now."
     record restart-checked
-    echo "Restarted; still $AFTER worker start(s)."
+    echo "Restarted; still $AFTER fire(s) on record."
 fi
 
 say "9. An edited ticket is stopped before it starts: $EDITED"
 if recorded edit-checked; then
     echo "Already checked."
 else
-    BEFORE=$(starts)
+    EDITED_TASK=$(printf '%s' "$EDITED" | tr 'A-Z' 'a-z')
+    look
+    BEFORE=$(fires)
     LINE=$(last_item "$EDITED")
     if [ -z "$LINE" ]; then
         echo "In Linear itself, move $EDITED, \"Qualification check: edited after the Todo move\", to Todo."
     fi
     TOLD=""
     while :; do
+        look
         LINE=$(last_item "$EDITED")
         case "$LINE" in
             *" open")
@@ -278,7 +320,8 @@ else
             "") ;;
             *) stop "$EDITED ended another way ($LINE). Tell Claude in the thread." ;;
         esac
-        [ "$(starts)" = "$BEFORE" ] || stop "A worker started for $EDITED. Tell Claude now."
+        [ "$(fired_for "$EDITED_TASK")" = 0 ] || stop "The factory fired a worker for $EDITED. Tell Claude now."
+        [ "$(fires)" = "$BEFORE" ] || stop "Another fire happened while checking $EDITED. Tell Claude now."
         sleep "$POLL"
     done
     record edit-checked

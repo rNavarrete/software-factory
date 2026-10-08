@@ -132,12 +132,18 @@ class CliTests(unittest.TestCase):
         code, out = self.run_cli("dispatch", str(self.path))
         self.assertEqual(code, 1, out)
         self.assertIn("Not started (HTTP 429)", out)
+        code, out = self.run_cli("status")
+        self.assertIn(f"Fire {self.a1}-f1: not-launched", out)
+        self.assertNotIn(": launched", out)
 
     def test_dispatch_unknown_exits_1(self):
         self.adapter = ScriptedAdapter([LOST])
         code, out = self.run_cli("dispatch", str(self.path))
         self.assertEqual(code, 1, out)
         self.assertIn("Unclear whether", out)
+        code, out = self.run_cli("status")
+        self.assertIn(f"Fire {self.a1}-f1: launch-outcome-unknown", out)
+        self.assertNotIn(": launched", out)
 
     def test_missing_contract_file_exits_2_without_a_controller(self):
         code, out = self.run_cli("dispatch", str(self.dir / "nope.json"))
@@ -167,6 +173,16 @@ class CliTests(unittest.TestCase):
             self.assertIn(f"{self.task}: running", out)
             self.assertIn(f"  {self.a1}: running.", out)
             self.assertIn(URL1, out)
+
+    def test_status_names_each_fire_and_its_answer(self):
+        code, out = self.run_cli("status")
+        self.assertIn("Usage reading:", out)
+        self.assertIn("Fires on record: 0", out)
+        self.run_cli("dispatch", str(self.path))
+        code, out = self.run_cli("status")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"Fire {self.a1}-f1: launched {URL1}", out)
+        self.assertIn("Fires on record: 1", out)
 
     # --- latest attempt by default ---
 

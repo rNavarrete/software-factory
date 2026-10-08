@@ -69,8 +69,12 @@ if ! have FACTORY_REVIEW_TOKEN; then
 fi
 
 echo "== Deploy (one machine only)"
-fly deploy . --app "$APP" --config deploy/fly/fly.toml \
-    --dockerfile deploy/fly/Dockerfile --ha=false
+# A clean export of the current commit, so untracked files never reach the image.
+BUILD=$(mktemp -d)
+git archive --format=tar HEAD | (cd "$BUILD" && tar -xf -)
+fly deploy "$BUILD" --app "$APP" --config "$BUILD/deploy/fly/fly.toml" \
+    --dockerfile "$BUILD/deploy/fly/Dockerfile" --ha=false
+rm -rf "$BUILD"
 
 echo
 echo "Done. Reviews start on the next worker PR. Nothing has been run or paid for yet."

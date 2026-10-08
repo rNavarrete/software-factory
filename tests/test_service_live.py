@@ -225,6 +225,18 @@ class LiveIntakeOffTests(LiveCase):
         self.assertEqual(self.linear.bodies(), [])
         self.assertEqual(self.gh.paths, [])
 
+    def test_real_workers_start_with_the_codex_review_configured(self):
+        self.install(
+            {
+                env_name("linear-key"): LINEAR_KEY,
+                env_name("github-token"): GH_TOKEN,
+                env_name("routine-token"): "sk-ant-oat01-" + "LiveRoutineKey00" * 3,
+                env_name("review-token"): "github_pat_" + "LiveReviewKey000" * 3,
+            }
+        )
+        args = ("--real-runtime", "--review-dispatcher", "rNavarrete", "--review-model", "gpt-x")
+        self.assertEqual(self.once(*args), 0)
+
     def test_move_is_refused_once_and_nothing_is_drafted_or_fired(self):
         self.rolando_moves()
         self.once()
@@ -397,6 +409,15 @@ class NotStartedTests(LiveCase):
     def test_missing_onboarding_file(self):
         self.onboarding.unlink()
         self.assertNotStarted()
+
+    def test_real_workers_without_the_codex_review(self):
+        self.assertNotStarted("--real-runtime")
+        self.assertNotStarted("--real-runtime", "--review-model", "gpt-x")
+
+    def test_real_workers_without_the_review_token(self):
+        self.assertNotStarted(
+            "--real-runtime", "--review-dispatcher", "rNavarrete", "--review-model", "gpt-x"
+        )
 
     def test_fixture_source_without_a_fixture_folder(self):
         args = ["once", "--source", "fixtures", "--onboarding", str(self.onboarding)]

@@ -17,7 +17,9 @@ From the root of the software-factory checkout on the Mac, on `main`, after this
 sh deploy/fly/go-live.sh
 ```
 
-It refuses to run on another branch, on an out-of-date `main`, with local changes, or while CI on `main` is red. It is safe to run again: each finished step is skipped, and an interrupted run picks up where it stopped. It stops only where Rolando must act:
+It refuses to run on another branch, on an out-of-date `main`, with local changes, or while CI on `main` is red. It also refuses until the Codex review is set up (`sh deploy/fly/setup-reviewer.sh`), and the live service itself won't start real workers without it, so no ticket can be told a review was requested when none can run. It deploys a clean export of the commit, never the folder, so untracked files can't reach the image.
+
+It is safe to run again: each finished step is skipped, and an interrupted run picks up where it stopped. If the switch to live was interrupted after the mode was saved but before it was deployed, the next run finishes that deploy. It knows live mode is running only from the machine itself. It stops only where Rolando must act:
 
 1. **The factory's own Linear user and key.** A Member invited by email, with a personal API key limited to "Read" and "Create comments". With those permissions the factory can't change a ticket's state, labels or text even if its code tried. The script checks with Linear that the key isn't Rolando's before storing it.
 2. **The routine's saved instructions.** The current text (which accepts a repair) is put on the clipboard; he pastes it over the old text in the routine on the factory account. The script records which version was pasted on the machine, so it asks only once per version.
@@ -51,7 +53,7 @@ Things to watch that offline tests can't settle:
 ## Offline rehearsal
 
 - `tests/test_go_live_rehearsal.py`: the shipped settings, the three ticket texts through the real drafting code (the open question is asked, the answered ticket becomes a tested task), and the run's order of events on the offline harness with the pilot's terms: one start, a restart that starts nothing, a failed review, the clearing, one repair, a restart during it, the cap; a bot move and an edit while the lane is busy; the ticket leaving Todo after the start; the empty live ledger.
-- `tests/test_go_live_script.py`: the command against stand-ins for Fly, GitHub, Linear and Keychain: a full first run, a re-run that does nothing twice, secrets never on a command line or in output, Rolando's own Linear key refused, wrong branch, stale `main`, local changes, red CI, a failed check staying in practice mode and then resuming, a connector change counted as his, a second worker after the restart, a worker for the edited ticket, a refused first ticket and an open hold.
+- `tests/test_go_live_script.py`: the command against stand-ins for Fly, GitHub, Linear and Keychain: a full first run, a re-run that does nothing twice, no switch without the Codex review, a refused or unknown launch never counted as a started worker, another ticket's launch never counted for the sample, an interrupted switch finished on the next run, saved markers read through a shell as Fly runs commands, untracked files kept out of the image, secrets never on a command line or in output, Rolando's own Linear key refused, wrong branch, stale `main`, local changes, red CI, a failed check staying in practice mode and then resuming, a connector change counted as his, a second worker after the restart, a worker for the edited ticket, a refused first ticket and an open hold.
 - Earlier offline cases still hold: `python3 -m redteam` (the Linear path) and `python3 -m controller.audit`.
 
 ## Pause and recovery
@@ -59,7 +61,7 @@ Things to watch that offline tests can't settle:
 - **Pause new work:** add the label `factory-pause` to the "Factory status and pause" ticket in Linear's own app; remove it to resume. Or from the terminal: `fly ssh console --app rnavarrete-factory --pty -C "/app/factory hold paused 'pausing from the terminal'"`.
 - **A running worker** can't be stopped from the factory. Stop it on the routine's run page on the factory account.
 - **Back to practice mode:** `fly secrets unset FACTORY_MODE --app rnavarrete-factory`. That restarts the machine on the practice ledger; the live ledger stays on the volume for when it is switched back.
-- **Where things stand:** `fly ssh console --app rnavarrete-factory -C "/app/factory status"` (attempts, holds, the usage reading, worker starts) and `-C "/app/factory queue"` (each ticket the service took in and how it ended). Logs: `fly logs --app rnavarrete-factory --no-tail`.
+- **Where things stand:** `fly ssh console --app rnavarrete-factory -C "/app/factory status"` (attempts, holds, the usage reading, and one line per worker start with its answer: launched with its session link, not launched, unknown, or no answer yet) and `-C "/app/factory queue"` (each ticket the service took in and how it ended). Logs: `fly logs --app rnavarrete-factory --no-tail`.
 - Everything else (an unclear worker start, a lost volume) is in [service.md](service.md).
 
 ## Results
