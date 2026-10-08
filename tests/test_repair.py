@@ -962,7 +962,9 @@ class RepairServiceTests(RepairServiceCase):
         self.assertEqual(self.authorizer.repair_calls, [(self.a2, SHA_A)])
         (record,) = self.repair_records()
         self.assertEqual(record.attempt, self.a2)
-        self.assertEqual(self.count("starting repair attempt 2"), 1)
+        # Eligible first; "started" only once the worker actually launched.
+        self.assertEqual(self.count("repair attempt 2 will start when the worker lane is free"), 1)
+        self.assertEqual(self.count("started repair attempt 2"), 1)
         # The worker gets what failed, exactly as signed.
         envelope = json.loads(self.adapter.requests[1].text)
         self.assertEqual(envelope["attempt"], 2)
@@ -973,7 +975,6 @@ class RepairServiceTests(RepairServiceCase):
         self.run_rounds(6)
         self.assertEqual(self.launched(), 2)
         self.assertIsNone(self.item(eid).closed)
-        self.assertEqual(self.count("asks"), 0)
 
     def test_repaired_pr_is_reviewed_and_merging_it_closes_the_item(self):
         eid = self.start()

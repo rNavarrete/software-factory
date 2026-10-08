@@ -683,11 +683,12 @@ class Service:
                 f"{item.event_id}:repairing:{nxt}",
                 item.issue_id,
                 m.progress(
-                    Stage.REPAIRING,
-                    f"{what} The factory is starting repair attempt {decision.attempt} to fix"
-                    f" it, under the repair allowance of your Todo move"
-                    f" ({_repairs_left(decision)}). The task, its acceptance criteria and its"
-                    " checks stay exactly as approved; the new PR gets a fresh review.",
+                    Stage.WAITING,
+                    f"{what} This is a routine fix within the repair allowance of your Todo"
+                    f" move ({_repairs_left(decision)}), so repair attempt {decision.attempt}"
+                    " will start when the worker lane is free. The task, its acceptance"
+                    " criteria and its checks stay exactly as approved; the new PR gets a"
+                    " fresh review.",
                     pr_url=self._pr_url(item, report.pr),
                 ),
                 now,
@@ -1128,6 +1129,12 @@ def _waiting_to_refire(status, attempt_state) -> bool:
 
 
 def _fired_text(result) -> tuple[Stage, str]:
+    if result.outcome == "launched" and result.run.attempt.number > 1:
+        return Stage.REPAIRING, (
+            f"The factory started repair attempt {result.run.attempt.number} ({result.run})."
+            " Its new draft PR gets a fresh independent review; the factory will post here"
+            " when it opens."
+        )
     if result.outcome == "launched":
         return Stage.WORKING, (
             f"The factory started the worker ({result.run}). Its draft PR will appear on the"

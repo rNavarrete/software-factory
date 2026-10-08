@@ -42,8 +42,17 @@ project's onboarding entry. It is its own kind, never a ``human-decision``,
 so it can't pass for a typed approval. It counts only where ``Approvals`` is
 built with ``source_routine`` (the service's dispatcher) and only for that
 routine, lasts at most ``MAX_SOURCE_TTL``, and is withdrawn by a rejection or
-revocation like any approval. Repairs, re-fires and clearings still need
-Rolando's typed records.
+revocation like any approval. Re-fires and clearings still need Rolando's
+typed records.
+
+A repair can also count without his typed go-ahead (ENG-160): a
+``source-repair-authorized`` record the signer makes under the allowance the
+move's own ``source-authorization`` was signed with. It counts only with
+``now`` (never on the terminal), for the service's routine, for exactly
+attempt n on the contract attempt n-1 ran, within that allowance, on the
+commit that is still the head of attempt n-1's open PR, with its findings
+intact, while it is in force, and until the contract is rejected or revoked
+(docs/repair.md).
 
 Approving a contract authorizes dispatch only. It never approves the PR, a
 merge or a release (ADR 0001 section 5 items 2 and 3); the release gate is the

@@ -14,7 +14,7 @@ Every entry the factory posts opens with a bold stage:
 | Waiting | It can't start yet; the entry says what it is waiting for (approval, a cap, a hold, a provider) |
 | Working | The worker started |
 | Reviewing | The worker's PR is up and the independent review started |
-| Repairing | An automatic repair started, with its reason and how many repairs are left |
+| Repairing | An automatic repair actually started (posted only after the worker launched). Before that, a Waiting entry says the fix is eligible and how many repairs are left |
 | Needs your decision | A product question, an observation request, or a suggested repair |
 | Ready for your review | What changed, what was checked, the limitations and the exact reviewed commit |
 | Failed / Stopped | The work ended, and why |
