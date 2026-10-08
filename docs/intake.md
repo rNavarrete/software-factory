@@ -17,7 +17,7 @@ The exact ticket text is pinned as a `revision`: the sha256 of the title, descri
 
 Anything else is refused once, with the reason. The reason is posted on the ticket once ENG-178's Linear reporter is in place; until then it goes to the service log. That covers a move by another person, a bot or an automation, an import, and an edit after the move. A ticket created straight into Todo, or imported there, is also refused once, and the comment says to move it to Backlog and back.
 
-Before reading anything, intake checks whose key it is using. If the factory's Linear key acts as Rolando, intake reads nothing and logs why every round, because the factory's own changes would then be recorded as his. The factory therefore needs its own Linear identity (an app, or a separate member) before intake is switched on.
+Before reading anything, intake checks whose key it is using, and checks again whenever the key changes (for example after the secret is replaced). If the factory's Linear key acts as Rolando, intake reads nothing and logs why every round, because the factory's own changes would then be recorded as his. The factory therefore needs its own Linear identity (an app, or a separate member) before intake is switched on.
 
 ## Why polling and not webhooks
 

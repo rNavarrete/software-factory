@@ -134,6 +134,8 @@ class TodoMoveAuthorizer:
             ticket = self.fetch(issue_id)
         except OSError as e:
             raise Refused(f"Linear could not be read ({e})", final=False) from None
+        except IntakeBlocked as e:
+            raise Refused(str(e), final=False) from None
         if viewer == policy.approver_id:
             raise Refused(
                 "the signer's Linear key acts as Rolando, so its own changes would look like"
