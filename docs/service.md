@@ -62,7 +62,7 @@ Every 60 seconds (`controller/service/service.py`):
 3. Intake. Read Linear from the saved cursor, apply pause and resume, then accept or refuse each verified Todo move. The results and the new cursor are saved in one write, so a crash re-reads the batch instead of losing it. A move that was already seen is ignored.
 4. Work, oldest ticket first. For a running attempt, check GitHub, start the review once its PR appears, and close the ticket when it is merged or finished. Otherwise, draft the contract, check it against the onboarding entry, and dispatch it through `Dispatcher.dispatch`, which applies the approval check, the attempt gate (one worker at a time, caps, holds, rate-limit waits) and recovery. At most one fire happens per round.
 5. Post the queued Linear messages. A failed post is retried later with growing waits. Retrying a message never repeats a launch.
-6. Write the heartbeat, and back up the ledger if anything was written.
+6. Write the heartbeat, and back up the ledger if it changed since the last backup that worked. A failed backup is tried again every round until it works.
 
 Each step stands alone. If Linear or GitHub is down, only that step waits for the next round.
 
@@ -113,7 +113,7 @@ The service posts this on the ticket: "It is unclear whether worker … started"
 | `AuthorizationSource.poll(cursor)` / `.standing(authorization)` | ENG-174 (`controller/intake`, docs/intake.md) | Returns only Todo moves it has proved were made by Rolando on an exact ticket revision. Each has a stable `event_id`, so a replay is ignored. Also returns the moves it refused, and pause/resume controls. `standing` is checked again before every dispatch try and every five minutes while the worker runs. |
 | `ContractPreparer.prepare(authorization, project)` | ENG-175 | Returns a contract, or a product question. A question closes the item, and moving the ticket to Todo again starts a new one. |
 | `Reporter.post(issue_id, key, text)` | ENG-178 | Posts on Linear. Must be idempotent per `key`, because the service retries when it can't tell a failure from a lost answer. |
-| `ReviewStarter.start(pr)` | ENG-156 | Called once per attempt, when its PR first appears. Runs under the reviewer's own identity. |
+| `ReviewStarter.start(pr, key)` | ENG-156 | Called when an attempt's PR first appears. The request and its key are saved in the ledger before the call, and after a crash the same key is sent again, so the reviewer must treat a repeated key as the review it already started. Runs under the reviewer's own identity. |
 | `RepairAdvisor.advise(attempt, detail)` | ENG-160 | Suggests a repair. The service only posts the suggestion; a repair still needs its signed go-ahead. |
 
 The worker itself sits behind the existing runtime boundary: `RuntimeAdapter` in `controller/interfaces.py`, which the service reaches only through the `adapter` factory `Dispatcher` takes. A worker pool (ENG-154) plugs in there. The first deployment keeps one worker at a time.

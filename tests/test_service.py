@@ -253,6 +253,52 @@ class ServiceTests(ServiceCase):
         self.assertEqual(self.view().items["evt-1"].closed, "merged")
         self.assertEqual(len(self.adapter.requests), 1)
 
+    def test_crash_after_starting_review_does_not_start_another(self):
+        self.rolando_approves()
+        self.tick()
+        a1 = AttemptId(self.task(), 1)
+        self.github.branches[a1.branch] = SHA_A
+        self.github.pulls = [self.pr()]
+        real_append = self.service._append
+
+        def die_on_started(*events):
+            if any(e.kind == q.REVIEW_STARTED for e in events):
+                raise SystemExit("killed after the reviewer was called")
+            real_append(*events)
+
+        with mock.patch.object(self.service, "_append", side_effect=die_on_started):
+            with self.assertRaises(SystemExit):
+                self.tick(minutes=6)
+        self.assertEqual(len(self.reviewer.started), 1)
+        self.build()  # a restarted process
+        self.tick(minutes=6)
+        self.tick(minutes=6)
+        self.assertEqual(len(self.reviewer.started), 1)
+        self.assertEqual(len(set(self.reviewer.calls)), 1)
+        self.assertIn(str(a1), self.view().reviews)
+
+    def test_failed_backup_is_retried_on_quiet_rounds(self):
+        self.rolando_approves()
+        fails = [True]
+
+        def backup(now):
+            if fails[0]:
+                raise OSError("disk full")
+            self.backups.append(now)
+
+        self.service._backup = backup
+        r = self.tick()
+        self.assertTrue(any("backup" in e for e in r.errors))
+        self.assertEqual(self.backups, [])
+        r = self.tick(minutes=1)  # nothing new written, still missing a backup
+        self.assertTrue(any("backup" in e for e in r.errors))
+        fails[0] = False
+        self.tick(minutes=1)
+        self.assertEqual(len(self.backups), 1)
+        self.tick(minutes=1)
+        self.tick(minutes=1)
+        self.assertEqual(len(self.backups), 1)  # nothing new since
+
     # --- authorization and onboarding ---
 
     def test_unapproved_contract_waits_and_says_so_once(self):

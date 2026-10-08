@@ -235,11 +235,15 @@ class PullRequestRef:
 
 @runtime_checkable
 class ReviewStarter(Protocol):
-    """ENG-156. Called once per attempt, when its PR is first seen."""
+    """ENG-156. Called when an attempt's PR is first seen, with a request key
+    the service recorded beforehand."""
 
-    def start(self, pr: PullRequestRef) -> str:
+    def start(self, pr: PullRequestRef, key: str) -> str:
         """Start the review with the reviewer's own identity; return a short
-        note for the record. Raise to have the service try again next round."""
+        note for the record. Must be idempotent per ``key``: after a crash or a
+        failed save the service calls again with the same key, and that call
+        must return the review already started instead of starting another.
+        Raise to have the service try again next round."""
         ...
 
 

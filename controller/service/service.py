@@ -166,6 +166,9 @@ class Service:
         self._last_beat = heartbeat.read() if heartbeat is not None else None
         self._last_reconcile: dict[AttemptId, datetime] = {}
         self._last_try: dict[str, datetime] = {}
+        self._backed_up: int | None = None
+        """The ledger's last seq at the last successful backup; None until the
+        first one, so a fresh start always backs up once."""
         self._config: Onboarding | None = None
 
     # --- the round ---------------------------------------------------------------
@@ -181,12 +184,20 @@ class Service:
             self._step(r, "intake", lambda: self._intake(r, now))
         self._step(r, "work", lambda: self._work(r))
         self._step(r, "outbox", lambda: self._flush(r))
-        r.wrote = self._last_seq() != before
-        if r.wrote and self._backup is not None:
-            self._step(r, "backup", lambda: self._backup(self._now()))
+        seq = self._last_seq()
+        r.wrote = seq != before
+        if self._backup is not None and seq != self._backed_up:
+            # Retried every round until it succeeds, whether or not this round
+            # wrote anything: what matters is what the last backup is missing.
+            self._step(r, "backup", lambda: self._back_up(seq))
         if self._heartbeat is not None and self._started:
             self._step(r, "heartbeat", lambda: self._heartbeat.write(self._now()))
         return r
+
+    def _back_up(self, seq: int) -> None:
+        assert self._backup is not None
+        self._backup(self._now())
+        self._backed_up = seq
 
     def _step(self, r: TickReport, name: str, fn: Callable[[], object]) -> None:
         try:
@@ -627,16 +638,25 @@ class Service:
                 " (see the recovery steps in docs/service.md).",
                 now,
             )
-        if status.pull_requests and str(attempt) not in self._view().reviews:
-            number = status.pull_requests[-1]
-            note = self._x.reviewer.start(PullRequestRef(attempt, number))
+        view = self._view()
+        if status.pull_requests and str(attempt) not in view.reviews:
+            request = view.review_requests.get(str(attempt))
+            if request is None:
+                # Record the request before making it. If the call or the save
+                # after it fails, the next round repeats this same request key,
+                # which the reviewer treats as the review already asked for.
+                number = status.pull_requests[-1]
+                request = (number, f"review:{attempt}:pr{number}")
+                self._append(q.review_requested(attempt, number, request[1], now))
+            number, key = request
+            note = self._x.reviewer.start(PullRequestRef(attempt, number), key)
             self._append(
                 LedgerEvent(
                     q.REVIEW_STARTED,
                     now,
                     attempt.task,
                     attempt,
-                    data={"pr": number, "note": note},
+                    data={"pr": number, "key": key, "note": note},
                 ),
                 q.message(
                     f"review:{attempt}",
