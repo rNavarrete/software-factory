@@ -51,6 +51,7 @@ from controller.adapter import routine
 from controller.approval import ApprovalRefused, Approvals
 from controller.attempts import AttemptGate
 from controller.attempts import DispatchRefused as GateRefused
+from controller.attempts.events import DISPATCH_REFUSED
 from controller.attempts.policy import LedgerView, Notice
 from controller.dispatch.base import BaseCheck, BaseUnreadable
 from controller.interfaces import (
@@ -103,8 +104,10 @@ _GOING = frozenset(
 class Refused(Exception):
     """Nothing was sent. ``blocks`` says why, one notice per reason."""
 
-    def __init__(self, blocks: Sequence[Notice]) -> None:
+    def __init__(self, blocks: Sequence[Notice], *, recorded: bool = False) -> None:
         self.blocks = tuple(blocks)
+        self.recorded = recorded
+        """The refusal is already in the ledger (the gate wrote it)."""
         super().__init__("; ".join(f"{b.code}: {b.detail}" for b in self.blocks))
 
 
@@ -228,10 +231,11 @@ class Launcher:
                 with_intent=context,
             )
         except GateRefused as e:
-            raise Refused(e.decision.blocks) from None
+            raise Refused(e.decision.blocks, recorded=True) from None
         except LedgerLocked:
             raise Refused(
-                [Notice("ledger-busy", "Another controller command is writing; try again.")]
+                [Notice("ledger-busy", "Another controller command is writing; try again.")],
+                recorded=True,  # nothing can be written while another command holds the lock
             ) from None
         assert reserved == run
 
@@ -368,7 +372,34 @@ class Dispatcher:
         )
 
     def dispatch(self, contract: Mapping[str, object]) -> DispatchResult:
-        """Fire the next attempt of ``contract``'s task, or report the one on record."""
+        """Fire the next attempt of ``contract``'s task, or report the one on record.
+
+        Every refusal is in the ledger (governance map G-A1): the gate records
+        its own, and one raised before the gate (no or declined approval, a
+        wrong target, a hold seen in the preview) is recorded here."""
+        try:
+            return self._dispatch(contract)
+        except Refused as e:
+            if not e.recorded:
+                self._record_refusal(contract, e)
+            raise
+
+    def _record_refusal(self, contract: Mapping[str, object], e: Refused) -> None:
+        task_id = contract.get("task_id") if isinstance(contract, Mapping) else None
+        task = TaskId(task_id) if isinstance(task_id, str) and task_id else None
+        event = LedgerEvent(
+            DISPATCH_REFUSED,
+            self._now(),
+            task,
+            data={"blocks": [b.as_data() for b in e.blocks], "alerts": [], "before_gate": True},
+        )
+        try:
+            with self._store.writer_lock():
+                self._store.append(event)
+        except Exception as err:  # the refusal itself must still reach Rolando
+            e.blocks += (Notice("not-recorded", f"this refusal could not be recorded: {err}"),)
+
+    def _dispatch(self, contract: Mapping[str, object]) -> DispatchResult:
         now = self._now()
         self._recovery.recover(now)
         errors = contracts.approval_errors(contract)

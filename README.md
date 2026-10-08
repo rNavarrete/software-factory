@@ -37,6 +37,7 @@ Each directory belongs to one ticket so parallel work never edits the same files
 | `controller/loop/` | ENG-145 | `python3 -m controller.loop run <contract.json>`: one task from contract to a PR ready for Rolando's review |
 | `tasks/samples/` | ENG-145 | The sample task contracts for the first full runs |
 | `redteam/` | ENG-158 | Red-team checks |
+| `controller/audit/`, `docs/control-audit*.md` | ENG-163 | The full control check: `python3 -m controller.audit` checks every governance-map control against its evidence |
 | `docs/adr/0001-operating-model.md` | ENG-134 | Operating model and human authority |
 | `docs/adr/0002-runtime-controller-identity.md` | ENG-136 (ENG-183 owns section 11) | Runtime and controller |
 | `docs/adr/0003-pilot-and-value-thresholds.md` | ENG-137 | Pilot and value thresholds |
