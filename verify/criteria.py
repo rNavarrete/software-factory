@@ -637,12 +637,18 @@ def _observed(cid, ev, observations):
         named = ev["reviewer"].lower()
         others = [o for o in mine if o.observer.lower() != named]
         mine = [o for o in mine if o.observer.lower() == named]
-        if others and not mine:
+        if not mine:
+            # Observations by anyone off the reviewer list were already dropped
+            # (see "Evidence not used"), so this names only listed reviewers.
             names = ", ".join(sorted({o.observer for o in others}))
+            seen_by = f"; observed only by {names}" if names else ""
             return (
                 Verdict.UNKNOWN,
                 (),
-                (f"the contract names {ev['reviewer']} as reviewer; observed only by {names}",),
+                (
+                    f"the contract names {ev['reviewer']} as reviewer and they have not "
+                    f"checked it on this revision{seen_by}",
+                ),
             )
     if not mine:
         return Verdict.UNKNOWN, (), ("nobody independent has checked it on this revision",)
