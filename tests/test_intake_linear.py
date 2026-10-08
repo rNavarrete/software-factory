@@ -10,6 +10,7 @@ import copy
 import http.client
 import json
 import random
+import types
 import unittest
 import urllib.error
 from datetime import UTC, datetime, timedelta
@@ -747,6 +748,76 @@ class IdentityTests(LinearCase):
         with self.assertRaises(LinearUnavailable):
             self.source.poll(None)
         self.assertEqual(self.world.names(), ["viewer"])
+
+
+class KeySwapTests(unittest.TestCase):
+    """The key is read for every request, so a key replaced while the
+    service runs must be checked before it is used."""
+
+    FACTORY_KEY = "lin_api_" + "F" * 40
+    ROLANDO_KEY = "lin_api_" + "R" * 40
+
+    def setUp(self):
+        self.key = self.FACTORY_KEY
+        self.sent = []  # (key, query name)
+        owners = {self.FACTORY_KEY: FACTORY_USER, self.ROLANDO_KEY: APPROVER}
+
+        def opener(req, timeout):
+            key = req.get_header("Authorization")
+            query = json.loads(req.data)["query"]
+            self.sent.append((key, "viewer" if query == VIEWER_QUERY else "other"))
+            if query == VIEWER_QUERY:
+                return _Resp(json.dumps({"data": {"viewer": {"id": owners[key]}}}).encode())
+            return _Resp(json.dumps({"data": {"issue": None}}).encode())
+
+        self.opener = opener
+        self.policy = types.SimpleNamespace(approver_id=APPROVER)
+
+    @property
+    def source(self):
+        """Wired as main.py wires the service's intake."""
+        if not hasattr(self, "_source"):
+            self.transport = HttpTransport(
+                lambda: self.key, opener=self.opener, forbidden_user=lambda: APPROVER
+            )
+            self._source = LinearSource(self.transport, lambda: self.policy)
+        return self._source
+
+    def test_a_key_swapped_for_rolandos_is_refused_before_use(self):
+        self.source.check_identity()
+        self.source.fetch("iss-eng-187")
+        self.key = self.ROLANDO_KEY
+        with self.assertRaises(IntakeBlocked):
+            self.source.check_identity()
+        with self.assertRaises(IntakeBlocked):
+            self.source.fetch("iss-eng-187")
+        self.assertNotIn((self.ROLANDO_KEY, "other"), self.sent)
+
+    def test_source_rechecks_when_the_key_changes(self):
+        # The source's own check, over a transport given no forbidden user.
+        t = HttpTransport(lambda: self.key, opener=self.opener)
+        source = LinearSource(t, lambda: self.policy)
+        source.check_identity()
+        self.key = self.ROLANDO_KEY
+        with self.assertRaises(IntakeBlocked):
+            source.check_identity()
+
+    def test_each_key_value_is_checked_once(self):
+        for _ in range(3):
+            self.source.fetch("iss-eng-187")
+        self.key = self.ROLANDO_KEY
+        for _ in range(2):
+            with self.assertRaises(IntakeBlocked):
+                self.source.fetch("iss-eng-187")
+        self.key = self.FACTORY_KEY
+        self.source.fetch("iss-eng-187")
+        viewers = [k for k, name in self.sent if name == "viewer"]
+        self.assertEqual(viewers, [self.FACTORY_KEY, self.ROLANDO_KEY])
+
+    def test_without_a_forbidden_user_nothing_extra_is_sent(self):
+        t = HttpTransport(lambda: self.key, opener=self.opener)
+        t(ISSUE_QUERY, {"id": "x"})
+        self.assertEqual(self.sent, [(self.FACTORY_KEY, "other")])
 
 
 class StandingTests(LinearCase):

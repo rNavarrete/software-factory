@@ -499,6 +499,11 @@ def parse_ticket(raw: Mapping[str, object], history: Iterable[Mapping[str, objec
 
 # --- The transport -----------------------------------------------------------------
 
+_ACTS_AS_APPROVER = (
+    "the factory's Linear key acts as Rolando, so its own changes would look like"
+    " his. Intake reads nothing until the factory has its own Linear identity."
+)
+
 Transport = Callable[[str, Mapping[str, object]], Mapping[str, object]]
 """``(query, variables) -> data``. Raises LinearUnavailable."""
 
@@ -510,14 +515,52 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class HttpTransport:
     """POSTs to Linear's GraphQL API with the factory's own Linear key.
-    Only api.linear.app, no redirects, and the key never appears in errors."""
+    Only api.linear.app, no redirects, and the key never appears in errors.
 
-    def __init__(self, key: Callable[[], str], opener: Callable[..., object] | None = None):
+    The key is read again for every request, so it can be replaced while the
+    service runs. With ``forbidden_user`` set, each new key value is checked
+    before its first use: if it acts as that user (Rolando), nothing is sent
+    with it and IntakeBlocked is raised.
+    """
+
+    def __init__(
+        self,
+        key: Callable[[], str],
+        opener: Callable[..., object] | None = None,
+        *,
+        forbidden_user: Callable[[], str | None] | None = None,
+    ):
         self._key = key
         self._open = opener or urllib.request.build_opener(_NoRedirect()).open
+        self._forbidden = forbidden_user
+        self._viewers: dict[str, str] = {}
+        """sha256 of a key -> the user it acts as, once checked."""
+
+    def checked_viewer(self) -> str:
+        """The Linear user the current key acts as, checked."""
+        return self._viewer(self._key())
 
     def __call__(self, query: str, variables: Mapping[str, object]) -> Mapping[str, object]:
         key = self._key()
+        if self._forbidden is not None:
+            self._viewer(key)  # with this same key value, before it is used
+        return self._post(key, query, variables)
+
+    def _viewer(self, key: str) -> str:
+        fp = hashlib.sha256(key.encode()).hexdigest()
+        vid = self._viewers.get(fp)
+        if vid is None:
+            viewer = self._post(key, VIEWER_QUERY, {}).get("viewer")
+            if not isinstance(viewer, Mapping) or not viewer.get("id"):
+                raise LinearUnavailable("Linear did not say whose key this is")
+            vid = str(viewer["id"])
+            self._viewers[fp] = vid
+        forbidden = self._forbidden() if self._forbidden is not None else None
+        if forbidden is not None and vid == forbidden:
+            raise IntakeBlocked(_ACTS_AS_APPROVER)
+        return vid
+
+    def _post(self, key: str, query: str, variables: Mapping[str, object]) -> Mapping[str, object]:
         auth = key if key.startswith("lin_api_") else f"Bearer {key}"
         req = urllib.request.Request(
             API,
@@ -552,33 +595,36 @@ class LinearSource:
     """``AuthorizationSource`` for the service (see seams.py).
 
     ``policy`` is read every poll (it comes from the onboarding file).
-    Before reading anything, it checks once that the factory's own Linear key
+    Before reading anything, it checks that the factory's own Linear key
     does not act as Rolando: if it did, the factory's own changes would be
-    recorded as his, and a move it made could pass for his.
+    recorded as his, and a move it made could pass for his. The check is
+    made for every key value the transport uses (``checked_viewer``), so a
+    key replaced while the service runs is checked too.
     """
 
     transport: Transport
     policy: Callable[[], IntakePolicy]
     now: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
-    _viewer_ok: bool = field(default=False, init=False)
+    _viewer: str | None = field(default=None, init=False)
+    """For a transport without ``checked_viewer`` (a fixed key): asked once."""
 
     def viewer_id(self) -> str:
         """Whose key this is, as Linear says."""
+        checked = getattr(self.transport, "checked_viewer", None)
+        if checked is not None:
+            return checked()
+        if self._viewer is not None:
+            return self._viewer
         data = self.transport(VIEWER_QUERY, {})
         viewer = data.get("viewer")
         if not isinstance(viewer, Mapping) or not viewer.get("id"):
             raise LinearUnavailable("Linear did not say whose key this is")
-        return str(viewer["id"])
+        self._viewer = str(viewer["id"])
+        return self._viewer
 
     def check_identity(self) -> None:
-        if self._viewer_ok:
-            return
         if self.viewer_id() == self.policy().approver_id:
-            raise IntakeBlocked(
-                "the factory's Linear key acts as Rolando, so its own changes would look like"
-                " his. Intake reads nothing until the factory has its own Linear identity."
-            )
-        self._viewer_ok = True
+            raise IntakeBlocked(_ACTS_AS_APPROVER)
 
     def _history(self, issue: Mapping[str, object]) -> list[Mapping[str, object]]:
         conn = issue.get("history") or {}

@@ -216,7 +216,10 @@ def build(args: argparse.Namespace):
                 onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
             )
 
-        source = LinearSource(HttpTransport(lambda: secrets.get("linear-key")), policy)
+        transport = HttpTransport(
+            lambda: secrets.get("linear-key"), forbidden_user=lambda: policy().approver_id
+        )
+        source = LinearSource(transport, policy)
     else:
         source = fixtures.FixtureSource(fixtures.load_events(fixture_dir / "events.json"))
     config_path = Path(args.onboarding) if args.onboarding else root / "onboarding.json"
@@ -326,7 +329,10 @@ def _todo_move_handler(args: argparse.Namespace, key, linear_key: str):
     def load():
         return onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
 
-    reader = LinearSource(HttpTransport(lambda: linear_key), lambda: None)  # type: ignore[arg-type,return-value]
+    transport = HttpTransport(
+        lambda: linear_key, forbidden_user=lambda: load().approver_linear_user_id
+    )
+    reader = LinearSource(transport, lambda: None)  # type: ignore[arg-type,return-value]
     authorizer = TodoMoveAuthorizer(
         key, load, reader.fetch, reader.viewer_id, OneContractPerMove(Path(args.state))
     )
