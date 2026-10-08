@@ -4,7 +4,7 @@ FROM python:3.13-slim
 
 # HOME holds the ledger (~/.software-factory). The qualification run gets its
 # own folder so its fake worker never counts against the real fire limits;
-# the real service will use /data/factory.
+# with FACTORY_MODE=live the start script uses /data/factory instead.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONNOUSERSITE=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -20,6 +20,7 @@ RUN useradd --system --no-create-home --shell /usr/sbin/nologin factory \
 
 WORKDIR /app
 COPY controller /app/controller
+COPY verify /app/verify
 COPY deploy/qualification /app/deploy/qualification
 COPY deploy/pilot /app/deploy/pilot
 COPY deploy/fly/entrypoint.sh /app/entrypoint.sh

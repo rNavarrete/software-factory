@@ -515,6 +515,33 @@ class CredentialSwapTests(unittest.TestCase):
             transport("mutation { commentCreate }", {})
 
 
+class ForbiddenChangesTests(unittest.TestCase):
+    """Rolando's report on #32: the approver could change while a key's check stayed cached."""
+
+    def test_a_newly_forbidden_user_stops_a_key_already_checked(self) -> None:
+        forbidden = {ROLANDO}
+        sent: list[str] = []
+
+        def opener(req, timeout=None):  # type: ignore[no-untyped-def]
+            from tests.linear_world import Resp
+
+            query = json.loads(req.data)["query"]
+            sent.append(query)
+            if "viewer" in query:
+                return Resp(json.dumps({"data": {"viewer": {"id": FACTORY}}}).encode())
+            return Resp(json.dumps({"data": {"ok": True}}).encode())
+
+        transport = HttpTransport(
+            lambda: "lin_api_" + "f" * 30, opener, forbidden_user=lambda: forbidden
+        )
+        transport("query { ok }", {})
+        forbidden.add(FACTORY)
+        sent.clear()
+        with self.assertRaises(LinearDown):
+            transport("mutation { commentCreate }", {})
+        self.assertEqual(sent, [])  # the cached identity is reused, but nothing is sent
+
+
 class ProbeTests(unittest.TestCase):
     """Rolando's report: the probe passed even when the marker was gone."""
 
