@@ -248,6 +248,44 @@ class Preparer:
         return Prepared(contract, summarize(reading, draft, base, project, policy))
 
 
+_CONTEXT_HOSTS = ("notion.so", "notion.site", "notion.com", "figma.com", "uploads.linear.app")
+_LINK_RE = re.compile(r"(?:https?://|//|(?<![\w@./:-])(?:[\w-]+\.)+)[^\s<>\[\]()\"'`]+", re.I)
+"""URLs and bare domains, without starting inside an email address or another path."""
+_IMAGE_LINK_RE = re.compile(
+    r"(?:https?://|//|(?<![\w@./:-])(?:[\w-]+\.)+)[^\s<>]*"
+    r"\.(?:png|jpe?g|gif|webp|svg)(?:[?#\s)>]|$)",
+    re.I,
+)
+"""Also catch valid image paths containing parentheses, e.g. design(v2).png."""
+
+
+def _github_delivery_attachment(url: str) -> bool:
+    """Only GitHub PR/commit attachments are delivery records, not design sources.
+
+    Keep unknown GitHub links (including blobs and uploaded assets) under the hold.
+    This classification neither reads the URL nor changes its authority.
+    """
+    try:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in {"github.com", "www.github.com"}
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return False
+        return bool(
+            re.fullmatch(
+                r"/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/"
+                r"(?:pull/[1-9][0-9]*|commit/[0-9a-fA-F]{7,40})/?",
+                parsed.path,
+            )
+        )
+    except ValueError:
+        return False
+
+
 def needs_captured_context(snap: Snapshot) -> bool:
     """Conservative guard until source assessment and hosted delivery are qualified.
 
@@ -256,23 +294,26 @@ def needs_captured_context(snap: Snapshot) -> bool:
     """
     text = f"{snap.title}\n{snap.description}"
     linked_context = False
-    for url in re.findall(r"https?://[^\s<>\[\]()]+", text, re.I):
+    for url in _LINK_RE.findall(text):
         try:
-            host = (urlsplit(url).hostname or "").lower().rstrip(".")
+            if "://" not in url:
+                url = "https:" + url if url.startswith("//") else "https://" + url
+            parsed = urlsplit(url)
+            host = (parsed.hostname or "").lower().rstrip(".")
         except ValueError:
             linked_context = True  # malformed reference cannot establish complete context
             break
-        if any(
-            host == d or host.endswith("." + d) for d in ("notion.so", "notion.site", "figma.com")
+        if any(host == d or host.endswith("." + d) for d in _CONTEXT_HOSTS) or re.search(
+            r"\.(?:png|jpe?g|gif|webp|svg)$", parsed.path, re.I
         ):
             linked_context = True
             break
     return bool(
-        snap.attachments
+        any(not _github_delivery_attachment(url) for url in snap.attachments)
         or not snap.attachments_complete
         or linked_context
         or re.search(r"!\[|<img\b", text, re.I)
-        or re.search(r"https?://[^\s<>]+\.(?:png|jpe?g|gif|webp|svg)(?:[?#\s)>]|$)", text, re.I)
+        or _IMAGE_LINK_RE.search(text)
     )
 
 

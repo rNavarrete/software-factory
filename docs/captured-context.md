@@ -2,7 +2,7 @@
 
 The preparer must not start a ticket while silently ignoring its linked requirements
 or designs. `Preparer.prepare` now returns a factory limitation notice when it sees
-a Notion or Figma link, an embedded design, a direct image link or a ticket attachment. Text-only
+a Notion or Figma link, an embedded design, a direct image link or a source attachment. Text-only
 tickets keep their existing behavior. No product answer or user-supplied test example
 is requested to work around this limitation.
 
@@ -11,6 +11,18 @@ Attachments are observed separately from intake's ticket-text revision; adding f
 to that revision here would break the existing authorization formula. An incomplete
 attachment listing also holds. The source guard cannot detect every possible prose
 reference or custom document URL.
+
+GitHub PR and commit attachments are delivery records and do not trigger this hold,
+so automatic GitHub attachments do not prevent retries or revised tickets from being
+drafted. This exception is restricted to GitHub PR/commit URL paths: blobs, issues,
+uploaded assets and unknown attachments still hold. An incomplete attachment listing
+still holds even when all visible attachments are PRs.
+
+The guard recognizes `notion.so`, `notion.site`, `notion.com` (including
+`app.notion.com`), Figma, and Linear's `uploads.linear.app` file links. Linear uploads
+hold regardless of extension, including PDFs and opaque file IDs. Known source links
+and image URLs are recognized with or without an `https://` prefix. Hostname matching
+does not confuse `notion.so.example.com` with Notion.
 
 ## What the capture code does
 
@@ -81,3 +93,5 @@ assessment. Use the existing ENG-163 qualification path with fresh synthetic inp
 real launch, new credential or deployment was performed here. ENG-199 remains In Progress.
 
 Reference: [Notion markdown API](https://developers.notion.com/reference/retrieve-page-markdown).
+URL forms: [Notion page domains](https://www.notion.com/en-gb/help/manage-your-notion-sites),
+[Linear file storage](https://linear.app/developers/file-storage-authentication).

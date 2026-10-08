@@ -378,3 +378,94 @@ class ContextReferenceGuardTests(unittest.TestCase):
         raw["attachments"] = {"nodes": [], "pageInfo": {"hasNextPage": False}}
         snap = LinearTicketReader(lambda q, v: {"issue": raw}).fetch(raw["id"])
         self.assertIsInstance(prep(snap).prepare(authorize(snap), project().as_mapping()), Prepared)
+
+
+class ReferenceClassificationTests(unittest.TestCase):
+    def prepare(self, *, attachments=(), context="", complete=True):
+        from dataclasses import replace
+
+        snap = replace(
+            ticket("## Acceptance criteria\n- [ ] The page shows books.\n\n## Context\n" + context),
+            attachments=attachments,
+            attachments_complete=complete,
+        )
+        return prep(snap).prepare(authorize(snap), project().as_mapping())
+
+    def test_github_pr_and_commit_attachments_do_not_block_redrafting(self):
+        for url in (
+            "https://github.com/rNavarrete/software-factory/pull/28",
+            "https://github.com/rNavarrete/software-factory/pull/28#issuecomment-1",
+            "https://github.com/rNavarrete/software-factory/commit/" + "a" * 40,
+        ):
+            with self.subTest(url=url):
+                out = self.prepare(attachments=(url,))
+                self.assertIsInstance(out, Prepared)
+                revised = self.prepare(
+                    attachments=(url,), context="Keep existing keyboard behavior."
+                )
+                self.assertIsInstance(revised, Prepared)
+
+    def test_parenthesized_image_paths_still_hold(self):
+        for url in (
+            "https://assets.example.test/design(v2).png",
+            "assets.example.test/design(v2).png",
+        ):
+            for reference in (url, f"<{url}>", f"[Design](<{url}>)"):
+                with self.subTest(reference=reference):
+                    self.assertIsInstance(self.prepare(context=reference), Question)
+
+    def test_github_delivery_links_do_not_hide_other_or_unobserved_attachments(self):
+        pr = "https://github.com/rNavarrete/software-factory/pull/28"
+        for url in (
+            "https://uploads.linear.app/workspace/asset/brief.pdf",
+            "https://github.com/rNavarrete/software-factory/blob/main/design.png",
+            "https://github.com.evil.example/rNavarrete/software-factory/pull/28",
+            "https://github.com@evil.example/rNavarrete/software-factory/pull/28",
+            "https://github.com/rNavarrete/software-factory/issues/28",
+            "https://github.com/rNavarrete/software-factory/commit/not-a-sha",
+            "unreadable attachment",
+        ):
+            with self.subTest(url=url):
+                self.assertIsInstance(self.prepare(attachments=(pr, url)), Question)
+        self.assertIsInstance(self.prepare(attachments=(pr,), complete=False), Question)
+
+    def test_linear_uploads_hold_regardless_of_file_extension(self):
+        for url in (
+            "https://uploads.linear.app/workspace/asset/brief.pdf",
+            "https://uploads.linear.app/workspace/asset/requirements.docx?signature=synthetic",
+            "https://uploads.linear.app/workspace/asset/opaque-id",
+            "uploads.linear.app/workspace/asset/brief.pdf",
+        ):
+            with self.subTest(url=url):
+                self.assertIsInstance(self.prepare(context=f"[Brief]({url})"), Question)
+
+    def test_notion_com_and_schemeless_design_links_hold(self):
+        for url in (
+            "https://app.notion.com/p/acme",
+            "https://www.notion.com/Brief-" + PAGE,
+            "notion.so/" + PAGE,
+            "www.notion.so/" + PAGE,
+            "acme.notion.site/brief",
+            "app.notion.com/p/acme",
+            "figma.com/design/abc/Reading",
+            "www.figma.com/design/abc/Reading",
+            "//www.figma.com/design/abc/Reading",
+            "assets.example.test/design.png?version=2",
+        ):
+            for reference in (url, f"[Design]({url})", f"<{url}>"):
+                with self.subTest(reference=reference):
+                    out = self.prepare(context=reference)
+                    self.assertIsInstance(out, Question)
+                    self.assertEqual(out.kind, "factory")
+
+    def test_ordinary_links_and_host_lookalikes_do_not_gain_context_semantics(self):
+        for text in (
+            "https://github.com/rNavarrete/software-factory/pull/28",
+            "https://example.com/docs",
+            "https://notion.so.example.com/brief",
+            "notion.so.example.com/brief",
+            "myfigma.com/design/abc",
+            "person@notion.so",
+        ):
+            with self.subTest(text=text):
+                self.assertIsInstance(self.prepare(context=text), Prepared)
