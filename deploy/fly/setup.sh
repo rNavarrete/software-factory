@@ -7,6 +7,8 @@
 #   2. typing the approval code for the qualification contract,
 #   3. typing your current usage numbers.
 set -eu
+# flyctl's own installer puts it here; Homebrew's folders are usually on PATH.
+PATH="$HOME/.fly/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 APP=rnavarrete-factory
 REGION=iad
 
@@ -16,7 +18,8 @@ if [ ! -f deploy/fly/fly.toml ]; then
 fi
 
 echo "== App"
-fly apps list | grep -q "^$APP " || fly apps create "$APP"
+# Listing the app's volumes works only if the app exists and is yours.
+fly volumes list --app "$APP" >/dev/null 2>&1 || fly apps create "$APP"
 
 echo "== Volume (1 GB, daily snapshots kept 14 days)"
 if ! fly volumes list --app "$APP" | grep -q factory_data; then
@@ -33,9 +36,9 @@ fi
 echo "== Read-only GitHub token"
 if ! fly secrets list --app "$APP" | grep -q FACTORY_GITHUB_TOKEN; then
     echo "Paste the read-only GitHub token and press Enter (nothing will show):"
-    stty -echo
-    read -r TOKEN
-    stty echo
+    stty -echo </dev/tty
+    read -r TOKEN </dev/tty
+    stty echo </dev/tty
     printf 'FACTORY_GITHUB_TOKEN=%s\n' "$TOKEN" | fly secrets import --app "$APP" --stage
     unset TOKEN
 fi
@@ -50,9 +53,9 @@ fly ssh console --app "$APP" --pty \
 
 echo "== Usage reading (claude.ai usage page of the factory account)"
 printf "Current session usage %%: "
-read -r SESSION
+read -r SESSION </dev/tty
 printf "Weekly usage %%: "
-read -r WEEKLY
+read -r WEEKLY </dev/tty
 case "$SESSION$WEEKLY" in
     *[!0-9.]* | "") echo "Numbers only, please. Run this script again." >&2; exit 1 ;;
 esac
