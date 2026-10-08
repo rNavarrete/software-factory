@@ -273,6 +273,7 @@ _RULES: dict[str, Callable[[LedgerEvent, list[str]], None]] = {
     ATTEMPT_ABANDONED: _attempt_abandoned,
     FAILURE: _failure,
     HUMAN_DECISION: _human_decision,
+    "source-authorization": _human_decision,
     HUMAN_TIME: _human_time,
     METRIC: _metric,
     gate.REPAIR_AUTHORIZED: _repair_authorized,

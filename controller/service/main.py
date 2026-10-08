@@ -3,7 +3,18 @@
     python3 -m controller.service run --fixtures <dir>   run until stopped
     python3 -m controller.service once --fixtures <dir>  one round, then exit
     python3 -m controller.service status                 the queue and outbox
-    python3 -m controller.service install-secrets        host start-up step
+    python3 -m controller.service install-secrets <dir>  host start-up step
+    python3 -m controller.service signer --socket <path>  the key-holding process
+
+On the host the service and the signer run as two different users. The
+signer (``controller/signer``) reads the approval key as root, then becomes
+``factory-signer``; the service becomes ``factory`` and holds a ``SignerKey``
+that can check signatures but never make one (``FACTORY_SIGNER_SOCKET``).
+Without that variable (tests, a laptop) the service reads the key file
+itself, as before.
+
+``--source linear`` reads Rolando's Todo moves from Linear (ENG-174, see
+controller/intake); the default ``fixtures`` reads ``events.json``.
 
 Everything lives under the factory home (``~/.software-factory``, the same
 folder the ``python3 -m controller`` commands use): ``ledger.db``, ``backups/``, ``contracts/``,
@@ -42,6 +53,7 @@ log = logging.getLogger("factory.service")
 
 DEFAULT_INTERVAL = 60
 SECRETS_DIR_ENV = "FACTORY_SECRETS_DIR"
+SIGNER_SOCKET_ENV = "FACTORY_SIGNER_SOCKET"
 
 
 class AlreadyRunning(Exception):
@@ -80,15 +92,32 @@ def prune_backups(folder: Path, keep: int) -> None:
         old.unlink(missing_ok=True)
 
 
-def install_secrets(target: Path, environ: dict[str, str] | None = None) -> list[str]:
+def install_secrets(
+    target: Path,
+    environ: dict[str, str] | None = None,
+    *,
+    only: tuple[str, ...] = NAMES,
+    owner: str | None = None,
+) -> list[str]:
     """Move the ``FACTORY_*`` secrets from the environment into 0400 files in
     ``target`` (a 0700 folder) and out of the environment. Returns the names
-    written. Run once at container start, before the service."""
+    written. Run once at container start, before the service. ``only`` limits
+    which secrets go there; ``owner`` gives the folder and files to that user
+    (the service's own copy, which never includes the approval key)."""
     environ = os.environ if environ is None else environ
     target.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(target, 0o700)
+    ids = None
+    if owner is not None:
+        import pwd
+
+        entry = pwd.getpwnam(owner)
+        ids = (entry.pw_uid, entry.pw_gid)
+        os.chown(target, *ids)
     written = []
     for name in NAMES:
+        if name not in only:
+            continue
         value = environ.pop(env_name(name), None)
         if not value or not value.strip():
             continue
@@ -97,6 +126,8 @@ def install_secrets(target: Path, environ: dict[str, str] | None = None) -> list
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
         with os.fdopen(fd, "w") as f:
             f.write(value.strip())
+        if ids is not None:
+            os.chown(path, *ids)
         written.append(name)
     return written
 
@@ -121,7 +152,13 @@ def build(args: argparse.Namespace):
     if not secrets_dir:
         raise SecretMissing(f"set {SECRETS_DIR_ENV} to the folder holding the secret files")
     secrets = FileSecrets(secrets_dir)
-    key = StaticKey(approval_key_bytes(secrets))
+    socket_path = os.environ.get(SIGNER_SOCKET_ENV)
+    if socket_path:
+        from controller.signer import SignerKey
+
+        key = SignerKey(socket_path)
+    else:
+        key = StaticKey(approval_key_bytes(secrets))
 
     store = SqliteLedgerStore(root / "ledger.db")
     backups = root / "backups"
@@ -132,6 +169,7 @@ def build(args: argparse.Namespace):
         confirm=never,
         os_user="factory-service",
         contracts=ContractStore(root / "contracts"),
+        source_routine=FACTORY_ROUTINE,
     )
     gh = HttpGhRunner(lambda: secrets.get("github-token"))
     recovery = Recovery(store, approvals, GhCliReader(run=gh), gate=gate, confirm=never)
@@ -165,14 +203,27 @@ def build(args: argparse.Namespace):
         p.stem: json.loads(p.read_text())
         for p in sorted((fixture_dir / "contracts").glob("*.json"))
     }
+    if args.source == "linear":
+        from controller.intake import LinearSource, policy_from
+        from controller.intake.linear import HttpTransport
+
+        def policy():
+            return policy_from(
+                onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
+            )
+
+        source = LinearSource(HttpTransport(lambda: secrets.get("linear-key")), policy)
+    else:
+        source = fixtures.FixtureSource(fixtures.load_events(fixture_dir / "events.json"))
+    config_path = Path(args.onboarding) if args.onboarding else root / "onboarding.json"
     integrations = Integrations(
-        source=fixtures.FixtureSource(fixtures.load_events(fixture_dir / "events.json")),
+        source=source,
         preparer=fixtures.FixturePreparer(contracts_by_issue),
         reporter=fixtures.LogReporter(),
         reviewer=fixtures.RecordingReviewer(),
         repair=fixtures.NoRepair(),
+        authorizer=_authorizer(socket_path) if args.source == "linear" else None,
     )
-    config_path = Path(args.onboarding) if args.onboarding else root / "onboarding.json"
     service = Service(
         store,
         dispatcher,
@@ -186,6 +237,96 @@ def build(args: argparse.Namespace):
         instance=os.environ.get("FLY_MACHINE_ID", os.uname().nodename),
     )
     return service, store
+
+
+def _authorizer(socket_path: str | None):
+    if not socket_path:
+        raise SecretMissing(
+            f"--source linear needs the signer ({SIGNER_SOCKET_ENV}): the service never signs"
+        )
+    from controller.signer import SignerAuthorizer
+
+    return SignerAuthorizer(socket_path)
+
+
+def run_signer(args: argparse.Namespace) -> int:
+    """Start as root: read the approval key, open the socket for the service's
+    user, then become the signer's own user for good and answer requests."""
+    import grp
+    import pwd
+
+    from controller.approval import StaticKey
+    from controller.service.secrets import FileSecrets, approval_key_bytes
+    from controller.signer import SignerServer, drop_privileges
+
+    secrets_dir = os.environ.get(SECRETS_DIR_ENV)
+    if not secrets_dir:
+        raise SecretMissing(f"set {SECRETS_DIR_ENV} to the folder holding the secret files")
+    secrets = FileSecrets(secrets_dir)
+    key = StaticKey(approval_key_bytes(secrets))
+    extra = {}
+    if args.onboarding:
+        try:
+            linear_key = secrets.get("linear-key")
+        except SecretMissing:
+            # No Linear key yet: the signer only checks signatures, and no
+            # Todo move can be approved. Typed approvals work as before.
+            log.warning("no linear-key: Todo-move approval is off")
+        else:
+            extra["authorize"] = _todo_move_handler(args, key, linear_key)
+    signer = pwd.getpwnam(args.user)
+    client = pwd.getpwnam(args.client_user)
+    group = grp.getgrgid(client.pw_gid).gr_gid
+    path = Path(args.socket)
+    path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    os.chown(path.parent, signer.pw_uid, group)
+    os.chmod(path.parent, 0o750)
+    server = SignerServer(key, path, allowed_uids={0, client.pw_uid}, extra=extra)
+    server.listen()
+    os.chown(path, signer.pw_uid, group)
+    if args.state:
+        state = Path(args.state)
+        state.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(state.parent, signer.pw_uid, signer.pw_gid)
+    drop_privileges(args.user)
+    stopping = False
+
+    def on_signal(signum: int, frame: object) -> None:
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    log.info("signer ready on %s for uid %s", path, client.pw_uid)
+    try:
+        server.serve_forever(lambda: stopping)
+    finally:
+        server.close()
+    return 0
+
+
+def _todo_move_handler(args: argparse.Namespace, key, linear_key: str):
+    """The signer's ``authorize`` request. The Linear key and onboarding path
+    are read here, as root, before the signer drops to its own user."""
+    from controller.dispatch.dispatch import FACTORY_ROUTINE
+    from controller.intake.linear import HttpTransport, LinearSource
+    from controller.recovery import PILOT_REPO
+    from controller.service import onboarding
+    from controller.signer import authorize_handler
+    from controller.signer.authorize import OneContractPerMove, TodoMoveAuthorizer
+
+    if not args.state:
+        raise SecretMissing("--onboarding needs --state for the signer's record of moves")
+    config_path = Path(args.onboarding)
+
+    def load():
+        return onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
+
+    reader = LinearSource(HttpTransport(lambda: linear_key), lambda: None)  # type: ignore[arg-type,return-value]
+    authorizer = TodoMoveAuthorizer(
+        key, load, reader.fetch, reader.viewer_id, OneContractPerMove(Path(args.state))
+    )
+    return authorize_handler(authorizer)
 
 
 def run_forever(
@@ -232,15 +373,36 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--real-runtime", dest="fake_runtime", action="store_false")
         s.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
         s.add_argument("--onboarding", help="mapping file (default: onboarding.json in the home)")
+        s.add_argument("--source", choices=("fixtures", "linear"), default="fixtures")
+        s.add_argument("--user", help="become this user before starting (on the host)")
     sub.add_parser("status")
     s = sub.add_parser("install-secrets")
     s.add_argument("target", type=Path)
+    s.add_argument("--only", help="comma-separated secret names (default: all)")
+    s.add_argument("--owner", help="give the folder and files to this user")
+    s = sub.add_parser("signer")
+    s.add_argument("--socket", required=True)
+    s.add_argument("--user", default="factory-signer")
+    s.add_argument("--client-user", default="factory")
+    s.add_argument("--onboarding", help="root-owned onboarding file; enables Todo-move approval")
+    s.add_argument("--state", help="the signer's record of which contract each move authorized")
     args = p.parse_args(sys.argv[1:] if argv is None else argv)
 
     if args.cmd == "install-secrets":
-        names = install_secrets(args.target)
+        only = tuple(args.only.split(",")) if args.only else NAMES
+        unknown = set(only) - set(NAMES)
+        if unknown:
+            print(f"unknown secret names: {sorted(unknown)}", file=sys.stderr)
+            return 2
+        names = install_secrets(args.target, only=only, owner=args.owner)
         print(f"installed: {', '.join(names) or 'nothing'}")
         return 0
+    if args.cmd == "signer":
+        try:
+            return run_signer(args)
+        except SecretMissing as e:
+            print(f"Not started: {e}.", file=sys.stderr)
+            return 4
     if args.cmd == "status":
         return status(home())
 
@@ -253,6 +415,10 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+    if args.user:
+        from controller.signer import drop_privileges
+
+        drop_privileges(args.user)
     try:
         with service_lock(home()):
             service, store = build(args)
