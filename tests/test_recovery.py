@@ -223,6 +223,8 @@ class RecoverySpecTests(unittest.TestCase):
             head_branch=attempt.branch,
             head_sha=SHA_A,
             head_repo=REPO,
+            base_repo=REPO,
+            base_branch="main",
             author=BOT,
             state="open",
             draft=False,
@@ -1340,6 +1342,87 @@ class RecoverySpecTests(unittest.TestCase):
         self.assertEqual(self.status(NOW).state, State.MERGED)
         with self.assertRaises(RecoveryRefused):
             self.recovery.close_attempt(self.a1, State.FAILED, "no", NOW)
+
+    # --- regressions from Rolando's review ---
+
+    def test_review_a_merge_into_a_side_branch_is_not_accepted(self):
+        self.dispatch()
+        merged = {"state": "closed", "merged": True, "merge_commit": "c" * 40}
+        for base in ({"base_branch": "side"}, {"base_repo": "someone/else"}):
+            with self.subTest(base=base):
+                self.publish(self.pr(**merged, **base))
+                result = self.recovery.reconcile(self.a1, NOW)
+                st = self.status(NOW)
+                self.assertNotEqual(st.state, State.MERGED)
+                self.assertEqual(st.pull_requests, ())
+                self.assertTrue(any("targets" in w for w in result.warnings), result.warnings)
+                self.assertEqual(self.candidates_for_pr(7), [])
+
+    def test_review_an_older_github_read_cannot_undo_a_newer_merge(self):
+        self.dispatch()
+        merged = self.pr(state="closed", merged=True, merge_commit="c" * 40)
+        newer = FakeGitHub()
+        newer.branches[self.a1.branch] = SHA_A
+        newer.pulls = [merged]
+        other_process = self.make_recovery(github=newer)
+        test = self
+
+        class SlowGitHub(FakeGitHub):
+            """Returns an open PR, but another reconcile records the merge meanwhile."""
+
+            reads = 0
+
+            def recent_pulls(self, repo):
+                SlowGitHub.reads += 1
+                if SlowGitHub.reads == 1:
+                    other_process.reconcile(test.a1, NOW)
+                    return [test.pr()]
+                return [merged]
+
+            def pulls_for_branch(self, repo, branch):
+                return []
+
+        slow = SlowGitHub()
+        slow.branches[self.a1.branch] = SHA_A
+        self.make_recovery(github=slow).reconcile(self.a1, NOW)
+        self.assertEqual(SlowGitHub.reads, 2)
+        self.assertEqual(self.status(NOW).state, State.MERGED)
+        opened = [e for e in self.kinds(PR_OBSERVED) if e.data["state"] == "open"]
+        self.assertEqual(opened, [])
+
+    def test_review_reconcile_gives_up_when_records_keep_changing(self):
+        run = self.dispatch()
+        test = self
+
+        class Busy(FakeGitHub):
+            def recent_pulls(self, repo):
+                test.append(
+                    records.failure(
+                        "probe", "another writer", NOW, run=run, task=test.task, attempt=test.a1
+                    )
+                )
+                return [test.pr()]
+
+        before = len(self.kinds(PR_OBSERVED))
+        with self.assertRaises(RecoveryRefused):
+            self.make_recovery(github=Busy()).reconcile(self.a1, NOW)
+        self.assertEqual(len(self.kinds(PR_OBSERVED)), before)
+
+    def test_review_a_recorded_merge_outlasts_a_later_open_snapshot(self):
+        run = self.dispatch()
+        merged = self.pr(state="closed", merged=True, merge_commit="c" * 40)
+        self.publish(merged)
+        self.recovery.reconcile(self.a1, NOW)
+        stale = LedgerEvent(
+            PR_OBSERVED,
+            NOW,
+            self.task,
+            self.a1,
+            run,
+            dict(self.kinds(PR_OBSERVED)[-1].data) | {"state": "open", "merged": False},
+        )
+        self.append(stale)
+        self.assertEqual(self.status(NOW).state, State.MERGED)
 
 
 class SqliteRecoverySpecTests(RecoverySpecTests):

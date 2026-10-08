@@ -18,6 +18,7 @@ from controller.recovery.events import (
 from controller.recovery.github import GhCliReader, GitHubReader, GitHubUnreadable, PullRequest
 from controller.recovery.recovery import (
     PILOT_REPO,
+    PROTECTED_BRANCH,
     WORKER_LOGINS,
     Reconciliation,
     Recovery,
@@ -39,6 +40,7 @@ __all__ = [
     "LATE_FIRE_RESULT",
     "LAUNCH_RECONCILED",
     "PILOT_REPO",
+    "PROTECTED_BRANCH",
     "PR_OBSERVED",
     "RELEASE_STATUS",
     "RELEASE_STATUSES",

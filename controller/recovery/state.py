@@ -203,7 +203,11 @@ def _apply(item, facts, checks, releases) -> None:
             del f.prs[number]
     elif e.kind == ev.PR_OBSERVED:
         f.work_recorded = True
-        f.prs[int(d["number"])] = _Pr(
+        number = int(d["number"])
+        if number in f.prs and f.prs[number].merged and d["merged"] is not True:
+            # GitHub never un-merges a PR: a later "open" is an older snapshot.
+            return
+        f.prs[number] = _Pr(
             int(d["number"]),
             str(d["url"]),
             str(d["state"]),

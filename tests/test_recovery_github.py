@@ -24,6 +24,7 @@ def pull(**changes):
             "sha": SHA,
             "repo": {"full_name": "rNavarrete/factory-pilot-demo"},
         },
+        "base": {"ref": "main", "repo": {"full_name": "rNavarrete/factory-pilot-demo"}},
         "user": {"login": "rnavarrete-factory-bot"},
         "state": "open",
         "draft": True,
@@ -92,6 +93,7 @@ class GhCliReaderTest(unittest.TestCase):
         self.assertEqual(pr.author, "rnavarrete-factory-bot")
         self.assertTrue(pr.draft)
         self.assertFalse(pr.merged)
+        self.assertEqual((pr.base_repo, pr.base_branch), (REPO, "main"))
 
     def test_merge_commit_only_when_merged(self):
         open_pr = self.reader(**{RECENT: (0, [pull()])}).recent_pulls(REPO)[0]
@@ -122,6 +124,8 @@ class GhCliReaderTest(unittest.TestCase):
             pull(html_url="http://github.com/x"),
             pull(head={"ref": "x", "sha": "short"}),
             pull(user=None),
+            pull(base=None),
+            pull(base={"ref": "main", "repo": None}),
             pull(state="closed", merged_at="2026-10-08T12:00:00Z", merge_commit_sha=None),
             "not an object",
         ]

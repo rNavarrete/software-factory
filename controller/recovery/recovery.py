@@ -55,6 +55,10 @@ from controller.recovery import state as st
 from controller.recovery.github import GitHubReader, GitHubUnreadable, PullRequest
 
 PILOT_REPO = "rNavarrete/factory-pilot-demo"
+PROTECTED_BRANCH = "main"
+"""The only branch a worker PR may merge into to count as accepted work: the
+one the ruleset protects (ENG-142). A merge into any other branch lands
+nothing Rolando approved."""
 WORKER_LOGINS = frozenset({"rnavarrete-factory-bot"})
 """The GitHub logins worker sessions push and open PRs as (ENG-183)."""
 
@@ -66,6 +70,18 @@ _NO_REPAIRS = ContractDigest("0" * 64)
 
 class RecoveryRefused(Exception):
     """A recovery step was not allowed. Nothing was written."""
+
+
+RECONCILE_TRIES = 3
+
+
+@dataclass(frozen=True)
+class _Read:
+    run: RunId
+    head: str | None
+    seen: tuple[tuple[PullRequest, tuple[str, ...]], ...]
+    warnings: tuple[str, ...]
+    hints: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -90,6 +106,7 @@ class Recovery:
         github: GitHubReader | None = None,
         *,
         repo: str = PILOT_REPO,
+        base_branch: str = PROTECTED_BRANCH,
         worker_logins: frozenset[str] = WORKER_LOGINS,
         gate: AttemptGate | None = None,
         confirm: Confirm = tty_confirm,
@@ -104,6 +121,7 @@ class Recovery:
         self._approvals = approvals
         self._github = github
         self._repo = repo
+        self._base = base_branch
         self._workers = frozenset(worker_logins)
         self._gate = gate or AttemptGate(store)
         self._confirm = confirm
@@ -185,15 +203,43 @@ class Recovery:
     def reconcile(self, attempt: AttemptId, now: datetime) -> Reconciliation:
         """Read ``attempt``'s marker branch and PRs from GitHub and record what
         changed. Finds a PR the controller never saved (say, it crashed after
-        the worker opened it) and records it once. Reads only."""
+        the worker opened it) and records it once. Reads only.
+
+        GitHub is read without the writer lock, so another reconcile may write
+        while this one reads. If the attempt's records changed meanwhile, this
+        read may be older than what is on record: it is thrown away and GitHub
+        read again, up to ``RECONCILE_TRIES`` times, rather than recorded."""
         _aware(now)
         if self._github is None:
             raise RecoveryRefused("reconcile needs a GitHub reader")
+        for _ in range(RECONCILE_TRIES):
+            mark = self._last_seq(attempt.task)
+            found = self._read_github(attempt, now)
+            with self._store.writer_lock():
+                if self._last_seq(attempt.task) != mark:
+                    continue  # someone recorded something while we read
+                new = self._new_records(attempt, found.run, found.head, found.seen, now)
+                if new:
+                    self._store.append(*new)
+            return Reconciliation(
+                self.attempt_status(attempt, now), len(new), found.warnings, found.hints
+            )
+        raise RecoveryRefused(
+            f"{attempt}'s records kept changing while GitHub was read; nothing recorded."
+            " Run reconcile again."
+        )
+
+    def _last_seq(self, task: TaskId) -> int:
+        stored = self._store.events(task)
+        return max((s.seq for s in stored), default=0)
+
+    def _read_github(self, attempt: AttemptId, now: datetime) -> _Read:
         current = self.attempt_status(attempt, now)
         run = current.latest_run
         if run is None or not current.digest:
             raise RecoveryRefused(f"{attempt} has no recorded fire")
         digest = ContractDigest(current.digest)
+        assert self._github is not None
         try:
             head = self._github.branch_head(self._repo, attempt.branch)
             pulls = {p.number: p for p in self._github.recent_pulls(self._repo)}
@@ -234,12 +280,7 @@ class Recovery:
                 if url not in current.session_urls
             )
         )
-
-        with self._store.writer_lock():
-            new = self._new_records(attempt, run, head, seen, now)
-            if new:
-                self._store.append(*new)
-        return Reconciliation(self.attempt_status(attempt, now), len(new), tuple(warnings), hints)
+        return _Read(run, head, tuple(seen), tuple(warnings), hints)
 
     def _names(self, pr: PullRequest, attempt: AttemptId) -> bool:
         """Whether the PR claims to be this attempt's, by branch or title."""
@@ -252,6 +293,11 @@ class Recovery:
         out = []
         if pr.head_branch != attempt.branch:
             out.append(f"its branch is {pr.head_branch!r}, not {attempt.branch!r}")
+        if (pr.base_repo, pr.base_branch) != (self._repo, self._base):
+            out.append(
+                f"it targets {pr.base_branch!r} in {pr.base_repo},"
+                f" not {self._base!r} in {self._repo}"
+            )
         if pr.head_repo != self._repo:
             out.append(f"its branch lives in {pr.head_repo or 'a deleted repository'}")
         parsed = AttemptId.from_pr_title(pr.title)
@@ -501,6 +547,8 @@ def _observation(pr: PullRequest, problems: tuple[str, ...]) -> dict[str, object
         "head_branch": pr.head_branch,
         "head_sha": pr.head_sha,
         "head_repo": pr.head_repo,
+        "base_repo": pr.base_repo,
+        "base_branch": pr.base_branch,
         "author": pr.author,
         "state": pr.state,
         "draft": pr.draft,

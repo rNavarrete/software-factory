@@ -24,7 +24,7 @@ The controller cannot read or stop a cloud session, and the start call has no wa
 | failed / canceled | You closed the attempt |
 | accepted-merged | You merged its PR |
 
-A draft PR, a PR with failing checks, an open PR with passing checks, and a PR closed without merging are all unfinished. Only a merge counts as success. A closed PR waits for you to say whether the attempt failed or was canceled. Release status is recorded separately: a merge is not a release.
+A draft PR, a PR with failing checks, an open PR with passing checks, and a PR closed without merging are all unfinished. Only a merge into `main` of the pilot repo counts as success; a PR merged into any other branch is reported as not the attempt's. A closed PR waits for you to say whether the attempt failed or was canceled. Release status is recorded separately: a merge is not a release.
 
 ## When a launch is unknown
 

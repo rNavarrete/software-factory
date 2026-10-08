@@ -41,6 +41,11 @@ class PullRequest:
     head_sha: str
     head_repo: str | None
     """``owner/name`` the head branch lives in; None if that repo was deleted."""
+    base_repo: str
+    """``owner/name`` the PR merges into."""
+    base_branch: str
+    """The branch the PR merges into. A merge anywhere but the protected
+    default branch is not accepted work."""
     author: str
     state: str
     """"open" or "closed"."""
@@ -161,6 +166,7 @@ def _pull(item: object) -> PullRequest:
     title, body = _get(item, "title"), _get(item, "body")
     ref, sha = _get(item, "head", "ref"), _get(item, "head", "sha")
     head_repo = _get(item, "head", "repo", "full_name")
+    base_ref, base_repo = _get(item, "base", "ref"), _get(item, "base", "repo", "full_name")
     author, state = _get(item, "user", "login"), _get(item, "state")
     draft, merged_at = _get(item, "draft"), _get(item, "merged_at")
     merge_commit = _get(item, "merge_commit_sha")
@@ -176,6 +182,8 @@ def _pull(item: object) -> PullRequest:
         and isinstance(sha, str)
         and _SHA_RE.fullmatch(sha) is not None
         and (head_repo is None or isinstance(head_repo, str))
+        and isinstance(base_ref, str)
+        and isinstance(base_repo, str)
         and isinstance(author, str)
         and state in ("open", "closed")
         and isinstance(draft, bool)
@@ -194,6 +202,8 @@ def _pull(item: object) -> PullRequest:
         head_branch=ref,
         head_sha=sha,
         head_repo=head_repo,
+        base_repo=base_repo,
+        base_branch=base_ref,
         author=author,
         state=state,
         draft=draft,
