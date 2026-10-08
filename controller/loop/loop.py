@@ -90,14 +90,36 @@ class Loop:
     now: Callable[[], datetime]
     sleep: Callable[[float], None]
     say: Callable[[str], None] = print
+    backup: Callable[[datetime], object] | None = None
+    """Copies the ledger to the backups folder. Run whenever a run of the loop
+    wrote anything (checks, Rolando's answers, the clearing, his minutes)."""
     poll_seconds: float = POLL_SECONDS
     repo: str = PILOT_REPO
 
     def run(
         self, contract: Mapping[str, object], wait_minutes: float = DEFAULT_WAIT_MINUTES
     ) -> int:
-        digest = contracts.digest(contract)
         task = TaskId(str(contract["task_id"]))
+        mark = self._last_seq(task)
+        try:
+            return self._run(contract, task, wait_minutes)
+        finally:
+            if self._last_seq(task) != mark:
+                self._backup()
+
+    def _last_seq(self, task: TaskId) -> int:
+        return max((s.seq for s in self.store.events(task)), default=0)
+
+    def _backup(self) -> None:
+        if self.backup is None:
+            return
+        try:
+            self.backup(self.now())
+        except Exception as e:  # a failed backup must not lose the run's result
+            self.say(f"Warning: the ledger backup failed ({type(e).__name__}: {e}).")
+
+    def _run(self, contract: Mapping[str, object], task: TaskId, wait_minutes: float) -> int:
+        digest = contracts.digest(contract)
         self.timer.task = task
         try:
             result = self.dispatcher.dispatch(contract)
@@ -154,7 +176,8 @@ class Loop:
         """Look once. Returns (exit code, None) when done, or (None, status line)."""
         now = self.now()
         try:
-            found = self.recovery.reconcile(attempt, now)
+            # Through the dispatcher, which backs the ledger up whenever this records.
+            found = self.dispatcher.reconcile(attempt)
         except RecoveryRefused as e:
             return None, f"Couldn't read GitHub just now ({e}); will try again."
         status = found.status

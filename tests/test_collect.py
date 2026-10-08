@@ -546,16 +546,30 @@ class ReadFailureTests(CollectCase):
             world.pr["head"]["sha"] = fx.NEW_HEAD
 
         w = MovingWorld(push)
-        with self.assertRaisesRegex(GitHubUnreadable, "moved while it was being read"):
+        with self.assertRaisesRegex(GitHubUnreadable, "changed while it was being read"):
             self.collect(w)
         pr_reads = [p for p in w.calls if p == f"repos/{REPO}/pulls/{NUMBER}"]
         self.assertEqual(len(pr_reads), 2)
+
+    def test_pr_changing_at_the_same_commit_while_read_raises(self):
+        # Rolando's repro: retargeted away from main at the same commit mid-read.
+        changes = {
+            "retargeted": lambda w: w.pr["base"].update(ref="release"),
+            "closed": lambda w: w.pr.update(state="closed"),
+            "renamed": lambda w: w.pr.update(title=w.pr["title"] + " (edited)"),
+            "body edited": lambda w: w.pr.update(body="Contract-Digest: " + "0" * 64),
+            "branch renamed": lambda w: w.pr["head"].update(ref="claude/other-a1"),
+            "moved repo": lambda w: w.pr["base"]["repo"].update(full_name="someone/else"),
+        }
+        for name, change in changes.items():
+            with self.subTest(name), self.assertRaisesRegex(GitHubUnreadable, "changed while"):
+                self.collect(MovingWorld(change))
 
     def test_base_moving_while_read_raises(self):
         def merge_to_main(world):
             world.pr["base"]["sha"] = fx.NEW_MAIN
 
-        with self.assertRaisesRegex(GitHubUnreadable, "moved"):
+        with self.assertRaisesRegex(GitHubUnreadable, "changed while"):
             self.collect(MovingWorld(merge_to_main))
 
     def test_nothing_moving_is_read_twice_and_usable(self):

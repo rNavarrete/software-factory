@@ -82,6 +82,7 @@ def _real() -> Loop:
         timer=timer,
         asker=Asker(sys.stdin, sys.stderr),
         reports=home / "reports",
+        backup=lambda now: store.backup(home / "backups", now),
         now=_now,
         sleep=time.sleep,
     )

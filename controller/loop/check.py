@@ -66,9 +66,22 @@ class Assessment:
         return tuple(dict.fromkeys(out))
 
     @property
+    def definite_failure(self) -> bool:
+        """Something is wrong that no review comment and no answer of Rolando's
+        can fix: a collection problem, a failed gate (scope, base, markers,
+        untrusted or failed checks) or a criterion that failed."""
+        if self.collected.problems:
+            return True
+        if self.criteria is None or self.assertions is None:
+            return False
+        if not all(g.ok for g in (*self.criteria.gates, *self.assertions.gates)):
+            return True
+        return any(c.verdict is Verdict.FAIL for c in self.criteria.criteria)
+
+    @property
     def waiting_on_review(self) -> bool:
-        """Nothing else is wrong yet; the independent mapping isn't posted."""
-        return self.collected.usable and self.review.url is None
+        """The independent mapping isn't posted, and nothing it can't fix is wrong."""
+        return self.collected.usable and self.review.url is None and not self.definite_failure
 
     def owed_observations(self, contract: Mapping[str, object]) -> tuple[Mapping, ...]:
         """Observable criteria with no verdict yet, which only Rolando can supply."""

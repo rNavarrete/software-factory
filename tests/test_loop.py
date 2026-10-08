@@ -561,6 +561,7 @@ class LoopCase(unittest.TestCase):
         self.gh = FakeGitHub()
         self.adapter = ScriptedAdapter([launched(1)])
         self.said = []
+        self.backups = []
         self.slept = 0
         self.on_sleep = []
         """Callables run one per sleep, to change the world between polls."""
@@ -576,6 +577,10 @@ class LoopCase(unittest.TestCase):
 
     def clock(self):
         return self.now
+
+    def back_up(self, now):
+        """Records the last ledger entry each backup holds."""
+        self.backups.append(max((s.seq for s in self.store.events()), default=0))
 
     def sleep(self, seconds):
         self.slept += 1
@@ -623,6 +628,7 @@ class LoopCase(unittest.TestCase):
             now=self.clock,
             sleep=self.sleep,
             say=self.said.append,
+            backup=self.back_up,
         )
 
     def run_loop(self, answers=None, wait=90):
@@ -1161,3 +1167,54 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewIsNotAwaitedForAKnownFailure(LoopCase):
+    """Rolando's repro: a forbidden package.json change with no review posted
+    must be reported at once, not hidden behind "waiting for the review"."""
+
+    def test_out_of_scope_change_is_reported_without_a_review(self):
+        self.world.comments = []
+        self.world.files.append({"filename": "package.json", "status": "modified"})
+        self.world.pr["changed_files"] += 1
+        self.world.contents[("package.json", fx.HEAD)] = b'{"scripts": {}}\n'
+        self.world.contents[("package.json", fx.BASE)] = b"{}\n"
+        self.on_sleep = [self.open_pr]
+        code = self.run_loop("")
+        self.assertEqual(code, EXIT_STOPPED, self.text())
+        text = self.text()
+        self.assertNotIn("waiting for the independent review comment", text)
+        self.assertIn("outside the permitted paths: package.json", text)
+        self.assertEqual([r["conclusion"] for r in self.checks()[-1].data["results"]][0], "failure")
+
+
+class BackupTests(LoopCase):
+    def test_every_write_of_a_run_is_backed_up(self):
+        self.on_sleep = [self.open_pr]
+        code = self.run_loop("y\n\nRead the diff: import and new tests only.\n")
+        self.assertEqual(code, EXIT_READY, self.text())
+        last = max(s.seq for s in self.store.events())
+        # The final backup holds the last write (Rolando's answers, the checks
+        # record), so a restore loses none of them.
+        self.assertTrue(self.backups, "nothing was backed up")
+        self.assertEqual(self.backups[-1], last)
+        kinds_written = {s.event.kind for s in self.store.events() if s.seq <= self.backups[-1]}
+        self.assertIn(kinds.CHECKS, kinds_written)
+        self.assertIn(kinds.HUMAN_DECISION, kinds_written)
+
+    def test_a_run_that_writes_nothing_makes_no_extra_backup(self):
+        self.on_sleep = [self.open_pr]
+        self.run_loop("y\n\nRead the diff: import and new tests only.\n")
+        before = len(self.backups)
+        self.assertEqual(self.run_loop("", wait=0), EXIT_READY, self.text())
+        self.assertEqual(len(self.backups), before)
+
+    def test_a_failing_backup_only_warns(self):
+        def broken(now):
+            raise OSError("disk full")
+
+        self.loop.backup = broken
+        self.on_sleep = [self.open_pr]
+        code = self.loop.run(self.contract)
+        self.assertIn("the ledger backup failed (OSError: disk full)", self.text())
+        self.assertIn(code, (EXIT_READY, EXIT_STOPPED))

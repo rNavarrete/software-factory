@@ -324,9 +324,12 @@ def collect(
     # Everything above was read in several calls. If the worker pushed (or main
     # moved) meanwhile, the file list and comments may describe another
     # revision than the head the CI run was matched to: read again later.
+    # Everything checked on the first read is compared, not just the commits:
+    # a PR retargeted to another branch at the same commit, closed, renamed or
+    # re-described while it was read is not the PR that was judged.
     again = api.json(f"repos/{repo}/pulls/{pr_number}")
-    if _get(again, "head", "sha") != head_sha or _get(again, "base", "sha") != base_sha:
-        raise GitHubUnreadable(f"PR #{pr_number} moved while it was being read")
+    if _identity(again) != _identity(pr):
+        raise GitHubUnreadable(f"PR #{pr_number} changed while it was being read")
 
     return Collected(
         **shell,
@@ -606,6 +609,26 @@ def _artifact_json(
 
 
 # --- Helpers ----------------------------------------------------------------------
+
+
+_IDENTITY_FIELDS = (
+    ("head", "sha"),
+    ("head", "ref"),
+    ("head", "repo", "full_name"),
+    ("base", "sha"),
+    ("base", "ref"),
+    ("base", "repo", "full_name"),
+    ("user", "login"),
+    ("title",),
+    ("body",),
+    ("state",),
+    ("changed_files",),
+)
+
+
+def _identity(pr: object) -> tuple:
+    """Every field of the PR that ``collect`` checks or relies on."""
+    return tuple(_get(pr, *keys) for keys in _IDENTITY_FIELDS)
 
 
 def _get(value: object, *keys: str) -> object:
