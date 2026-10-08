@@ -75,6 +75,12 @@ jobs:
         run: |
           test "$(git -C pilot rev-parse HEAD)" = "$HEAD_SHA"
           git -C pilot cat-file -e "$MERGE_BASE^{commit}"
+      # Codex would follow these as its own instructions. Removed from the
+      # working tree only: the review still sees any change to them in git.
+      - name: Remove agent instruction files from the PR's checkout
+        run: |
+          find pilot -path pilot/.git -prune -o \( -iname 'AGENTS*.md' -o -name .codex \) -print0 \
+            | xargs -0 -r rm -rf --
       # Last step of the job, as the action's security guide advises.
       - name: Codex review (read-only)
         id: codex
@@ -93,7 +99,8 @@ jobs:
 
   # Runs the tests the review linked, from the PR's head, against the base's
   # product code. This runs the worker's code, so it gets no secrets and no
-  # token permissions, and sudo and Docker are switched off first.
+  # token permissions. Docker is switched off, and the code runs as a separate
+  # user, "prover", which can't use sudo or write this job's outputs.
   proofs:
     needs: review
     if: needs.review.result == 'success'
@@ -128,11 +135,19 @@ jobs:
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: 22
-      - name: Switch off sudo and Docker before running the PR's code
+      - name: Switch off Docker and sudo; add the user that runs the PR's code
         run: |
+          set -eu
           sudo systemctl stop docker.socket docker.service containerd.service || true
-          sudo sh -c 'deluser runner docker 2>/dev/null; deluser runner sudo 2>/dev/null; rm -f /etc/sudoers.d/runner; sed -i "/^runner[[:space:]]/d" /etc/sudoers' || true
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin prover
+          sudo install -d -o runner -g runner -m 0755 /srv/factory-proof
+          sudo sh -c 'rm -f /etc/sudoers.d/*
+            sed -i "/^runner[[:space:]]/d; /^%sudo[[:space:]]/d; /^%admin[[:space:]]/d" /etc/sudoers
+            echo "runner ALL=(prover) NOPASSWD: ALL" > /etc/sudoers.d/prover
+            chmod 0440 /etc/sudoers.d/prover
+            deluser runner docker 2>/dev/null; deluser runner sudo 2>/dev/null; true'
           if sudo -n true 2>/dev/null; then echo "sudo is still available" >&2; exit 1; fi
+          sudo -n -u prover -- true
       - name: Run the linked tests on the base's code
         id: proofs
         working-directory: factory
@@ -140,7 +155,9 @@ jobs:
           KEY: ${{ inputs.key }}
           REQUEST: ${{ inputs.request }}
           FINAL_MESSAGE: ${{ needs.review.outputs.final_message }}
-        run: python3 -E -s -m controller.review.codex_job proofs --pilot "$GITHUB_WORKSPACE/pilot"
+        run: >-
+          python3 -E -s -m controller.review.codex_job proofs
+          --pilot "$GITHUB_WORKSPACE/pilot" --work /srv/factory-proof --as-user prover
 
   # Writes the one result the controller reads. Runs no PR code, gets no key.
   publish:
@@ -172,4 +189,4 @@ jobs:
           name: factory-review-result
           path: ${{ runner.temp }}/result/result.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90

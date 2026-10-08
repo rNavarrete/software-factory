@@ -6,12 +6,17 @@ has no access to that repository, so it can't edit the workflow, its prompt,
 its output schema or this code, and it can't start a run. Inside the run:
 
 - ``review``: checks the request, checks out the pilot PR at the exact head,
-  and runs the official Codex GitHub Action (pinned) read-only, with the
-  OpenAI API key held by the action's proxy and sudo dropped. Nothing from the
-  pilot repository is installed or run in this job.
+  removes agent instruction files (``AGENTS*.md``, ``.codex/``) from the
+  working tree, and runs the official Codex GitHub Action (pinned) read-only,
+  with the OpenAI API key held by the action's proxy and sudo dropped. No
+  pilot script, install hook or test is run in this job; Codex reads the
+  pilot's files, which are data to it, not instructions it must follow.
 - ``proofs``: runs the tests the review linked, from the PR's head, against the
-  base's product code (the failure proofs). No secrets, no token permissions,
-  sudo dropped before any pilot code runs.
+  base's product code (the failure proofs). No secrets, no token permissions;
+  the pilot's code runs as a separate user that can't use sudo or write the
+  job's outputs. The outcomes are what the worker's own test code reported
+  in-process, so the worker's code can influence them; a test that wasn't run
+  or whose result can't be read makes the whole result incomplete.
 - ``publish``: wraps both outputs, with the run's own identity, into one
   ``factory-review-result`` artifact. It runs no pilot code and gets no key.
 
@@ -49,7 +54,7 @@ from enum import Enum
 
 from controller.adapter.routine import LaunchInterrupted, parse_retry_after
 from controller.interfaces import LaunchOutcome, LaunchResult
-from controller.loop.collect import GitHubApi, GitHubUnreadable
+from controller.loop.collect import GitHubApi, GitHubUnreadable, NotFound
 from controller.review.runtime import ENVELOPE, ReviewTooLarge
 from verify.assertions import AssertionLink, FailureProof, FailureProofLimit, ProofOutcome
 from verify.criteria import _login_key
@@ -66,10 +71,13 @@ IDENTITY = "codex-review"
 from anything the run wrote: every result under it comes from a run that
 passed ``WorkflowResults``'s checks."""
 RUN_NAME = "codex-review {key}"
+NOT_RUN = "not-run"
+"""The proof job's outcome for a linked test it couldn't run or read."""
 MAX_REQUEST_CHARS = 60_000
 """GitHub caps a dispatch's inputs at 65,535 characters in all."""
 MAX_RESULT_BYTES = 4 * 1024 * 1024
 CLOCK_SKEW = timedelta(minutes=5)
+MAX_RUN_PAGES = 5
 
 # The areas every review must say it examined (codex_prompt.md).
 AREAS = (
@@ -89,6 +97,9 @@ _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _EFFORT_RE = re.compile(r"^[a-z]{0,16}$")
 _REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
 _PATH_RE = re.compile(r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9._/@+-]{1,300}$")
+_TEST_PATH_RE = re.compile(r"^tests/[A-Za-z0-9._/-]+\.test\.(?:ts|tsx|js|mjs)$")
+"""The only files a link may name, and so the only files the proof job copies
+from the PR's head into the base's code: the pilot's test files."""
 
 
 @dataclass(frozen=True)
@@ -356,18 +367,10 @@ class WorkflowResults:
         c = self._config
         if not request.claimed:
             return Found(ResultState.ABSENT)
-        since = (min(request.claimed) - CLOCK_SKEW).astimezone(UTC).strftime("%Y-%m-%d")
-        listing = self._api.json(
-            f"repos/{c.repository}/actions/workflows/{c.workflow_file}/runs"
-            f"?event=workflow_dispatch&per_page=100&created=%3E%3D{since}"
-        )
-        runs = listing.get("workflow_runs") if isinstance(listing, Mapping) else None
-        if not isinstance(runs, list):
-            raise GitHubUnreadable("the review workflow's runs could not be read")
         ignored: list[str] = []
         authentic = []
         title = c.run_name(request.key)
-        for run in runs:
+        for run in self._runs(request):
             if not isinstance(run, Mapping) or run.get("display_title") != title:
                 continue
             why = self._not_authentic(run, request)
@@ -379,27 +382,64 @@ class WorkflowResults:
             return Found(ResultState.ABSENT, ignored=tuple(ignored))
         authentic.sort(key=lambda r: (str(r.get("created_at")), int(r["id"])))
         done = [r for r in authentic if r.get("status") == "completed"]
-        if not done:
-            run = authentic[-1]
+        good = [r for r in done if r.get("conclusion") == "success"]
+        if good:
+            # The newest run that finished cleanly answers the request. A
+            # later run (started by hand with the same key) that failed or is
+            # still going doesn't hide it.
+            run = good[-1]
+        elif len(done) < len(authentic):
+            run = [r for r in authentic if r.get("status") != "completed"][-1]
             return Found(ResultState.RUNNING, url=_run_url(run), ignored=tuple(ignored))
-        run = done[-1]
-        ignored += [
-            f"run {r['id']} ignored: a newer run answered the same request" for r in done[:-1]
-        ]
-        url = _run_url(run)
-        if run.get("conclusion") != "success":
+        else:
+            run = done[-1]
             return Found(
                 ResultState.INCOMPLETE,
-                url=url,
+                url=_run_url(run),
                 reason=f"the review run ended as {run.get('conclusion')!r}, without a result",
                 ignored=tuple(ignored),
             )
+        ignored += [
+            f"run {r['id']} ignored: run {run['id']} answered the same request"
+            for r in authentic
+            if r is not run
+        ]
+        url = _run_url(run)
         try:
             result = self._artifact(run)
             review = to_review(result, run, request, c)
         except _Incomplete as e:
             return Found(ResultState.INCOMPLETE, url=url, reason=str(e), ignored=tuple(ignored))
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            # Anything the checks above didn't foresee is still never a pass.
+            return Found(
+                ResultState.INCOMPLETE,
+                url=url,
+                reason=f"the result can't be read ({type(e).__name__})",
+                ignored=tuple(ignored),
+            )
         return Found(ResultState.READY, review=review, url=url, ignored=tuple(ignored))
+
+    def _runs(self, request: ResultRequest) -> list:
+        """Every dispatched run of the workflow since the first claim, reading
+        up to ``MAX_RUN_PAGES`` pages. A listing that can't be read, or is
+        longer than that, raises GitHubUnreadable: a stored verdict is never
+        dropped because one page was missing."""
+        c = self._config
+        since = (min(request.claimed) - CLOCK_SKEW).astimezone(UTC).strftime("%Y-%m-%d")
+        runs: list = []
+        for page in range(1, MAX_RUN_PAGES + 1):
+            listing = self._api.json(
+                f"repos/{c.repository}/actions/workflows/{c.workflow_file}/runs"
+                f"?event=workflow_dispatch&per_page=100&page={page}&created=%3E%3D{since}"
+            )
+            items = listing.get("workflow_runs") if isinstance(listing, Mapping) else None
+            if not isinstance(items, list):
+                raise GitHubUnreadable("the review workflow's runs could not be read")
+            runs += items
+            if len(items) < 100:
+                return runs
+        raise GitHubUnreadable("the review workflow has too many runs to read")
 
     def _not_authentic(self, run: Mapping, request: ResultRequest) -> str:
         """Why GitHub's own record of ``run`` doesn't make it the trusted
@@ -435,10 +475,12 @@ class WorkflowResults:
     def _on_main(self, sha: str) -> bool:
         if sha not in self._cache.on_main:
             c = self._config
+            # Any other GitHubUnreadable propagates: the round is tried again,
+            # and a verdict already recorded is kept meanwhile.
             try:
                 cmp = self._api.json(f"repos/{c.repository}/compare/{sha}...{c.ref}")
-            except GitHubUnreadable:
-                return False  # not cached: asked again next round
+            except NotFound:
+                cmp = None  # a commit the factory doesn't have
             status = cmp.get("status") if isinstance(cmp, Mapping) else None
             self._cache.on_main[sha] = status in ("ahead", "identical")
         return self._cache.on_main[sha]
@@ -559,6 +601,9 @@ def to_review(
     error = result.get("review_error")
     if error:
         raise _Incomplete(f"the Codex output was unusable: {str(error)[:300]}")
+    model = _obj(result, "model")
+    if model.get("model") != config.model or model.get("effort") != config.effort:
+        raise _Incomplete("the review ran with another model or effort than the factory's setting")
     out = _obj(result, "review")
     problem = output_problem(out, request)
     if problem:
@@ -581,6 +626,12 @@ def to_review(
             )
             for x in out["links"]
         )
+        linked = {link.criterion for link in links}
+        if links and jobs.get("proofs") != "success":
+            raise _Incomplete(f"the failure-proof job ended as {jobs.get('proofs')!r}")
+        if links and result.get("proofs_error"):
+            why = str(result["proofs_error"])[:300]
+            raise _Incomplete(f"the failure proofs couldn't run: {why}")
         limits = tuple(
             FailureProofLimit(
                 criterion=x["criterion"],
@@ -591,10 +642,13 @@ def to_review(
                 reason=x["reason"],
             )
             for x in out["limits"]
+            # A criterion with a linked test needs its proof: the reviewer
+            # can't excuse it with a reason instead.
+            if x["criterion"] not in linked
         )
         proofs = _proofs(result, links, request, by, url)
         findings = _findings(out, request, by)
-    except (KeyError, TypeError, ValueError) as e:
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
         raise _Incomplete(f"the Codex output can't be used ({e})") from None
     return Review(links, proofs, limits, url, (), findings, by)
 
@@ -647,8 +701,10 @@ def output_problem(out: Mapping, request: ResultRequest) -> str:
         for x in out[name]:
             if not isinstance(x, Mapping) or not all(_text(x.get(k)) for k in keys):
                 return f"a {name[:-1]} entry is malformed"
-            if not _PATH_RE.fullmatch(x.get("path", "tests/x")):
-                return f"a {name[:-1]} names an unsafe path"
+            if name == "links" and not (
+                _PATH_RE.fullmatch(x["path"]) and _TEST_PATH_RE.fullmatch(x["path"])
+            ):
+                return f"a link names {x['path'][:100]!r}, which is not a test file"
     for f in out["findings"]:
         if not isinstance(f, Mapping):
             return "a finding is malformed"
@@ -710,22 +766,32 @@ def _proofs(
     by: str,
     url: str,
 ) -> tuple[FailureProof, ...]:
-    """The measured failure proofs, only for tests the review linked."""
+    """The failure proofs the proof job reported, only for tests the review
+    linked. Every linked test must have exactly one: a test that wasn't run or
+    whose result couldn't be read makes the whole result incomplete, so a
+    measurement problem is never mistaken for a failing test."""
     raw = result.get("proofs")
     if not isinstance(raw, list):
-        return ()
+        raw = []
     linked = {(link.criterion, link.path, link.test) for link in links}
     out = []
+    seen = set()
     for p in raw:
         if not isinstance(p, Mapping):
             continue
         ident = (p.get("criterion"), p.get("path"), p.get("test"))
-        if ident not in linked:
+        if ident not in linked or ident in seen:
             continue
+        if p.get("outcome") == NOT_RUN:
+            raise _Incomplete(
+                f"the linked test {ident[2]!r} in {ident[1]} wasn't run:"
+                f" {str(p.get('output_excerpt') or '')[:200]}"
+            )
         try:
             outcome = ProofOutcome(p.get("outcome"))
         except ValueError:
-            continue
+            raise _Incomplete(f"the proof for {ident[2]!r} has no outcome") from None
+        seen.add(ident)
         out.append(
             FailureProof(
                 criterion=ident[0],
@@ -740,6 +806,9 @@ def _proofs(
                 output_excerpt=str(p.get("output_excerpt") or "")[:2000],
             )
         )
+    if seen != linked:
+        missing = sorted(t for _, _, t in linked - seen)
+        raise _Incomplete(f"no failure proof for {', '.join(repr(t) for t in missing[:5])}")
     return tuple(out)
 
 

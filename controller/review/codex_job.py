@@ -4,14 +4,16 @@ Run from the factory's own checkout, at the workflow's commit, never from the
 pilot checkout::
 
     python3 -m controller.review.codex_job prepare
-    python3 -m controller.review.codex_job proofs --pilot ../pilot
+    python3 -m controller.review.codex_job proofs --pilot ../pilot --work /srv/factory-proof \\
+        --as-user prover
     python3 -m controller.review.codex_job publish
 
 Inputs come from environment variables the workflow sets (never spliced into
 a shell command). ``prepare`` checks the request before anything is checked
 out or any model is called, and writes the prompt. ``proofs`` runs the linked
 tests from the PR's head against the base's product code; it runs in a job
-with no secrets. ``publish`` writes the one result file the controller reads.
+with no secrets, and the PR's code runs as a separate user that can't write
+this step's outputs. ``publish`` writes the one result file the controller reads.
 None of them treats the request, the PR, the model's output or the test
 output as instructions.
 
@@ -41,7 +43,9 @@ from controller.review.workflow import (
     _MODEL_RE,
     _PATH_RE,
     _SHA_RE,
+    _TEST_PATH_RE,
     MAX_REQUEST_CHARS,
+    NOT_RUN,
     RESULT_SCHEMA,
     request_hash,
 )
@@ -175,21 +179,27 @@ def _parse_output(text: str) -> dict | None:
 
 
 def linked_tests(output: Mapping | None) -> list[tuple[str, str, str]]:
-    """(criterion, path, test) for each link in the review, safe paths only."""
+    """(criterion, path, test) for each link in the review, test files only."""
     out = []
     links = output.get("links") if output else None
     for link in links if isinstance(links, list) else []:
         if not isinstance(link, Mapping):
             continue
         c, p, t = link.get("criterion"), link.get("path"), link.get("test")
-        if all(isinstance(x, str) and x.strip() for x in (c, p, t)) and _PATH_RE.fullmatch(p):
+        texts = all(isinstance(x, str) and x.strip() for x in (c, p, t))
+        if texts and _PATH_RE.fullmatch(p) and _TEST_PATH_RE.fullmatch(p):
             if (c, p, t) not in out:
                 out.append((c, p, t))
     return out
 
 
 def outcome_of(report: Mapping, path: str, test: str) -> tuple[str, str]:
-    """(outcome, excerpt) for ``test`` in a vitest JSON report."""
+    """(outcome, excerpt) for ``test`` in a vitest JSON report.
+
+    ``not-run`` when the report doesn't show the test running: no report, the
+    file isn't in it, or the file ran without that test. The controller never
+    counts that as a failure. A file that vitest reports as failing to load
+    (an import the base doesn't have) is ``failed-error``."""
     files = report.get("testResults") if isinstance(report, Mapping) else None
     for f in files if isinstance(files, list) else []:
         if not isinstance(f, Mapping):
@@ -212,8 +222,10 @@ def outcome_of(report: Mapping, path: str, test: str) -> tuple[str, str]:
                 return "failed-assertion", excerpt
             return "failed-error", excerpt
         message = "\n".join(str(f.get("message") or "").splitlines()[:20])
-        return "failed-error", message or "the test was not found in its file's run"
-    return "failed-error", "the test file did not run"
+        if message and not f.get("assertionResults"):
+            return "failed-error", message
+        return NOT_RUN, "the test was not found in its file's run"
+    return NOT_RUN, "the test file did not run"
 
 
 def cmd_proofs(args: argparse.Namespace) -> int:
@@ -228,59 +240,84 @@ def cmd_proofs(args: argparse.Namespace) -> int:
     proofs: list[dict] = []
     error = ""
     pilot = Path(args.pilot).resolve()
-    base = pilot.parent / "base-code"
+    work = Path(args.work).resolve()
+    base = work / "base-code"
+    home = work / "home"
     if links:
         head, merge_base = request["head"], request["merge_base"]
         git = ["git", "-C", str(pilot)]
-        subprocess.run([*git, "worktree", "add", "--detach", str(base), merge_base], check=True)
+        # A plain copy of the base's files, with no link back to the checkout.
+        base.mkdir(parents=True)
+        tree = subprocess.run([*git, "archive", merge_base], capture_output=True, check=True)
+        subprocess.run(["tar", "-x", "-C", str(base)], input=tree.stdout, check=True)
         missing = set()
-        for path in sorted({p for _, p, _ in links})[:MAX_PROOF_FILES]:
+        paths = sorted({p for _, p, _ in links})[:MAX_PROOF_FILES]
+        for path in paths:
             shown = subprocess.run([*git, "show", f"{head}:{path}"], capture_output=True)
-            if shown.returncode != 0:
-                missing.add(path)
-                continue
             target = (base / path).resolve()
-            if not target.is_relative_to(base.resolve()):
+            if shown.returncode != 0 or not target.is_relative_to(base):
                 missing.add(path)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(shown.stdout)
-        install = _run(["npm", "ci"], base, INSTALL_TIMEOUT)
-        if install != 0:
+        if args.as_user:
+            # The PR's code runs as another user, which can write here and
+            # nowhere this step reads from except its report.
+            home.mkdir(parents=True)
+            for d in (base, home):
+                subprocess.run(["chmod", "-R", "a+rwX", str(d)], check=True)
+        reports: dict[str, Mapping] = {}
+        if _run(["npm", "ci"], base, INSTALL_TIMEOUT, args.as_user, home) != 0:
             error = "installing the base commit's dependencies failed"
         else:
-            reports: dict[str, Mapping] = {}
-            for path in sorted({p for _, p, _ in links} - missing)[:MAX_PROOF_FILES]:
-                report = base / f".factory-proof-{len(reports)}.json"
+            for path in [p for p in paths if p not in missing]:
+                # A fresh, unguessable name per run, read straight after it.
+                report = base / f".factory-proof-{secrets.token_hex(16)}.json"
                 cmd = ["npx", "--no-install", "vitest", "run", path, "--reporter=json"]
-                _run([*cmd, f"--outputFile={report}"], base, TEST_TIMEOUT)
+                _run([*cmd, f"--outputFile={report}"], base, TEST_TIMEOUT, args.as_user, home)
                 try:
                     reports[path] = json.loads(report.read_text())
                 except (OSError, ValueError):
                     reports[path] = {}
-            for criterion, path, test in links:
-                if path in missing:
-                    outcome, excerpt = "failed-error", "the test file is not in the PR's head"
-                else:
-                    outcome, excerpt = outcome_of(reports.get(path, {}), path, test)
-                proofs.append(
-                    {
-                        "criterion": criterion,
-                        "path": path,
-                        "test": test,
-                        "outcome": outcome,
-                        "output_excerpt": excerpt[:2000],
-                    }
-                )
+        for criterion, path, test in links:
+            if error:
+                outcome, excerpt = NOT_RUN, error
+            elif path in missing:
+                outcome, excerpt = NOT_RUN, "the test file is not in the PR's head"
+            elif path not in reports:
+                outcome, excerpt = NOT_RUN, "too many test files to run"
+            else:
+                outcome, excerpt = outcome_of(reports[path], path, test)
+            proofs.append(
+                {
+                    "criterion": criterion,
+                    "path": path,
+                    "test": test,
+                    "outcome": outcome,
+                    "output_excerpt": excerpt[:2000],
+                }
+            )
     _output(proofs=json.dumps({"proofs": proofs, "error": error}), proofs_error=error or "none")
-    return 0
+    return 1 if error else 0
 
 
-def _run(cmd: list[str], cwd: Path, timeout: int) -> int:
+def _run(cmd: list[str], cwd: Path, timeout: int, user: str = "", home: Path | None = None) -> int:
+    if user:
+        cmd = [
+            *("sudo", "-n", "-u", user, "--", "env", "-i"),
+            f"PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
+            f"HOME={home}",
+            "CI=true",
+            *cmd,
+        ]
     try:
         return subprocess.run(cmd, cwd=cwd, timeout=timeout).returncode
     except subprocess.TimeoutExpired:
         return 124
+    finally:
+        if user:
+            # Nothing the PR's code started outlives its run.
+            subprocess.run(["sudo", "-n", "-u", user, "--", "kill", "-9", "-1"], check=False)
 
 
 # --- the result -------------------------------------------------------------------
@@ -367,6 +404,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_prepare)
     p = sub.add_parser("proofs")
     p.add_argument("--pilot", required=True)
+    p.add_argument("--work", required=True)
+    p.add_argument("--as-user", default="")
     p.set_defaults(func=cmd_proofs)
     p = sub.add_parser("publish")
     p.add_argument("--out", required=True)

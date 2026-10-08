@@ -17,13 +17,13 @@ import zipfile
 from datetime import timedelta
 from email.message import Message
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from controller.attempts import AttemptGate
 from controller.attempts import events as aev
 from controller.attempts.gate import DispatchRefused
 from controller.interfaces import AttemptId, LaunchOutcome, LaunchResult, LedgerEvent, TaskId
-from controller.loop.collect import NotFound
+from controller.loop.collect import GitHubUnreadable, NotFound
 from controller.review import codex_job
 from controller.review import events as rev
 from controller.review.reviewer import ReviewPolicy, ReviewState
@@ -96,13 +96,20 @@ class Factory:
         self.on_main = {MAIN_SHA: "identical"}
         self.next_id = 9000
         self.calls = []
+        self.compare_down = False
 
     def json(self, path):
         self.calls.append(path)
-        rest = urlsplit(path).path[len(f"repos/{FACTORY_REPO}/") :]
+        parts = urlsplit(path)
+        rest = parts.path[len(f"repos/{FACTORY_REPO}/") :]
         if rest == "actions/workflows/codex-review.yml/runs":
-            return {"workflow_runs": copy.deepcopy(self.runs)}
+            page = int(parse_qs(parts.query).get("page", ["1"])[0])
+            # Newest first, 100 a page, as GitHub lists them.
+            runs = list(reversed(self.runs))[(page - 1) * 100 : page * 100]
+            return {"workflow_runs": copy.deepcopy(runs)}
         if rest.startswith("compare/"):
+            if self.compare_down:
+                raise GitHubUnreadable("compare is down")
             sha = rest[len("compare/") :].split("...")[0]
             return {"status": self.on_main.get(sha, "diverged")}
         if rest.startswith("actions/runs/") and rest.endswith("/artifacts"):
@@ -973,7 +980,8 @@ class JobStepTests(Case):
                 "GITHUB_OUTPUT": str(out),
             }
             with mock.patch.dict(os.environ, env):
-                self.assertEqual(codex_job.main(["proofs", "--pilot", f"{d}/pilot"]), 0)
+                argv = ["proofs", "--pilot", f"{d}/pilot", "--work", f"{d}/work"]
+                self.assertEqual(codex_job.main(argv), 0)
             self.assertIn('{"proofs": [], "error": ""}', out.read_text())
 
     def test_proof_outcomes_come_from_the_test_report(self):
@@ -1008,13 +1016,267 @@ class JobStepTests(Case):
             codex_job.outcome_of(report, path, "filterByStatus > crashes")[0], "failed-error"
         )
         self.assertEqual(codex_job.outcome_of(report, path, "fine")[0], "passed")
-        self.assertEqual(codex_job.outcome_of(report, path, "missing")[0], "failed-error")
-        self.assertEqual(codex_job.outcome_of({}, path, "x")[0], "failed-error")
+        self.assertEqual(codex_job.outcome_of(report, path, "missing")[0], "not-run")
+        self.assertEqual(codex_job.outcome_of({}, path, "x")[0], "not-run")
 
     def test_only_safe_linked_paths_are_run(self):
         out = honest_output("k")
         out["links"].append(dict(out["links"][0], path="../outside.test.ts"))
         out["links"].append(dict(out["links"][0], path="/etc/passwd"))
+        paths = {p for _, p, _ in codex_job.linked_tests(out)}
+        self.assertEqual(paths, {fx.TEST_FILE})
+
+
+# --- the proof step and run selection (follow-up review fixes) --------------------------
+
+
+class ProofAndSelectionTests(Case):
+    def assert_unknown(self, contains="", **finish):
+        return BadResultTests.assert_unknown(self, contains, **finish)
+
+    def key(self):
+        return json.loads(self.text())["key"]
+
+    def test_a_proof_job_that_couldnt_install_is_unknown_even_with_limits(self):
+        self.started()
+        key = self.key()
+        limits = [{"criterion": c, "reason": "Not practical."} for c in ("ac1", "ac2")]
+        error = json.dumps(
+            {"proofs": [], "error": "installing the base commit's dependencies failed"}
+        )
+        self.assert_unknown(
+            "couldn't run",
+            output=honest_output(key, limits=limits),
+            env={"PROOFS": error},
+        )
+
+    def test_a_failed_proof_job_is_unknown_whatever_the_result_says(self):
+        self.started()
+        run = self.gh_run()
+        doc = codex_job.result_document(self.env(self.text(), run))
+        doc["jobs"]["proofs"] = "failure"
+        self.factory.runs.clear()
+        self.factory.next_id -= 1
+        r = self.reviewer(decisions=his_answers)
+        self.finish(doc=doc)
+        status = r.check(ATTEMPT)
+        self.assertIs(status.state, ReviewState.UNKNOWN, status.note)
+        self.assertIn("failure-proof job", status.note)
+
+    def test_a_test_that_wasnt_run_is_unknown_not_a_failure(self):
+        self.started()
+        proofs = [dict(p, outcome="not-run", output_excerpt="timed out") for p in honest_proofs()]
+        self.assert_unknown("wasn't run", proofs=proofs)
+
+    def test_a_linked_test_without_a_proof_is_unknown(self):
+        self.started()
+        self.assert_unknown("no failure proof", proofs=honest_proofs()[:1])
+
+    def test_a_reason_doesnt_replace_a_linked_tests_proof(self):
+        r = self.started()
+        limits = [{"criterion": "ac1", "reason": "Not practical."}]
+        proofs = [
+            dict(p, outcome="passed") if p["criterion"] == "ac1" else p for p in honest_proofs()
+        ]
+        self.finish(output=honest_output(self.key(), limits=limits), proofs=proofs)
+        self.assertIsNot(r.check(ATTEMPT).state, ReviewState.PASSED)
+
+    def test_a_link_to_a_file_that_isnt_a_test_is_unknown(self):
+        self.started()
+        out = honest_output(self.key())
+        out["links"][0] = dict(out["links"][0], path="src/books.ts")
+        self.assert_unknown("not a test file", output=out)
+
+    def test_a_result_from_another_model_or_effort_is_unknown(self):
+        for over in ({"MODEL": "gpt-other"}, {"EFFORT": "low"}):
+            with self.subTest(over=over):
+                self.setUp()
+                self.started()
+                self.assert_unknown("model", env=over)
+
+    def test_a_malformed_limit_is_unknown_not_a_crash(self):
+        self.started()
+        out = honest_output(self.key(), limits=[{"criterion": "ac3", "reason": 5}])
+        self.assert_unknown("limit", output=out)
+        from controller.review.workflow import ResultRequest, output_problem
+
+        req = ResultRequest(self.key(), "r/p", 1, "d", fx.HEAD, "b", "m", (), frozenset(), {})
+        weird = honest_output(self.key(), limits=[{"criterion": "x", "reason": "y", "path": 5}])
+        self.assertIsInstance(output_problem(weird, req), str)
+
+    def test_a_newer_failed_run_doesnt_hide_a_good_one(self):
+        r = self.started()
+        self.finish()
+        self.finish(conclusion="failure")
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.PASSED)
+
+    def test_a_running_rerun_doesnt_hide_a_good_one(self):
+        r = self.started()
+        self.finish()
+        self.gh_run(status="in_progress", conclusion=None)
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.PASSED)
+
+    def test_a_failed_run_with_another_still_going_is_running(self):
+        r = self.started()
+        self.finish(conclusion="failure")
+        self.gh_run(status="in_progress", conclusion=None)
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.RUNNING)
+
+    def test_the_run_is_found_past_the_first_page(self):
+        r = self.started()
+        run, _ = self.finish()
+        others = [
+            dict(run, id=run["id"] + 1 + i, display_title=f"codex-review rv-{i:032x}")
+            for i in range(150)
+        ]
+        self.factory.runs += others
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.PASSED)
+        self.assertTrue(any("page=2" in c for c in self.factory.calls))
+
+    def test_a_listing_too_long_to_read_is_retried_not_unknown(self):
+        r = self.started()
+        run, _ = self.finish()
+        self.factory.runs = [run] + [
+            dict(run, id=run["id"] + 1 + i, display_title="codex-review other") for i in range(600)
+        ]
+        with self.assertRaises(GitHubUnreadable):
+            r.check(ATTEMPT)
+
+    def test_github_trouble_confirming_main_is_retried_not_unknown(self):
+        r = self.started()
+        self.finish()
+        self.factory.compare_down = True
+        with self.assertRaises(GitHubUnreadable):
+            r.check(ATTEMPT)
+        self.factory.compare_down = False
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.PASSED)
+        self.assertEqual(len(self.runtime.texts), 1)
+
+    def test_a_workflow_commit_github_doesnt_know_is_ignored(self):
+        r = self.started()
+        self.finish(head_sha="e" * 40)
+        self.factory.on_main.pop("e" * 40, None)
+        orig = self.factory.json
+
+        def json_404(path):
+            if "/compare/" in path:
+                raise NotFound(path)
+            return orig(path)
+
+        self.factory.json = json_404
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.RUNNING)
+
+
+class ProofStepTests(Case):
+    def pilot(self, d):
+        import subprocess
+
+        pilot = Path(d) / "pilot"
+        (pilot / "tests").mkdir(parents=True)
+        (pilot / "package.json").write_text("{}")
+        (pilot / fx.TEST_FILE).write_text("test")
+        git = ["git", "-C", str(pilot)]
+        subprocess.run([*git, "init", "-q"], check=True)
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run(
+            [*git, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"], check=True
+        )
+        sha = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True)
+        return pilot, sha.stdout.strip()
+
+    def run_proofs(self, d, fake_run):
+        import os
+        from unittest import mock
+
+        pilot, sha = self.pilot(d)
+        out = Path(d) / "gh-output"
+        key = "rv-" + "0" * 32
+        env = {
+            "REQUEST": "x",
+            "KEY": key,
+            "FINAL_MESSAGE": json.dumps(honest_output(key)),
+            "GITHUB_OUTPUT": str(out),
+        }
+        request = {"head": sha, "merge_base": sha}
+        argv = ["proofs", "--pilot", str(pilot), "--work", f"{d}/work"]
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch.object(codex_job, "check_request", return_value=request),
+            mock.patch.object(codex_job, "_run", side_effect=fake_run),
+        ):
+            code = codex_job.main(argv)
+        text = out.read_text()
+        start = text.index("{")
+        return code, json.loads(text[start : text.index("\n", start)])
+
+    def test_a_failed_install_fails_the_step_and_runs_nothing(self):
+        calls = []
+
+        def fake_run(cmd, *a):
+            calls.append(cmd)
+            return 1
+
+        with tempfile.TemporaryDirectory() as d:
+            code, out = self.run_proofs(d, fake_run)
+        self.assertEqual(code, 1)
+        self.assertIn("install", out["error"])
+        self.assertEqual({p["outcome"] for p in out["proofs"]}, {"not-run"})
+        self.assertEqual(len(calls), 1)
+
+    def test_a_test_run_without_a_report_is_not_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, out = self.run_proofs(d, lambda *a: 0)
+        self.assertEqual(code, 0)
+        self.assertEqual({p["outcome"] for p in out["proofs"]}, {"not-run"})
+
+    def test_reports_get_fresh_names_and_are_read_from_that_run(self):
+        names = []
+
+        def fake_run(cmd, cwd, *a):
+            if cmd[0] == "npx":
+                report = Path(cmd[-1].split("=", 1)[1])
+                names.append(report.name)
+                report.write_text(json.dumps({"testResults": []}))
+            return 0
+
+        with tempfile.TemporaryDirectory() as d:
+            self.run_proofs(d, fake_run)
+        self.assertEqual(len(names), 1)
+        self.assertRegex(names[0], r"^\.factory-proof-[0-9a-f]{32}\.json$")
+
+    def test_pr_code_runs_as_the_other_user_with_a_bare_environment(self):
+        from unittest import mock
+
+        seen = []
+
+        def fake(cmd, **kw):
+            seen.append(cmd)
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(codex_job.subprocess, "run", side_effect=fake):
+            codex_job._run(["npm", "ci"], Path("/w"), 5, "prover", Path("/w/home"))
+        self.assertEqual(seen[0][:7], ["sudo", "-n", "-u", "prover", "--", "env", "-i"])
+        self.assertIn("HOME=/w/home", seen[0])
+        self.assertEqual(seen[0][-2:], ["npm", "ci"])
+        self.assertEqual(seen[1], ["sudo", "-n", "-u", "prover", "--", "kill", "-9", "-1"])
+
+    def test_a_file_that_fails_to_load_on_the_base_is_a_failure(self):
+        report = {
+            "testResults": [
+                {
+                    "name": f"/w/{fx.TEST_FILE}",
+                    "status": "failed",
+                    "message": "Failed to load url ../src/books (no export filterByStatus)",
+                    "assertionResults": [],
+                }
+            ]
+        }
+        self.assertEqual(codex_job.outcome_of(report, fx.TEST_FILE, "x")[0], "failed-error")
+
+    def test_only_test_files_are_linked(self):
+        out = honest_output("k")
+        out["links"].append(dict(out["links"][0], path="src/books.ts"))
+        out["links"].append(dict(out["links"][0], path="package.json"))
         paths = {p for _, p, _ in codex_job.linked_tests(out)}
         self.assertEqual(paths, {fx.TEST_FILE})
 
@@ -1090,6 +1352,16 @@ class WorkflowFileTests(unittest.TestCase):
     def test_the_proofs_job_drops_sudo_before_running_pr_code(self):
         proofs = self.jobs()["proofs"]
         self.assertLess(proofs.index("sudo is still available"), proofs.index("codex_job proofs"))
+        self.assertIn('"runner ALL=(prover) NOPASSWD: ALL"', proofs)
+        self.assertIn("--as-user prover", proofs)
+
+    def test_agent_instruction_files_are_removed_before_codex(self):
+        review = self.jobs()["review"]
+        self.assertIn("AGENTS*.md", review)
+        self.assertLess(review.index("-name .codex"), review.index("openai/codex-action@"))
+
+    def test_the_result_is_kept_as_long_as_ci_evidence(self):
+        self.assertIn("retention-days: 90", self.jobs()["publish"])
 
 
 if __name__ == "__main__":
