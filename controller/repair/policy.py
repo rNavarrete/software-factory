@@ -160,8 +160,7 @@ def plan(
     if len(open_) > MAX_FINDINGS or detail_chars(open_) > MAX_DETAIL_CHARS:
         return Stop(
             "too-many-findings",
-            f"the review found {len(open_)} problems, or more detail than a routine repair"
-            " covers",
+            f"the review found {len(open_)} problems, or more detail than a routine repair covers",
             "Look at the PR; repair it by hand or close the attempt.",
         )
     nxt = attempts_used + 1
