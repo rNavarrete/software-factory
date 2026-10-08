@@ -57,6 +57,8 @@ _KEYS = {
     "allowed_actions",
     "checks",
     "max_attempts",
+    "repair_allowance",
+    "repair_allowance_since",
     "status_issue_id",
     "issues",
     "skip_labels",
@@ -88,6 +90,11 @@ class Project:
     """Tickets with any of these labels never start (ENG-174)."""
     protected_paths: frozenset[str] = frozenset()
     """Paths a Todo move alone can't approve a change to (ENG-174)."""
+    repair_allowance: int = 0
+    """Corrections included in the total attempt budget (ENG-160), not extra
+    attempts. Recording this allowance does not enable automatic dispatch."""
+    repair_allowance_since: datetime | None = None
+    """Only Todo moves at or after this policy activation may include repairs."""
 
     def as_mapping(self) -> Mapping[str, object]:
         return {
@@ -99,6 +106,10 @@ class Project:
             "allowed_actions": sorted(self.allowed_actions),
             "checks": sorted(self.checks),
             "max_attempts": self.max_attempts,
+            "repair_allowance": self.repair_allowance,
+            "repair_allowance_since": (
+                self.repair_allowance_since.isoformat() if self.repair_allowance_since else None
+            ),
         }
 
     def contract_problems(self, contract: Mapping[str, object], task: str) -> list[str]:
@@ -250,6 +261,21 @@ def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
         cap = PILOT_LIMITS.attempts_per_task
         if isinstance(budget, bool) or not isinstance(budget, int) or not 1 <= budget <= cap:
             raise OnboardingError(f"{where}: max_attempts must be 1..{cap}")
+        repairs = e.get("repair_allowance", 0)
+        if type(repairs) is not int or not 0 <= repairs < budget:
+            raise OnboardingError(f"{where}: repair_allowance must be 0..{budget - 1}")
+        repair_since = e.get("repair_allowance_since")
+        if repair_since is not None or repairs:
+            try:
+                repair_since = (
+                    datetime.fromisoformat(repair_since) if isinstance(repair_since, str) else None
+                )
+            except ValueError:
+                repair_since = None
+            if repair_since is None or repair_since.tzinfo is None:
+                raise OnboardingError(
+                    f"{where}: repair_allowance_since must be an ISO time with a time zone"
+                )
         status = e.get("status_issue_id")
         if status is not None and (not isinstance(status, str) or not status.strip()):
             raise OnboardingError(f"{where}: status_issue_id must be text")
@@ -281,6 +307,8 @@ def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
             issues,
             skip or frozenset(),
             protected or frozenset(),
+            repairs,
+            repair_since,
         )
     return Onboarding(projects, hashlib.sha256(raw).hexdigest(), enabled, approver, since)
 

@@ -73,6 +73,38 @@ Rolando's typed approval over `fly ssh console` still works and always counts.
 
 What the Todo move does not check: the signer can't judge whether the drafted goal and acceptance criteria match the ticket, and it doesn't check the base commit (the dispatcher refuses one that isn't on main). Inside the limits above, the Todo move approves whatever the factory drafted from that ticket. The independent review (ENG-156), CI and Rolando's merge are the checks on the result.
 
+### Repair allowance recorded with the move (ENG-160, first part)
+
+Onboarding can now declare `repair_allowance`, default **0**. It counts corrections
+inside `max_attempts`, not on top of it: three total attempts allow at most two
+repairs. The signer further reduces the recorded allowance if the specific
+contract has a smaller attempt budget. Neither ticket text nor the drafting
+model chooses this number.
+
+A positive allowance also requires `repair_allowance_since`, an ISO timestamp
+with a time zone. Set this to the activation time whenever establishing or
+changing repair terms; do not backdate it. A Todo move before that time is
+refused, even if the factory is only now reading it. Rolando must make a new
+move to accept the new terms.
+
+The signer includes the allowance in the signature alongside the task digest,
+source revision and policy hash. It saves the move's terms durably before
+returning a signature. Renewal extends the expiry, never the allowance. Changing
+a positive allowance's policy or source revision requires a new move. Legacy
+digest-only move records remain valid for zero repairs and cannot be upgraded.
+Old signed records without this field still verify but carry no allowance.
+The new move records are objects; rolling back to an older signer refuses them
+rather than accepting different terms. Preserve the signer's state file.
+
+**This records the terms; it does not enable automatic repairs.** The current
+dispatcher still requires a typed repair go-ahead and qualified writer-clearing
+evidence. The pilot configuration remains at zero. ENG-160 still needs the
+independent failure handoff from ENG-156, bounded dispatch and new-candidate
+verification, followed by the live successful/capped repair demonstrations.
+Future repair dispatch must recheck current policy, source standing, expiry,
+revocation and remaining total attempts under the existing launch lock; the
+presence of a signed allowance alone is insufficient.
+
 ## Before switching intake on
 
 1. The factory has its own Linear identity, and its key is set as `linear-key`.
