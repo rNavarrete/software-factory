@@ -1,22 +1,19 @@
 """Starting one review job (ENG-156).
 
-A review job is a fresh, scoped session that reviews one exact revision of one
-worker PR and posts its result as a single comment on the PR, as the reviewer's
-own GitHub account. It has no write access to the repository: on a public repo
-any account can comment, so the reviewer account needs no permission at all,
-and so it can't push, approve, merge or release (docs/review.md has the setup).
+A review job reviews one exact revision of one worker PR. It runs as one
+dispatch of the factory's protected Codex review workflow
+(``controller.review.workflow.WorkflowDispatchRuntime``); the result is read
+back from that run, never from a PR comment.
 
-``ReviewRuntime`` is how the reviewer starts a job. ``RoutineReviewRuntime``
-fires the reviewer's own cloud routine (a separate routine and start key from
-the worker's, ideally on a separate account). A future adapter from the worker
-pool (ENG-154) can stand in, as long as it keeps the same rules: one launch per
-call, never a retry, and an answer of launched, not-launched or
-launch-outcome-unknown decided by HTTP status alone.
+``ReviewRuntime`` is how the reviewer starts a job. Any runtime keeps the same
+rules: one launch per call, never a retry, and an answer of launched,
+not-launched or launch-outcome-unknown. A future adapter from the worker pool
+(ENG-154) can stand in on the same terms.
 
-The job's instructions travel as a JSON envelope (``review_text``) holding the
-contract, the exact revision and, on a verification pass, the findings it must
-check. The routine's saved prompt (reviewer_prompt.md) checks the envelope
-again before doing anything.
+The job's request travels as a JSON envelope (``review_text``) holding the
+contract, the exact revision, the trusted CI results and, on a verification
+pass, the findings it must check. The workflow checks the envelope again
+before doing anything (``controller.review.codex_job``).
 """
 
 from __future__ import annotations
@@ -26,7 +23,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from controller.adapter.routine import RoutineAdapter
 from controller.contract import canonical_bytes
 from controller.interfaces import MAX_FIRE_TEXT_CHARS, LaunchResult
 
@@ -97,35 +93,10 @@ class ReviewRuntime(Protocol):
         ...
 
 
-class RoutineReviewRuntime:
-    """The reviewer's cloud routine, fired the same way as the worker's.
-
-    Uses the routine adapter's single POST (``RoutineAdapter._post``) without
-    its worker-envelope check, which describes a worker run, not a review.
-    The review envelope is checked here instead.
-    """
-
-    def __init__(self, adapter: RoutineAdapter) -> None:
-        self._adapter = adapter
-
-    @property
-    def routine(self) -> str:
-        return self._adapter.trig_id
-
-    def launch(self, text: str) -> LaunchResult:
-        data = json.loads(text)
-        if not isinstance(data, dict) or data.get("envelope") != ENVELOPE:
-            raise ValueError("not a review job envelope")
-        if len(text) > MAX_FIRE_TEXT_CHARS:
-            raise ReviewTooLarge("review job text is too long")
-        return self._adapter._post(text)
-
-
 __all__ = [
     "ENVELOPE",
     "ReviewJob",
     "ReviewRuntime",
     "ReviewTooLarge",
-    "RoutineReviewRuntime",
     "review_text",
 ]

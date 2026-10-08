@@ -55,7 +55,7 @@ Switching it on belongs to the qualification run (ENG-163), after the factory ha
 
 ## Secrets
 
-There are four secrets. Each is scoped to one job, and none is a copy of Rolando's own credentials:
+There are five secrets. Each is scoped to one job, and none is a copy of Rolando's own credentials:
 
 | Name | What it can do | Made where |
 |---|---|---|
@@ -63,7 +63,7 @@ There are four secrets. Each is scoped to one job, and none is a copy of Rolando
 | `github-token` | Reads the pilot repo (contents, pull requests, metadata, and Actions for the reviewer's CI evidence). It cannot write | A fine-grained GitHub token limited to that one repository |
 | `routine-token` | Starts the factory routine, nothing else | The routine's own start key. Not needed until real workers start |
 | `linear-key` | Reads Todo moves and ticket text, and posts the factory's comments (ENG-174, 175, 178) | The factory's own Linear login, never Rolando's. Needed only for live mode |
-| `reviewer-token` | Starts the reviewer routine, nothing else (ENG-156) | The reviewer routine's own start key, on the reviewer's claude.ai account. Set by `deploy/fly/setup-reviewer.sh` |
+| `review-token` | Starts and reads the Codex review workflow in the factory repo, nothing else (ENG-156). It can't change code in either repo | A fine-grained GitHub token limited to `software-factory`, with Actions read and write and Contents read. Set by `deploy/fly/setup-reviewer.sh` |
 
 They are set with `fly secrets`. Fly encrypts them and they can't be read back from the command line. When the machine starts, `deploy/fly/entrypoint.sh` moves them out of the environment into files at `/run/factory-secrets/`. The folder is mode 0700 and each file is mode 0400. Child processes therefore never inherit them. `FileSecrets` refuses any file that is a symlink, belongs to another user, or can be read by group or others (`controller/service/secrets.py`). The ledger redacts anything that looks like a token, and no secret is ever logged.
 

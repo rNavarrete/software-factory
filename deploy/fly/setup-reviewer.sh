@@ -1,49 +1,71 @@
 #!/bin/sh
-# Turns on the factory's independent reviewer (ENG-156, docs/review.md).
+# Turns on the factory's independent Codex review (ENG-156, docs/review.md).
 # Run from the root of the software-factory checkout, on main, after the
-# reviewer's GitHub account and its claude.ai routine exist. Safe to run
-# again: steps already done are skipped. It stops only where you must act:
-#   1. typing the reviewer's GitHub login and the routine's trig_ id,
-#   2. pasting the routine's start key (hidden, never shown or saved).
+# review workflow is merged. Safe to run again: steps already done are
+# skipped. It stops only where you must act:
+#   1. pasting the OpenAI API key (hidden; it goes straight into GitHub),
+#   2. pasting the factory's review token (hidden; it goes straight into Fly).
+# Needs: gh (signed in as you) and fly (signed in), both on this Mac.
 set -eu
 PATH="$HOME/.fly/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 APP=rnavarrete-factory
+REPO=rNavarrete/software-factory
+ENV=codex-review
+# The model is a setting, not code. Check it is on OpenAI's Codex model list
+# (https://learn.chatgpt.com/docs/models) before turning the review on.
+MODEL="${MODEL:-gpt-6.1-sol}"
 
-if [ ! -f deploy/fly/fly.toml ]; then
-    echo "Run this from the root of the software-factory folder." >&2
+if [ ! -f deploy/fly/fly.toml ] || [ ! -f .github/workflows/codex-review.yml ]; then
+    echo "Run this from the root of the software-factory folder, on main." >&2
     exit 1
+fi
+gh auth status >/dev/null 2>&1 || { echo "Sign in to gh first: gh auth login" >&2; exit 1; }
+ME=$(gh api user --jq .login)
+
+hidden() {
+    stty -echo </dev/tty
+    read -r VALUE </dev/tty
+    stty echo </dev/tty
+    echo
+}
+
+echo "== GitHub: the review's protected environment (only main can use it)"
+if ! gh api "repos/$REPO/environments/$ENV" >/dev/null 2>&1; then
+    gh api -X PUT "repos/$REPO/environments/$ENV" --silent \
+        -F 'deployment_branch_policy[protected_branches]=false' \
+        -F 'deployment_branch_policy[custom_branch_policies]=true'
+    gh api -X POST "repos/$REPO/environments/$ENV/deployment-branch-policies" --silent \
+        -f name=main -f type=branch
+fi
+
+echo "== GitHub: the OpenAI API key, kept only in that environment"
+if ! gh secret list --repo "$REPO" --env "$ENV" | grep -q '^OPENAI_API_KEY'; then
+    echo "Paste the OpenAI API key and press Enter (nothing will show):"
+    hidden
+    printf '%s' "$VALUE" | gh secret set OPENAI_API_KEY --repo "$REPO" --env "$ENV"
+    unset VALUE
 fi
 
 have() { fly secrets list --app "$APP" | grep -q "$1"; }
 
-echo "== Reviewer GitHub account"
-if ! have FACTORY_REVIEWER_LOGIN; then
-    printf "The reviewer's GitHub login (the new account, not yours or the bot's): "
-    read -r LOGIN </dev/tty
-    # Checks it's a plain user with no write access to the pilot repo.
-    python3 -m controller.review qualify-identity "$LOGIN"
-    printf 'FACTORY_REVIEWER_LOGIN=%s\n' "$LOGIN" | fly secrets import --app "$APP" --stage
+echo "== Fly: who starts reviews, and which model"
+if ! have FACTORY_REVIEW_DISPATCHER; then
+    printf 'FACTORY_REVIEW_DISPATCHER=%s\n' "$ME" | fly secrets import --app "$APP" --stage
+fi
+if ! have FACTORY_REVIEW_MODEL; then
+    printf 'FACTORY_REVIEW_MODEL=%s\n' "$MODEL" | fly secrets import --app "$APP" --stage
 fi
 
-echo "== Reviewer routine"
-if ! have FACTORY_REVIEWER_ROUTINE; then
-    printf "The reviewer routine's id (starts with trig_): "
-    read -r ROUTINE </dev/tty
-    case "$ROUTINE" in
-        trig_*) ;;
-        *) echo "That doesn't start with trig_." >&2; exit 1 ;;
+echo "== Fly: the factory's review token"
+if ! have FACTORY_REVIEW_TOKEN; then
+    echo "Paste the review token (github_pat_...) and press Enter (nothing will show):"
+    hidden
+    case "$VALUE" in
+        github_pat_*) ;;
+        *) echo "That isn't a fine-grained GitHub token." >&2; exit 1 ;;
     esac
-    printf 'FACTORY_REVIEWER_ROUTINE=%s\n' "$ROUTINE" | fly secrets import --app "$APP" --stage
-fi
-
-echo "== Reviewer start key"
-if ! have FACTORY_REVIEWER_TOKEN; then
-    echo "Paste the reviewer routine's start key and press Enter (nothing will show):"
-    stty -echo </dev/tty
-    read -r TOKEN </dev/tty
-    stty echo </dev/tty
-    printf 'FACTORY_REVIEWER_TOKEN=%s\n' "$TOKEN" | fly secrets import --app "$APP" --stage
-    unset TOKEN
+    printf 'FACTORY_REVIEW_TOKEN=%s\n' "$VALUE" | fly secrets import --app "$APP" --stage
+    unset VALUE
 fi
 
 echo "== Deploy (one machine only)"
@@ -51,4 +73,4 @@ fly deploy . --app "$APP" --config deploy/fly/fly.toml \
     --dockerfile deploy/fly/Dockerfile --ha=false
 
 echo
-echo "Done. The reviewer starts on the next worker PR. Nothing has been fired."
+echo "Done. Reviews start on the next worker PR. Nothing has been run or paid for yet."
