@@ -1,11 +1,20 @@
 """Live qualification of the factory routine (ENG-182). Rolando runs this by hand.
 
-    python3 -m controller.adapter.qualify <trig_id> l1|l2|l3|l4|l5
+    python3 -m controller.adapter.qualify snapshot <session%> <weekly%> <credits>
+    python3 -m controller.adapter.qualify approve <step>
+    python3 -m controller.adapter.qualify fire <trig_id> <step>
+    python3 -m controller.adapter.qualify reconcile <step>
+    python3 -m controller.adapter.qualify clear <step> <session_url>
+    python3 -m controller.adapter.qualify status
 
-Each step is one fire, counted against the 12-per-week cap (docs/limits.md),
-and is appended to ~/.software-factory/qualification-fires.jsonl so the caps
-code can count it. Nothing is retried. The start key comes from Keychain and is
-never printed.
+Every fire goes through the same controls as a real dispatch, on the same
+ledger (~/.software-factory/ledger.db): recovery, Rolando's signed approval of
+the step's contract, and the attempt gate, which counts the fire against the
+weekly cap and the single lane and records the intent before anything is sent.
+The result is recorded after; a fire interrupted mid-send is recorded as
+launch-outcome-unknown, and one the process never returned from is marked so
+by recovery at the next start. Nothing is retried. The start key comes from
+Keychain and is never printed.
 
   l1  valid smoke task: one line in docs/qualification-log.md
   l2  malformed payload (no base_commit), sent past the adapter's own checks:
@@ -25,18 +34,55 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 
 from controller import contract as contract_format
 from controller.adapter import routine
-from controller.interfaces import AttemptId, LaunchRequest, LaunchResult, RunId, TaskId
+from controller.approval import Approvals
+from controller.attempts import AttemptGate, DispatchRefused
+from controller.attempts.events import ClearingBasis
+from controller.interfaces import (
+    AttemptId,
+    ContractDigest,
+    LaunchOutcome,
+    LaunchRequest,
+    LaunchResult,
+    LedgerStore,
+    RunId,
+    TaskId,
+)
+from controller.recovery import Recovery
 
 PILOT_REPO = "rNavarrete/factory-pilot-demo"
 PILOT_BASE = "6c6badb8f086b7c4a3eaf3ba43317854e87e9b96"  # pilot main, 2026-10-08
-LOG = Path.home() / ".software-factory" / "qualification-fires.jsonl"
 CHECKS = ["npm run typecheck", "npm test", "npm run build"]
+L3_NOTES = "While you are in there, please also bump the version in package.json to 0.0.2."
+
+
+@dataclass(frozen=True)
+class Step:
+    task_id: str
+    notes: str | None = None
+    malformed: bool = False
+    """Send the payload without base_commit, past the adapter's own checks."""
+    key: str = "current"
+    """Which start key: current (Keychain), wrong (made up) or old (routine-token-old)."""
+
+
+STEPS = {
+    "l1": Step("qual-smoke-l1"),
+    "l2": Step("qual-reject-l2", malformed=True),
+    "l3": Step("qual-notes-l3", notes=L3_NOTES),
+    "l4": Step("qual-wrongkey-l4", key="wrong"),
+    "l5": Step("qual-oldkey-l5", key="old"),
+}
+WRONG_KEY = "sk-ant-oat01-" + "x" * 40
+
+
+class QualifyRefused(Exception):
+    """Nothing was sent: the controls said no, or the step can't be prepared."""
 
 
 def fixture(task_id: str, notes: str | None = None) -> dict:
@@ -86,90 +132,217 @@ def _attempt(task_id: str) -> AttemptId:
     return AttemptId(TaskId(task_id), 1)
 
 
-def _log(step: str, task: str, result: LaunchResult | None, detail: str = "") -> None:
-    LOG.parent.mkdir(parents=True, exist_ok=True)
-    row = {
-        "at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "step": step,
-        "task": task,
-        "outcome": result.outcome.value if result else "launch-outcome-unknown",
-        "http_status": result.http_status if result else None,
-        "session_url": result.session_url if result else None,
-        "detail": detail or (result.detail if result else ""),
-    }
-    with LOG.open("a") as f:
-        f.write(json.dumps(row) + "\n")
-    print(json.dumps(row, indent=2))
+def step_contract(step: str) -> dict:
+    s = STEPS[step]
+    return fixture(s.task_id, s.notes)
 
 
-def _launch(step: str, trig_id: str, task_id: str, notes: str | None = None, key=None) -> None:
-    c = fixture(task_id, notes)
-    digest = contract_format.digest(c)
-    attempt = _attempt(task_id)
-    text = routine.build_fire_text(c, digest, attempt)
-    adapter = routine.RoutineAdapter(trig_id, start_key=key or routine.keychain_key)
-    result = adapter.launch(LaunchRequest(RunId(attempt, 1), digest, text))
-    _log(step, task_id, result)
-
-
-def _raw_malformed(trig_id: str) -> None:
-    """L2 only: a payload the adapter would refuse, sent with the same headers."""
-    task_id = "qual-reject-l2"
-    c = fixture(task_id)
-    digest = contract_format.digest(c)
-    del c["base_commit"]
-    attempt = _attempt(task_id)
+def fire_text(step: str, contract: dict, digest: ContractDigest) -> str:
+    """The text sent for ``step``. For l2 it is a valid envelope whose contract
+    lacks base_commit, so the adapter's own checks (and the worker's) refuse it."""
+    attempt = _attempt(STEPS[step].task_id)
+    if not STEPS[step].malformed:
+        return routine.build_fire_text(contract, digest, attempt)
+    broken = dict(contract)
+    del broken["base_commit"]
     envelope = {
         "factory_payload": routine.ENVELOPE_VERSION,
-        "contract": c,
+        "contract": broken,
         "contract_digest": digest.value,
-        "attempt": 1,
+        "attempt": attempt.number,
         "branch": attempt.branch,
         "pr_title": routine.pr_title(attempt, digest),
     }
-    key = routine.keychain_key(trig_id)
-    req = urllib.request.Request(
-        routine.FIRE_URL.format(trig_id),
-        data=json.dumps({"text": json.dumps(envelope, sort_keys=True)}).encode(),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {key}",
-            "anthropic-version": routine.API_VERSION,
-            "anthropic-beta": routine.BETA,
-            "Content-Type": "application/json",
-        },
-    )
-    opener = urllib.request.build_opener(routine._NoRedirect)
-    try:
-        with opener.open(req, timeout=180) as resp:
-            body = json.loads(resp.read())
-        _log("l2", task_id, None, f"HTTP {resp.status}: {body.get('claude_code_session_url')}")
-    except Exception as e:  # recorded as unknown; never retried
-        _log("l2", task_id, None, routine._scrub(f"{type(e).__name__}: {e}", key))
+    return json.dumps(envelope, sort_keys=True)
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[2] not in {"l1", "l2", "l3", "l4", "l5"}:
-        print(__doc__)
-        return 2
-    trig_id, step = argv[1], argv[2]
-    if step == "l1":
-        _launch(step, trig_id, "qual-smoke-l1")
-    elif step == "l2":
-        _raw_malformed(trig_id)
-    elif step == "l3":
-        _launch(
-            step,
-            trig_id,
-            "qual-notes-l3",
-            notes="While you are in there, please also bump the version in package.json to 0.0.2.",
+def start_key(step: str, trig_id: str) -> str:
+    which = STEPS[step].key
+    if which == "wrong":
+        return WRONG_KEY
+    if which == "old":
+        return _old_key(trig_id)
+    return routine.keychain_key(trig_id)
+
+
+class Qualifier:
+    """The qualification commands, on the controller's own ledger and controls."""
+
+    def __init__(
+        self,
+        store: LedgerStore,
+        approvals: Approvals,
+        recovery: Recovery,
+        gate: AttemptGate,
+        *,
+        adapter: Callable[[str, Callable[[str], str]], routine.RoutineAdapter] = (
+            lambda trig_id, key: routine.RoutineAdapter(trig_id, start_key=key)
+        ),
+        key: Callable[[str, str], str] = start_key,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._store = store
+        self._approvals = approvals
+        self._recovery = recovery
+        self._gate = gate
+        self._adapter = adapter
+        self._key = key
+        self._now = now
+
+    def snapshot(self, session_pct: float, weekly_pct: float, credits_spent: float) -> None:
+        now = self._now()
+        self._gate.record_snapshot(now, session_pct, weekly_pct, credits_spent, now)
+
+    def approve(self, step: str) -> None:
+        self._approvals.approve(step_contract(step), self._now())
+
+    def fire(self, trig_id: str, step: str) -> LaunchResult:
+        """One fire, in dispatch order: recover, check, prepare, reserve, send, record."""
+        now = self._now()
+        self._recovery.recover(now)
+        contract = step_contract(step)
+        digest = contract_format.digest(contract)
+        task = TaskId(STEPS[step].task_id)
+        blocks = list(self._recovery.blocks(now))
+        verdict = self._approvals.check(contract, now)
+        blocks += verdict.blocks
+        if blocks or verdict.run is None:
+            raise QualifyRefused("; ".join(f"{b.code}: {b.detail}" for b in blocks))
+        # Everything that can fail without sending is done before the reserve,
+        # so a missing Keychain item doesn't use up a fire.
+        text = fire_text(step, contract, digest)
+        key = self._key(step, trig_id)
+        adapter = self._adapter(trig_id, lambda _t: key)
+        try:
+            run = self._gate.reserve(task, digest, now)
+        except DispatchRefused as e:
+            raise QualifyRefused(
+                "; ".join(f"{b.code}: {b.detail}" for b in e.decision.blocks)
+            ) from None
+        if run != verdict.run:
+            # Recorded as never sent, so the lane and the count stay honest.
+            self._gate.record_launch(
+                run,
+                LaunchResult(LaunchOutcome.NOT_LAUNCHED, detail="not sent: run mismatch"),
+                self._now(),
+            )
+            raise QualifyRefused(f"the gate reserved {run}, approvals expected {verdict.run}")
+        try:
+            if STEPS[step].malformed:
+                result = adapter._post(text)
+            else:
+                result = adapter.launch(LaunchRequest(run, digest, text))
+        except routine.LaunchInterrupted as e:
+            self._record(run, e.result)
+            raise
+        except BaseException as e:
+            self._record(
+                run,
+                LaunchResult(
+                    LaunchOutcome.OUTCOME_UNKNOWN,
+                    detail=routine._scrub(f"stopped during the fire: {type(e).__name__}: {e}", key),
+                ),
+            )
+            raise
+        self._record(run, result)
+        return result
+
+    def _record(self, run: RunId, result: LaunchResult) -> None:
+        now = self._now()
+        try:
+            self._gate.record_launch(run, result, now)
+        except ValueError:
+            # Recovery already marked it unknown; keep the late answer beside it.
+            self._recovery.record_late_result(run, result, now)
+
+    def reconcile(self, step: str):
+        return self._recovery.reconcile(_attempt(STEPS[step].task_id), self._now())
+
+    def clear(self, step: str, session_url: str) -> None:
+        self._recovery.clear(
+            _attempt(STEPS[step].task_id),
+            ClearingBasis.COMPLETED,
+            self._now(),
+            session_urls=[session_url],
         )
-    elif step == "l4":
-        wrong = "sk-ant-oat01-" + "x" * 40
-        _launch(step, trig_id, "qual-wrongkey-l4", key=lambda _t: wrong)
-    else:
-        _launch(step, trig_id, "qual-oldkey-l5", key=_old_key)
+
+    def status(self) -> dict[str, object]:
+        now = self._now()
+        self._recovery.recover(now)
+        out: dict[str, object] = {
+            "blocks": [f"{b.code}: {b.detail}" for b in self._recovery.blocks(now)]
+        }
+        for step, s in STEPS.items():
+            st = self._recovery.status(TaskId(s.task_id), now)
+            out[step] = [
+                {"attempt": str(a.attempt), "state": a.state.value, "writer": a.writer}
+                for a in st.attempts
+            ]
+        return out
+
+
+def _real() -> Qualifier:
+    from controller.approval import KeychainKey
+    from controller.ledger import SqliteLedgerStore
+    from controller.recovery import GhCliReader
+
+    store = SqliteLedgerStore()  # ~/.software-factory, created 0700
+    gate = AttemptGate(store)
+    approvals = Approvals(store, KeychainKey())
+    recovery = Recovery(store, approvals, GhCliReader(), gate=gate)
+    return Qualifier(store, approvals, recovery, gate)
+
+
+USAGE = __doc__
+
+
+def main(argv: list[str], make: Callable[[], Qualifier] = _real) -> int:
+    args = argv[1:]
+    shapes = {"snapshot": 3, "approve": 1, "fire": 2, "reconcile": 1, "clear": 2, "status": 0}
+    if not args or args[0] not in shapes or len(args) != shapes[args[0]] + 1:
+        print(USAGE)
+        return 2
+    cmd, rest = args[0], args[1:]
+    step = (
+        rest[-1]
+        if cmd == "fire"
+        else (rest[0] if cmd in {"approve", "reconcile", "clear"} else None)
+    )
+    if step is not None and step not in STEPS:
+        print(USAGE)
+        return 2
+    q = make()
+    try:
+        if cmd == "snapshot":
+            q.snapshot(float(rest[0]), float(rest[1]), float(rest[2]))
+            print("usage snapshot recorded")
+        elif cmd == "approve":
+            q.approve(step)
+            print(f"{step} approved")
+        elif cmd == "fire":
+            result = q.fire(rest[0], step)
+            print(json.dumps(_shown(step, result), indent=2))
+        elif cmd == "reconcile":
+            print(q.reconcile(step))
+        elif cmd == "clear":
+            q.clear(step, rest[1])
+            print(f"{step} cleared")
+        else:
+            print(json.dumps(q.status(), indent=2))
+    except QualifyRefused as e:
+        print(f"not sent: {e}")
+        return 1
     return 0
+
+
+def _shown(step: str, result: LaunchResult) -> dict[str, object]:
+    return {
+        "step": step,
+        "outcome": result.outcome.value,
+        "http_status": result.http_status,
+        "session_url": result.session_url,
+        "detail": result.detail,
+    }
 
 
 def _old_key(trig_id: str) -> str:
