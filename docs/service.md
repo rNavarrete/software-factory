@@ -2,7 +2,7 @@
 
 The factory now runs on a small always-on machine instead of Rolando's laptop. The machine watches for work, starts one worker at a time through the same checks the terminal commands use, and keeps the factory's record. Rolando's laptop can be closed or asleep.
 
-This is the foundation from ENG-194. Reading Todo moves from Linear (ENG-174), drafting the task contract (ENG-175), posting progress in Linear (ENG-178), automatic review (ENG-156) and repairs (ENG-160) plug into it. Until they land, the service runs a qualification fixture with a fake worker, so it never starts a real worker.
+This is the foundation from ENG-194. Reading Todo moves from Linear (ENG-174), drafting the task contract (ENG-175) and posting progress in Linear (ENG-178) are wired in and run together in live mode (below). Automatic review (ENG-156) and repairs (ENG-160) still use fixtures. For now the machine still runs a qualification fixture with a fake worker, so it never starts a real worker.
 
 ## Where it runs
 
@@ -28,7 +28,30 @@ Everything is on the machine's volume under `$HOME/.software-factory/`, which is
 
 The worker never sees any of this. It runs in Anthropic's cloud and receives only the fire text, which holds the contract and the markers. It has no way to reach the machine.
 
-For now, `HOME` is `/data/qualification`, so the qualification run's fake worker has its own ledger and never counts against the real fire limits. The real service will use `/data/factory`, which means changing `HOME` in `deploy/fly/Dockerfile` and `deploy/fly/factory`.
+For now, `HOME` is `/data/qualification`, so the qualification run's fake worker has its own ledger and never counts against the real fire limits. Live mode uses `/data/factory`. The start script records which home is in use in `/run/factory-home`, and `/app/factory` reads it, so Rolando's commands over `fly ssh console` always act on the running service's ledger.
+
+## Live mode
+
+`FACTORY_MODE` decides what the start script runs. When it is unset, the script runs the qualification fixture, as it always has. With `FACTORY_MODE=live` it runs `python3 -m controller.service run --live --real-runtime` with the pilot's onboarding file (`deploy/pilot/onboarding.json`). That means:
+
+- Todo moves come from Linear (ENG-174), and the signer turns Rolando's verified moves into approvals.
+- Contracts are drafted from the ticket text with `deploy/pilot/drafting.json`, from the newest main commit that passed CI (ENG-175).
+- Progress, questions and refusals are posted on the tickets as the factory's own Linear user (ENG-178).
+
+The pilot's onboarding file ships with `intake_enabled: false`, so the live service refuses every Todo move, says so on the ticket, and starts nothing until that file says otherwise.
+
+Before its first round, the live service checks what it needs. It does not start, and says why, if any of these is missing or wrong:
+
+- the `linear-key` or `github-token` secret;
+- the signer, which must actually answer on its socket;
+- the onboarding file, which must be readable and name the approver (the same one as `--approver-linear-id`) and the time intake reads from;
+- the drafting policy, which needs an entry with the same base branch for every onboarded project.
+
+These checks ask only local files and the signer, never Linear or GitHub.
+
+While it runs, the factory's Linear key is checked before every request against everyone it must never act as: Rolando, and whoever the onboarding file has named as approver since the service started. If the file is changed to name another user, that user's key stops working for posting too, not just for intake.
+
+Switching it on belongs to the qualification run (ENG-163), after the factory has its own Linear login and the probe in `docs/reporting.md` has passed.
 
 ## Secrets
 
@@ -39,7 +62,7 @@ There are four secrets. Each is scoped to one job, and none is a copy of Rolando
 | `approval-key` | Signs and checks decision records in this machine's ledger | Generated straight into Fly's secret store. It is a new key, not the Mac's Keychain key |
 | `github-token` | Reads the pilot repo (contents, pull requests, metadata, and Actions for the reviewer's CI evidence). It cannot write | A fine-grained GitHub token limited to that one repository |
 | `routine-token` | Starts the factory routine, nothing else | The routine's own start key. Not needed until real workers start |
-| `linear-key` | Linear access for ENG-174 and ENG-178 | Not needed yet |
+| `linear-key` | Reads Todo moves and ticket text, and posts the factory's comments (ENG-174, 175, 178) | The factory's own Linear login, never Rolando's. Needed only for live mode |
 | `reviewer-token` | Starts the reviewer routine, nothing else (ENG-156) | The reviewer routine's own start key, on the reviewer's claude.ai account. Set by `deploy/fly/setup-reviewer.sh` |
 
 They are set with `fly secrets`. Fly encrypts them and they can't be read back from the command line. When the machine starts, `deploy/fly/entrypoint.sh` moves them out of the environment into files at `/run/factory-secrets/`. The folder is mode 0700 and each file is mode 0400. Child processes therefore never inherit them. `FileSecrets` refuses any file that is a symlink, belongs to another user, or can be read by group or others (`controller/service/secrets.py`). The ledger redacts anything that looks like a token, and no secret is ever logged.
@@ -76,6 +99,7 @@ The service never approves, merges or releases anything, and it never signs a de
 - `linear_project_id`, `name`
 - `repository` and `routine_id`. In v1 these must be the pilot repo and the factory routine, and any other value refuses the whole file.
 - `allowed_actions`, `checks` and `max_attempts`. These are the most a drafted contract may ask for. A contract that names another repository, another task, a new action, a new check or a bigger budget is refused before dispatch.
+- `repair_allowance` (default zero) records how many of those attempts may be corrections. A positive value needs `repair_allowance_since`, the policy activation timestamp; only later Todo moves may acquire it. This is signed groundwork for ENG-160 and does not enable automatic repair. See [repair terms](intake.md#repair-allowance-recorded-with-the-move-eng-160-first-part).
 - `status_issue_id`: a Linear ticket for notices that concern the whole factory, such as outages and pause.
 - `intake_enabled` (top level). This is off unless set. While it is off, every Todo move is refused, and only work already queued continues. It stays off until the full path is qualified (ENG-163).
 

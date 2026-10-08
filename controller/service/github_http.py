@@ -67,6 +67,25 @@ class HttpGhRunner:
             raise OSError(f"GitHub request failed: {type(e).__name__}") from None
 
 
+def as_bytes(
+    run: Callable[..., subprocess.CompletedProcess],
+) -> Callable[..., subprocess.CompletedProcess]:
+    """``run`` for readers that expect ``gh``'s raw bytes (``GhApi``), where
+    ``HttpGhRunner`` answers with text like ``gh --jq`` would."""
+
+    def call(argv: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess:
+        r = run(argv, **kwargs)
+        out, err = r.stdout, r.stderr
+        return subprocess.CompletedProcess(
+            r.args,
+            r.returncode,
+            out.encode() if isinstance(out, str) else out,
+            err.encode() if isinstance(err, str) else err,
+        )
+
+    return call
+
+
 def _message(e: urllib.error.HTTPError, token: str) -> str:
     try:
         raw = e.read().decode("utf-8", "replace")
@@ -168,4 +187,4 @@ def _unreadable(text: str) -> Exception:
     return GitHubUnreadable(text)
 
 
-__all__ = ["HttpGhRunner", "HttpGitHubApi"]
+__all__ = ["HttpGhRunner", "HttpGitHubApi", "as_bytes"]

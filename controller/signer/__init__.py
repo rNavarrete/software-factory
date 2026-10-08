@@ -4,10 +4,19 @@ See ``signer.py``.
 """
 
 from controller.signer.signer import (
+    SignerAuthorizer,
     SignerKey,
     SignerServer,
     SignerUnavailable,
+    authorize_handler,
     drop_privileges,
 )
 
-__all__ = ["SignerKey", "SignerServer", "SignerUnavailable", "drop_privileges"]
+__all__ = [
+    "SignerAuthorizer",
+    "SignerKey",
+    "SignerServer",
+    "SignerUnavailable",
+    "authorize_handler",
+    "drop_privileges",
+]

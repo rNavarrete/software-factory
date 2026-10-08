@@ -3,7 +3,9 @@
 # secret files the service uses. Used over `fly ssh console`, as root: these
 # are Rolando's own commands, signed with the key file directly. Afterwards
 # the files go back to the service's user so the service can keep using them.
-export HOME=/data/qualification FACTORY_SECRETS_DIR=/run/factory-secrets
+# The home the running service uses (the start script records it).
+HOME=$(cat /run/factory-home 2>/dev/null || echo /data/qualification)
+export HOME FACTORY_SECRETS_DIR=/run/factory-secrets
 cd /app || exit 1
 # Give the files back even if the session drops or is interrupted.
 trap 'chown -R factory:factory "$HOME/.software-factory"' EXIT

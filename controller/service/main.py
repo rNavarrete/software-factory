@@ -25,15 +25,29 @@ Only one service runs per home: ``service.lock`` is held for the life of the
 process and a second one exits at once. On Fly.io the volume can only be
 attached to one machine, which keeps a second copy off another machine too.
 
-The Linear integrations (ENG-174, 175, 178) and the reviewer (ENG-156) are
-not built yet, so for now the service runs with the fixtures in a folder:
-``events.json`` (Todo moves, refusals, pause/resume) and one contract per
-ticket in ``contracts/<ISSUE-KEY>.json``. With ``--fake-runtime`` (the
-default with fixtures) no real worker is fired.
+Each of the three Linear pieces can come from a fixture folder or from
+Linear:
 
-``--reporter linear`` posts the service's messages on the Linear tickets
-(ENG-178) with the ``linear-key`` secret, as the factory's own Linear user.
-The default, ``log``, writes them to the service log instead.
+- ``--source``: Todo moves (ENG-174). ``fixtures`` reads ``events.json``.
+- ``--preparer``: the task contract (ENG-175). ``fixtures`` reads
+  ``contracts/<ISSUE-KEY>.json``; ``linear`` drafts it from the ticket with
+  the drafting policy (``--drafting``, default ``deploy/pilot/drafting.json``)
+  and picks the base commit from GitHub.
+- ``--reporter``: the service's messages (ENG-178). ``log`` writes them to
+  the service log; ``linear`` posts them on the tickets as the factory's own
+  Linear user.
+
+``--live`` sets all three to ``linear`` and needs no fixture folder. Whether
+anything is taken on is still the onboarding file's ``intake_enabled``, which
+is off unless set. The reviewer (ENG-156) and repairs (ENG-160) are still
+fixtures. A real worker is fired only with ``--real-runtime``.
+
+Before its first round, a service that uses Linear checks what it needs and
+does not start without it: the ``linear-key`` and ``github-token`` secrets,
+a signer that answers (the service reads ticket text, so it must never hold
+the approval key), an onboarding file that names the same approver and an
+``intake_since``, and a drafting policy for every onboarded project. Nothing
+is sent to Linear or GitHub by these checks.
 """
 
 from __future__ import annotations
@@ -60,8 +74,26 @@ SECRETS_DIR_ENV = "FACTORY_SECRETS_DIR"
 SIGNER_SOCKET_ENV = "FACTORY_SIGNER_SOCKET"
 
 
+DRAFTING_POLICY = Path(__file__).resolve().parents[2] / "deploy" / "pilot" / "drafting.json"
+"""The drafting policy in the repo, and in the image at /app/deploy/pilot."""
+
+
 class AlreadyRunning(Exception):
     pass
+
+
+class NotReady(Exception):
+    """The service is set up wrong and doesn't start: say what to fix."""
+
+
+def linear_opener():
+    """What sends requests to Linear: None is the real API. Tests replace it."""
+    return None
+
+
+def github_opener():
+    """What sends requests to GitHub: None is the real API. Tests replace it."""
+    return None
 
 
 def home() -> Path:
@@ -157,6 +189,8 @@ def build(args: argparse.Namespace):
         raise SecretMissing(f"set {SECRETS_DIR_ENV} to the folder holding the secret files")
     secrets = FileSecrets(secrets_dir)
     socket_path = os.environ.get(SIGNER_SOCKET_ENV)
+    config_path = Path(args.onboarding) if args.onboarding else root / "onboarding.json"
+    ready_check(args, secrets, socket_path, config_path)
     if socket_path:
         from controller.signer import SignerKey
 
@@ -175,14 +209,14 @@ def build(args: argparse.Namespace):
         contracts=ContractStore(root / "contracts"),
         source_routine=FACTORY_ROUTINE,
     )
-    gh = HttpGhRunner(lambda: secrets.get("github-token"))
+    gh = HttpGhRunner(lambda: secrets.get("github-token"), github_opener())
     recovery = Recovery(store, approvals, GhCliReader(run=gh), gate=gate, confirm=never)
 
     def backup(now: datetime) -> None:
         store.backup(backups, now)
         prune_backups(backups, 48)
 
-    fixture_dir = Path(args.fixtures)
+    fixture_dir = Path(args.fixtures) if args.fixtures else None
     if args.fake_runtime:
         fake = FakeRuntimeAdapter([FakeStep.launch()] * 100)
         adapter = lambda trig, key: fake  # noqa: E731
@@ -203,30 +237,51 @@ def build(args: argparse.Namespace):
         start_key=start_key,
         backup=backup,
     )
-    contracts_by_issue = {
-        p.stem: json.loads(p.read_text())
-        for p in sorted((fixture_dir / "contracts").glob("*.json"))
-    }
+    forbidden = approvers(args, config_path)
+    linear = None
+    if "linear" in (args.source, args.preparer):
+        from controller.intake.linear import HttpTransport
+
+        # Reads only: Todo moves and ticket text. The reporter has its own.
+        linear = HttpTransport(
+            lambda: secrets.get("linear-key"), linear_opener(), forbidden_user=forbidden
+        )
     if args.source == "linear":
         from controller.intake import LinearSource, policy_from
-        from controller.intake.linear import HttpTransport
 
         def policy():
             return policy_from(
                 onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
             )
 
-        transport = HttpTransport(
-            lambda: secrets.get("linear-key"), forbidden_user=lambda: policy().approver_id
-        )
-        source = LinearSource(transport, policy)
+        source = LinearSource(linear, policy)
     else:
+        assert fixture_dir is not None
         source = fixtures.FixtureSource(fixtures.load_events(fixture_dir / "events.json"))
-    config_path = Path(args.onboarding) if args.onboarding else root / "onboarding.json"
+    if args.preparer == "linear":
+        from controller.loop.collect import GhApi
+        from controller.prepare import LinearTicketReader, Preparer
+        from controller.prepare import policy as drafting
+        from controller.service.github_http import as_bytes
+
+        drafting_path = Path(args.drafting)
+        preparer = Preparer(
+            LinearTicketReader(linear),
+            GhApi(run=as_bytes(gh)),
+            lambda: drafting.load(drafting_path),
+        )
+    else:
+        assert fixture_dir is not None
+        preparer = fixtures.FixturePreparer(
+            {
+                p.stem: json.loads(p.read_text())
+                for p in sorted((fixture_dir / "contracts").glob("*.json"))
+            }
+        )
     integrations = Integrations(
         source=source,
-        preparer=fixtures.FixturePreparer(contracts_by_issue),
-        reporter=_reporter(args, secrets),
+        preparer=preparer,
+        reporter=_reporter(args, secrets, forbidden),
         reviewer=_reviewer(args, secrets, store, root) or fixtures.RecordingReviewer(),
         repair=fixtures.NoRepair(),
         authorizer=_authorizer(socket_path) if args.source == "linear" else None,
@@ -244,6 +299,100 @@ def build(args: argparse.Namespace):
         instance=os.environ.get("FLY_MACHINE_ID", os.uname().nodename),
     )
     return service, store
+
+
+def approvers(args: argparse.Namespace, config_path: Path) -> Callable[[], frozenset[str]]:
+    """The Linear users the factory's key must never act as, asked again
+    before every request: ``--approver-linear-id`` (Rolando), and whoever the
+    onboarding file names as approver now or named earlier in this run. So
+    a changed approver applies to keys already checked, and a file that
+    can't be read never lifts a restriction."""
+    from controller.dispatch.dispatch import FACTORY_ROUTINE
+    from controller.recovery import PILOT_REPO
+    from controller.service import onboarding
+
+    seen = {args.approver_linear_id}
+
+    def current() -> frozenset[str]:
+        try:
+            config = onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
+        except (OSError, onboarding.OnboardingError):
+            pass
+        else:
+            if config.approver_linear_user_id:
+                seen.add(config.approver_linear_user_id)
+        return frozenset(seen)
+
+    return current
+
+
+def ready_check(args: argparse.Namespace, secrets, socket_path: str | None, config_path: Path):
+    """Refuse to start a service that would fail every round. Reads only
+    local files: nothing is sent to Linear or GitHub."""
+    from controller.dispatch.dispatch import FACTORY_ROUTINE
+    from controller.recovery import PILOT_REPO
+    from controller.service import onboarding
+
+    uses = {args.source, args.preparer, args.reporter}
+    if "fixtures" in (args.source, args.preparer) and not args.fixtures:
+        raise NotReady("--fixtures is needed unless --source and --preparer are both linear")
+    if "linear" not in uses:
+        return
+    secrets.get("linear-key")  # raises SecretMissing, which says which file
+    if args.preparer == "linear":
+        secrets.get("github-token")
+    if "linear" in (args.source, args.preparer):
+        if not socket_path:
+            raise NotReady(
+                f"reading Linear tickets needs the signer ({SIGNER_SOCKET_ENV}): the process"
+                " that reads ticket text must never hold the approval key"
+            )
+        from controller.signer import SignerKey, SignerUnavailable
+
+        try:
+            _ = SignerKey(socket_path).key_id  # answers only if the signer is up
+        except SignerUnavailable as e:
+            raise NotReady(f"the signer at {socket_path} is not working: {e}") from None
+    try:
+        config = onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
+    except (OSError, onboarding.OnboardingError) as e:
+        raise NotReady(f"the onboarding file {config_path} is unusable: {e}") from None
+    named = config.approver_linear_user_id
+    if not named:
+        raise NotReady(
+            f"the onboarding file {config_path} names no approver_linear_user_id, so the"
+            " factory can't tell whose moves count or whose identity it must never use"
+        )
+    if named != args.approver_linear_id:
+        raise NotReady(
+            "the onboarding file names a different approver than --approver-linear-id, so"
+            " the reporter could post as the approver"
+        )
+    if args.source == "linear":
+        from controller.intake import IntakeBlocked, policy_from
+
+        try:
+            policy_from(config)
+        except IntakeBlocked as e:
+            raise NotReady(
+                f"intake can't run with the onboarding file {config_path}: {e}"
+            ) from None
+    if args.preparer == "linear":
+        from controller.prepare import policy as drafting
+
+        try:
+            policies = drafting.load(Path(args.drafting))
+        except drafting.PolicyError as e:
+            raise NotReady(f"the drafting policy is unusable: {e}") from None
+        for pid, project in config.projects.items():
+            policy = policies.project(pid)
+            if policy is None:
+                raise NotReady(f"the drafting policy has no entry for onboarded project {pid}")
+            if policy.base.branch != project.base_branch:
+                raise NotReady(
+                    f"the drafting policy's base branch for {pid} is {policy.base.branch!r},"
+                    f" not the onboarded {project.base_branch!r}"
+                )
 
 
 def _authorizer(socket_path: str | None):
@@ -407,7 +556,7 @@ def _reviewer(args: argparse.Namespace, secrets, store, root: Path):
     )
 
 
-def _reporter(args: argparse.Namespace, secrets):
+def _reporter(args: argparse.Namespace, secrets, forbidden: Callable[[], frozenset[str]]):
     from controller.service import fixtures
 
     if getattr(args, "reporter", "log") != "linear":
@@ -416,7 +565,11 @@ def _reporter(args: argparse.Namespace, secrets):
     from controller.report.reporter import LinearReporter
 
     return LinearReporter(
-        HttpTransport(lambda: secrets.get("linear-key"), forbidden_user=args.approver_linear_id),
+        HttpTransport(
+            lambda: secrets.get("linear-key"),
+            linear_opener(),
+            forbidden_user=forbidden,
+        ),
         approver_id=args.approver_linear_id,
     )
 
@@ -426,7 +579,12 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("run", "once"):
         s = sub.add_parser(name)
-        s.add_argument("--fixtures", required=True, help="folder with events.json and contracts/")
+        s.add_argument("--fixtures", help="folder with events.json and contracts/")
+        s.add_argument(
+            "--live", action="store_true", help="Todo moves, contracts and messages via Linear"
+        )
+        s.add_argument("--preparer", choices=("fixtures", "linear"), default="fixtures")
+        s.add_argument("--drafting", default=str(DRAFTING_POLICY), help="drafting policy file")
         s.add_argument("--real-runtime", dest="fake_runtime", action="store_false")
         s.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
         s.add_argument("--onboarding", help="mapping file (default: onboarding.json in the home)")
@@ -466,6 +624,8 @@ def main(argv: list[str] | None = None) -> int:
             return 4
     if args.cmd == "status":
         return status(home())
+    if args.live:
+        args.source = args.preparer = args.reporter = "linear"
 
     stopping = False
 
@@ -495,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
     except AlreadyRunning as e:
         print(f"Not started: {e}.", file=sys.stderr)
         return 3
-    except SecretMissing as e:
+    except (SecretMissing, NotReady) as e:
         print(f"Not started: {e}.", file=sys.stderr)
         return 4
 
