@@ -40,6 +40,7 @@ if args[:2] == ["auth", "whoami"]:
     out = "rolando@example.com\n"
 elif args[:2] == ["secrets", "list"]:
     out = "NAME\tDIGEST\tSTATUS\n" + "".join(f"{n}\tabc\tDeployed\n" for n in st["secrets"])
+    out += "".join(f"{n}\tabc\tStaged\n" for n in st["staged"])
 elif args[:2] == ["secrets", "import"]:
     data = sys.stdin.read()
     st["stdin"].append(data)
@@ -47,6 +48,15 @@ elif args[:2] == ["secrets", "import"]:
         name, _, value = line.partition("=")
         st["staged"][name] = value
 elif args[0] == "deploy":
+    st["deploy_dirs"].append(args[1])
+    st["deployed_files"] = sorted(
+        os.path.relpath(os.path.join(d, f), args[1])
+        for d, _, fs in os.walk(args[1]) for f in fs
+    )
+    if st.get("deploy_fails_at") == st["deploys"] + 1:
+        st["deploy_fails_at"] = None
+        save()
+        sys.exit(1)
     st["secrets"].update(st["staged"])
     st["staged"] = {}
     st["deploys"] += 1
@@ -54,12 +64,15 @@ elif args[0] == "deploy":
 elif args[:2] == ["apps", "restart"]:
     st["restarts"] += 1
     if st.get("fire_on_restart"):
-        st["extra_starts"] += 1
+        st["extra_fires"].append(["eng-200-a2-f1", "launched https://claude.ai/code/s2"])
 elif args[:2] == ["ssh", "console"]:
     cmd = args[args.index("-C") + 1]
-    if cmd == "cat /run/factory-home":
+    if any(op in cmd for op in ("|", "&", ";", ">", "<")) and not cmd.startswith("sh -c "):
+        # Fly runs the command without a shell: operators reach the program.
+        out, code = "cat: '||': No such file or directory\n", 1
+    elif cmd == "cat /run/factory-home":
         out = "/data/factory\n" if st["mode"] == "live" else "/data/qualification\n"
-    elif cmd.startswith("cat /data/go-live/"):
+    elif cmd.startswith("sh -c 'cat /data/go-live/"):
         name = cmd.split("/data/go-live/")[1].split()[0]
         out = st["records"].get(name, "") + ("\n" if name in st["records"] else "")
     elif cmd.startswith("sh -c 'mkdir -p /data/go-live && echo "):
@@ -72,12 +85,13 @@ elif args[:2] == ["ssh", "console"]:
         st["report_probes"] += 1
     elif cmd == "/app/factory status":
         w = world()
-        starts = w["starts"] + st["extra_starts"]
-        lines = ["No tasks on record."] if not starts else ["eng-200: running (release: none)"]
+        fires = w["fires"] + st["extra_fires"]
+        lines = ["No tasks on record."] if not fires else ["eng-200: running (release: none)"]
         lines += w.get("extra", [])
         reading = "2026-10-09 00:00 UTC, session 5%, weekly 20%" if st["snapshot"] else ""
         lines.append(f"Usage reading: {reading or 'none recorded'}")
-        lines.append(f"Worker starts on record: {starts}")
+        lines += [f"Fire {run}: {answer}" for run, answer in fires]
+        lines.append(f"Fires on record: {len(fires)}")
         out = "\n".join(lines) + "\n"
     elif cmd == "/app/factory queue":
         w = world()
@@ -144,12 +158,13 @@ GOOD_REPORT_PROBE = "OK: posted once under the factory's own user; retries showe
 
 # The factory as Rolando acts: ENG-200 is moved, asked a question, answered,
 # moved again and started; then ENG-202 is moved, queued and withdrawn.
+LAUNCHED = [["eng-200-a1-f1", "launched https://claude.ai/code/session_1"]]
 _PHASES = [
-    {"starts": 0, "items": {}},
-    {"starts": 0, "items": {"ENG-200": "question"}},
-    {"starts": 1, "items": {"ENG-200": "open"}},
-    {"starts": 1, "items": {"ENG-200": "open", "ENG-202": "open"}},
-    {"starts": 1, "items": {"ENG-200": "open", "ENG-202": "authorization-withdrawn"}},
+    {"fires": [], "items": {}},
+    {"fires": [], "items": {"ENG-200": "question"}},
+    {"fires": LAUNCHED, "items": {"ENG-200": "open"}},
+    {"fires": LAUNCHED, "items": {"ENG-200": "open", "ENG-202": "open"}},
+    {"fires": LAUNCHED, "items": {"ENG-200": "open", "ENG-202": "authorization-withdrawn"}},
 ]
 HAPPY = [w for w in _PHASES for _ in range(3)]
 """Each look at the queue moves one world on; each phase lasts three looks."""
@@ -194,7 +209,9 @@ class GoLiveScriptCase(unittest.TestCase):
             snapshot=None,
             step=0,
             worlds=HAPPY,
-            extra_starts=0,
+            extra_fires=[],
+            deploy_dirs=[],
+            deployed_files=[],
             intake_probe=GOOD_INTAKE_PROBE,
             report_probe=GOOD_REPORT_PROBE,
             ci="success",
@@ -265,7 +282,7 @@ class GoLiveScriptCase(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=60,
             stdin=subprocess.DEVNULL,
         )
 
@@ -433,17 +450,18 @@ class RefusalTests(GoLiveScriptCase):
         self.assertNotIn("restart-checked", self.st()["records"])
 
     def test_a_worker_for_the_edited_ticket_is_an_alarm(self):
-        worlds = HAPPY[:-3] + [{"starts": 2, "items": {"ENG-200": "open", "ENG-202": "open"}}]
+        fired = LAUNCHED + [["eng-202-a1-f1", "launched https://claude.ai/code/session_2"]]
+        worlds = HAPPY[:-3] + [{"fires": fired, "items": {"ENG-200": "open", "ENG-202": "open"}}]
         self.set_state(worlds=worlds)
         out = self.run_script(FIRST_RUN)
         self.assertNotEqual(out.returncode, 0)
-        self.assertIn("A worker started for ENG-202", out.stderr)
+        self.assertIn("The factory fired a worker for ENG-202", out.stderr)
 
     def test_the_first_ticket_refused_says_so(self):
         self.set_state(
             worlds=[
-                {"starts": 0, "items": {}},
-                {"starts": 0, "items": {"ENG-200": "authorization-refused"}},
+                {"fires": [], "items": {}},
+                {"fires": [], "items": {"ENG-200": "authorization-refused"}},
             ]
         )
         out = self.run_script(FIRST_RUN)
@@ -457,6 +475,99 @@ class RefusalTests(GoLiveScriptCase):
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("Something is holding the factory", out.stderr)
         self.assertNotIn("move ENG-200", out.stdout)
+
+
+class ReviewFindingTests(GoLiveScriptCase):
+    """Cases from Rolando's review of the first version."""
+
+    def test_no_live_switch_without_the_codex_review(self):
+        for name in ("FACTORY_REVIEW_DISPATCHER", "FACTORY_REVIEW_MODEL", "FACTORY_REVIEW_TOKEN"):
+            with self.subTest(missing=name):
+                secrets = dict(self.st()["secrets"])
+                value = secrets.pop(name)
+                self.set_state(secrets=secrets, calls=[])
+                out = self.run_script(FIRST_RUN)
+                self.assertNotEqual(out.returncode, 0)
+                self.assertIn("setup-reviewer.sh", out.stderr)
+                self.assertEqual(self.fly_calls("deploy"), [])
+                self.assertEqual(self.st()["staged"], {})
+                secrets[name] = value
+                self.set_state(secrets=secrets)
+
+    def check_launch_answer(self, answer):
+        fire = [["eng-200-a1-f1", answer]]
+        worlds = [{"fires": [], "items": {}}] * 3 + [
+            {"fires": fire, "items": {"ENG-200": "open"}}
+        ] * 3
+        if answer == "no answer yet":
+            worlds += HAPPY[6:]
+        self.set_state(worlds=worlds)
+        return self.run_script(FIRST_RUN)
+
+    def test_a_refused_launch_is_not_a_started_worker(self):
+        for answer in ("not-launched", "launch-outcome-unknown"):
+            with self.subTest(answer=answer):
+                self.set_state(step=0, records={}, restarts=0)
+                out = self.check_launch_answer(answer)
+                self.assertNotEqual(out.returncode, 0)
+                self.assertIn("didn't launch", out.stderr)
+                self.assertNotIn("A worker started", out.stdout)
+                self.assertEqual(self.st()["restarts"], 0)
+
+    def test_a_launch_still_waiting_for_its_answer_is_waited_for(self):
+        out = self.check_launch_answer("no answer yet")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("eng-200-a1-f1: launched", out.stdout)
+
+    def test_another_tickets_launch_is_not_the_work_tickets(self):
+        other = [["eng-187-a1-f1", "launched https://claude.ai/code/session_9"]]
+        worlds = [{"fires": other, "items": {}}] * 6 + [
+            {"fires": other + w["fires"], "items": w["items"]} for w in HAPPY[6:]
+        ]
+        self.set_state(worlds=worlds)
+        out = self.run_script(FIRST_RUN)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("eng-200-a1-f1: launched", out.stdout)
+        started = out.stdout.split("A worker started for ENG-200:\n", 1)[1].splitlines()
+        self.assertIn("eng-200-a1-f1: launched", started[0])
+        self.assertNotIn("eng-187", started[1])
+
+    def test_interrupted_switch_finishes_on_the_next_run(self):
+        # The deploy that switches to live dies after FACTORY_MODE was staged.
+        self.set_state(deploy_fails_at=2)
+        out = self.run_script(FIRST_RUN)
+        self.assertNotEqual(out.returncode, 0)
+        st = self.st()
+        self.assertEqual(st["mode"], "qualification")
+        self.assertIn("FACTORY_MODE", st["staged"])
+        out = self.run_script(["5", "20", "0"])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        st = self.st()
+        self.assertEqual(st["mode"], "live")
+        self.assertEqual(st["deploys"], 2)  # the practice deploy, then the finished switch
+        self.assertEqual(st["report_probes"], 1)
+
+    def test_saved_markers_are_read_back_through_a_shell(self):
+        self.assertEqual(self.run_script(FIRST_RUN).returncode, 0)
+        self.set_state(clipboard=None)
+        out = self.run_script(())
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIsNone(self.st()["clipboard"])  # the prompt step wasn't repeated
+        self.assertEqual(self.st()["restarts"], 1)
+        self.assertEqual(out.stdout.count("Already checked."), 2)
+
+    def test_untracked_files_never_reach_the_image(self):
+        (self.repo / "controller" / "evil.py").write_text("raise SystemExit")
+        (self.repo / "deploy" / "fly" / "extra.sh").write_text("echo hi")
+        out = self.run_script(FIRST_RUN)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        st = self.st()
+        for d in st["deploy_dirs"]:
+            self.assertNotEqual(Path(d).resolve(), self.repo.resolve())
+            self.assertFalse(Path(d).exists())  # the export is cleaned up
+        self.assertIn("deploy/fly/fly.toml", st["deployed_files"])
+        self.assertNotIn("controller/evil.py", st["deployed_files"])
+        self.assertNotIn("deploy/fly/extra.sh", st["deployed_files"])
 
 
 if __name__ == "__main__":

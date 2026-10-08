@@ -42,7 +42,7 @@ from pathlib import Path
 from controller import contract as contracts
 from controller.approval import ApprovalRefused, Approvals
 from controller.attempts import AttemptGate
-from controller.attempts.events import FIRE_INTENT, ClearingBasis
+from controller.attempts.events import FIRE_INTENT, FIRE_RESULT, ClearingBasis
 from controller.attempts.policy import LedgerView
 from controller.dispatch import Dispatcher, Refused
 from controller.interfaces import AttemptId, LedgerLocked, LedgerStore, TaskId
@@ -289,8 +289,22 @@ def _status(c: Controller, task: str | None, now: datetime) -> None:
             f"Usage reading: {snap.taken_at:%Y-%m-%d %H:%M} UTC, session {snap.session_pct:g}%,"
             f" weekly {snap.weekly_pct:g}%"
         )
-    fires = [s for s in c.store.events() if s.event.kind == FIRE_INTENT]
-    print(f"Worker starts on record: {len(fires)}")
+    # Every fire on record and what its launch answered. Only "launched" with a
+    # session started a worker; an intent with no answer yet is still unclear.
+    answers: dict[str, Mapping[str, object]] = {}
+    fires: list[str] = []
+    for s in c.store.events():
+        if s.event.kind == FIRE_INTENT and s.event.run is not None:
+            fires.append(str(s.event.run))
+        elif s.event.kind == FIRE_RESULT and s.event.run is not None:
+            answers[str(s.event.run)] = s.event.data
+    for run in fires:
+        answer = answers.get(run)
+        if answer is None:
+            print(f"Fire {run}: no answer yet")
+        else:
+            print(f"Fire {run}: {answer.get('outcome')} {answer.get('session_url') or ''}".rstrip())
+    print(f"Fires on record: {len(fires)}")
 
 
 def _print_attempt(a) -> None:

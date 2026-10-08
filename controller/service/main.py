@@ -337,6 +337,16 @@ def ready_check(args: argparse.Namespace, secrets, socket_path: str | None, conf
     from controller.service import onboarding
 
     uses = {args.source, args.preparer, args.reporter}
+    if args.source == "linear" and not args.fake_runtime:
+        # Real workers from Todo moves need the real review: the stand-in
+        # reviewer would let the ticket say a review was asked for when no
+        # Codex run exists (docs/go-live.md).
+        if not (args.review_dispatcher and args.review_model):
+            raise NotReady(
+                "real workers from Linear need the Codex review configured"
+                " (--review-dispatcher and --review-model, set by deploy/fly/setup-reviewer.sh)"
+            )
+        secrets.get("review-token")  # raises SecretMissing, which says which file
     if "fixtures" in (args.source, args.preparer) and not args.fixtures:
         raise NotReady("--fixtures is needed unless --source and --preparer are both linear")
     if "linear" not in uses:

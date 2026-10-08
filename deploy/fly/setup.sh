@@ -43,8 +43,12 @@ if ! fly secrets list --app "$APP" | grep -q FACTORY_GITHUB_TOKEN; then
 fi
 
 echo "== Deploy (one machine only)"
-fly deploy . --app "$APP" --config deploy/fly/fly.toml \
-    --dockerfile deploy/fly/Dockerfile --ha=false
+# A clean export of the current commit, so untracked files never reach the image.
+BUILD=$(mktemp -d)
+git archive --format=tar HEAD | (cd "$BUILD" && tar -xf -)
+fly deploy "$BUILD" --app "$APP" --config "$BUILD/deploy/fly/fly.toml" \
+    --dockerfile "$BUILD/deploy/fly/Dockerfile" --ha=false
+rm -rf "$BUILD"
 
 echo "== Approve the qualification contract (type the code it shows)"
 fly ssh console --app "$APP" --pty \
