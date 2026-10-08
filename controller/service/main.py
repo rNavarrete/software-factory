@@ -282,7 +282,7 @@ def build(args: argparse.Namespace):
         source=source,
         preparer=preparer,
         reporter=_reporter(args, secrets, forbidden),
-        reviewer=fixtures.RecordingReviewer(),
+        reviewer=_reviewer(args, secrets, store, root) or fixtures.RecordingReviewer(),
         repair=fixtures.NoRepair(),
         authorizer=_authorizer(socket_path) if args.source == "linear" else None,
     )
@@ -530,6 +530,45 @@ ROLANDO_LINEAR_ID = "cd9ec650-f957-4f25-b5f0-9c14bcae49c8"
 """Rolando's Linear user. The factory never posts as this user."""
 
 
+def _reviewer(args: argparse.Namespace, secrets, store, root: Path):
+    """The independent review (ENG-156), when the Codex review workflow is set
+    up: ``--review-dispatcher`` (the GitHub login that owns the review token)
+    and ``--review-model`` (docs/review.md). Without them the stand-in
+    reviewer is used and no review is ever started."""
+    if not (args.review_dispatcher or args.review_model):
+        return None
+    if not (args.review_dispatcher and args.review_model):
+        raise SystemExit("--review-dispatcher and --review-model go together")
+    from controller.approval import ContractStore
+    from controller.recovery import PILOT_REPO
+    from controller.review.reviewer import AutoReviewer, ReviewPolicy, ledger_contracts
+    from controller.review.workflow import (
+        WorkflowConfig,
+        WorkflowDispatchRuntime,
+        WorkflowResults,
+    )
+    from controller.service.github_http import HttpGitHubApi
+
+    try:
+        config = WorkflowConfig(
+            dispatchers=frozenset({args.review_dispatcher}),
+            model=args.review_model,
+            effort=args.review_effort or "",
+        )
+    except ValueError as e:
+        raise SystemExit(f"review settings: {e}") from None
+    token = lambda: secrets.get("review-token")  # noqa: E731
+    return AutoReviewer(
+        store,
+        HttpGitHubApi(lambda: secrets.get("github-token")),
+        WorkflowDispatchRuntime(config, token),
+        ledger_contracts(store, ContractStore(root / "contracts").load),
+        policy=ReviewPolicy(workflow=config.identity),
+        repo=PILOT_REPO,
+        results=WorkflowResults(HttpGitHubApi(token), config),
+    )
+
+
 def _reporter(args: argparse.Namespace, secrets, forbidden: Callable[[], frozenset[str]]):
     from controller.service import fixtures
 
@@ -565,6 +604,11 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--reporter", choices=("log", "linear"), default="log")
         s.add_argument("--approver-linear-id", default=ROLANDO_LINEAR_ID)
         s.add_argument("--source", choices=("fixtures", "linear"), default="fixtures")
+        s.add_argument(
+            "--review-dispatcher", help="GitHub login that owns the review token (ENG-156)"
+        )
+        s.add_argument("--review-model", help="OpenAI model for the Codex review (ENG-156)")
+        s.add_argument("--review-effort", default="", help="Codex reasoning effort (optional)")
         s.add_argument("--user", help="become this user before starting (on the host)")
     sub.add_parser("status")
     s = sub.add_parser("install-secrets")

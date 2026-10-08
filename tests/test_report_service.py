@@ -9,20 +9,23 @@ from __future__ import annotations
 
 import re
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from unittest import mock
 
-from controller.interfaces import AttemptId
+from controller.interfaces import AttemptId, TaskId
 from controller.report.linear_api import LinearDown
 from controller.report.messages import Stage
 from controller.report.replies import LinearDecisions
 from controller.report.reporter import LinearReporter, comment_id
+from controller.review.report import review_messages
+from controller.review.reviewer import ReviewState, ReviewStatus, Revision
 from controller.service import queue as q
 from controller.service.seams import Option, Question
 from tests.linear_world import FACTORY, ROLANDO, FakeLinear, issue_uuid
 from tests.test_recovery import SHA_A
 from tests.test_service import REPO, ServiceCase, move
+from verify.findings import Finding, Route, Severity, finding_id
 
 ISSUE = "issue-ENG-186"
 OTHER_ISSUE = "issue-ENG-187"
@@ -292,10 +295,6 @@ class MergeServiceTests(LinearServiceCase):
             self.assertEqual(c.user_id, FACTORY)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class OrderTests(LinearServiceCase):
     def test_comments_keep_their_order_after_an_outage(self) -> None:
         """Rolando's report: Working showed before Queued after an outage."""
@@ -371,3 +370,199 @@ class PullRequestLinkTests(LinearServiceCase):
         merged = [b for b in self.bodies() if b.startswith("**Factory: Merged")]
         self.assertEqual(len(merged), 1)
         self.assertIn(f"Pull request: {link}", merged[0])
+
+
+class ScriptedReviewer:
+    """A reviewer with the full ENG-156 surface, answering from a script."""
+
+    def __init__(self) -> None:
+        self.started: list = []
+        self.status = None
+        self.head = ""
+        self.checks = 0
+
+    def start(self, pr, key):
+        self.started.append(pr)
+        return "asked"
+
+    def check(self, attempt):
+        self.checks += 1
+        if self.status is None:
+            raise RuntimeError("GitHub unreadable")
+        return replace(self.status, attempt=attempt)
+
+    def evidence(self, attempt):
+        return None if self.status is None else replace(self.status, attempt=attempt)
+
+    def merged_head(self, attempt):
+        return self.head
+
+
+def status(state, head=SHA_A, findings=()):
+    rv = Revision(REPO, 7, "0" * 64, head, "b" * 40, "c" * 40)
+    return ReviewStatus(state, AttemptId(TaskId("x"), 1), 7, "note", rv.key(), rv, findings)
+
+
+def finding(category, route, summary, criterion=None):
+    return Finding(
+        id=finding_id(category, criterion, summary),
+        severity=Severity.BLOCKING,
+        category=category,
+        route=route,
+        summary=summary,
+        evidence="e",
+        suggested_action="a",
+        commit=SHA_A,
+        criterion=criterion,
+    )
+
+
+class ReviewServiceTests(LinearServiceCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.reviewer = ScriptedReviewer()  # type: ignore[assignment]
+        self.build()
+
+    def open_pr(self) -> None:
+        self.rolando_approves()
+        self.tick()
+        a1 = AttemptId(self.task(), 1)
+        self.github.branches[a1.branch] = SHA_A
+        self.github.pulls = [self.pr()]
+        self.tick(minutes=6)
+        self.tick(minutes=6)
+
+    def merge(self) -> None:
+        self.github.pulls = [self.pr(state="closed", merged=True, merge_commit="c" * 40)]
+        self.tick(minutes=6)
+        self.tick(minutes=6)
+
+    def stages(self):
+        return [HEADER_RE.match(b.split("\n", 1)[0])["stage"] for b in self.bodies()]
+
+    def test_a_pass_on_the_merged_commit_is_verified_work(self) -> None:
+        self.open_pr()
+        self.reviewer.status = status(ReviewState.PASSED)
+        self.tick(minutes=6)
+        self.tick(minutes=6)
+        self.assertEqual(self.stages().count("Ready for your review"), 1)
+        self.reviewer.head = SHA_A
+        self.merge()
+        [body] = [b for b in self.bodies() if "merged at" in b]
+        self.assertTrue(body.startswith("**Factory: Merged**"), body)
+        self.assertIn("passed on that exact commit", body)
+
+    def test_a_pass_on_an_earlier_commit_is_an_exception(self) -> None:
+        self.open_pr()
+        self.reviewer.status = status(ReviewState.PASSED, head="e" * 40)
+        self.tick(minutes=6)
+        self.reviewer.head = SHA_A
+        self.merge()
+        [body] = [b for b in self.bodies() if "merged at" in b]
+        self.assertTrue(body.startswith("**Factory: Merged as an exception**"), body)
+        self.assertIn("the review covered `eeeeeee", body)
+
+    def test_an_unreadable_merged_head_is_an_exception(self) -> None:
+        self.open_pr()
+        self.reviewer.status = status(ReviewState.PASSED)
+        self.tick(minutes=6)
+        self.merge()
+        [body] = [b for b in self.bodies() if "merged at" in b]
+        self.assertTrue(body.startswith("**Factory: Merged as an exception**"), body)
+
+    def test_failed_review_reports_once_for_the_repair_step(self) -> None:
+        self.open_pr()
+        self.reviewer.status = status(
+            ReviewState.FAILED, findings=(finding("checks-failed", Route.REPAIR, "npm test fails"),)
+        )
+        for _ in range(3):
+            self.tick(minutes=6)
+        failed = [b for b in self.bodies() if b.startswith("**Factory: Failed**")]
+        self.assertEqual(len(failed), 1)
+        self.assertIn("npm test fails", failed[0])
+        self.assertIn("Nothing is needed from you", failed[0])
+
+    def test_needs_rolando_asks_for_an_observation_bound_to_the_commit(self) -> None:
+        self.open_pr()
+        self.reviewer.status = status(
+            ReviewState.NEEDS_ROLANDO,
+            findings=(
+                finding("needs-observation", Route.ROLANDO, "Check the filter control", "ac3"),
+                finding("flag-changed-test", Route.ROLANDO, "A protected control changed"),
+            ),
+        )
+        for _ in range(3):
+            self.tick(minutes=6)
+        asks = [b for b in self.bodies() if "Please look at the change" in b]
+        self.assertEqual(len(asks), 1)
+        self.assertIn("aaaaaaa", asks[0])
+        others = [b for b in self.bodies() if "only you can settle" in b]
+        self.assertEqual(len(others), 1)
+        self.assertNotIn("Check the filter control", others[0])
+        self.assert_one_comment_per_key()
+
+    def test_a_check_that_fails_posts_nothing_and_keeps_going(self) -> None:
+        self.open_pr()
+        before = len(self.bodies())
+        self.tick(minutes=6)
+        self.assertGreater(self.reviewer.checks, 0)
+        self.assertEqual(len(self.bodies()), before)
+
+
+class ReviewMessageTests(unittest.TestCase):
+    def test_waiting_and_running_say_nothing(self) -> None:
+        for state in (ReviewState.WAITING_CI, ReviewState.RUNNING):
+            self.assertEqual(review_messages(status(state)), [])
+
+    def test_a_new_revision_gets_new_keys(self) -> None:
+        a = review_messages(status(ReviewState.PASSED))
+        b = review_messages(status(ReviewState.PASSED, head="e" * 40))
+        self.assertNotEqual(a[0][0], b[0][0])
+        self.assertTrue(a[0][0].startswith("ready:"))
+
+    def test_blocked_keys_change_with_the_reason(self) -> None:
+        s = replace(status(ReviewState.BLOCKED), blocks=("on hold",))
+        t = replace(status(ReviewState.BLOCKED), blocks=("12 of 12 fires",))
+        self.assertNotEqual(review_messages(s)[0][0], review_messages(t)[0][0])
+        self.assertIn("Waiting", review_messages(s)[0][1])
+
+    def test_a_started_codex_review_is_reported_once_per_revision(self) -> None:
+        s = replace(status(ReviewState.RUNNING), pass_kind="full", reviewer="codex-review")
+        ((key, text),) = review_messages(s)
+        self.assertIn("Codex review is running", text)
+        self.assertEqual(review_messages(s)[0][0], key)
+        t = replace(s, pass_kind="verify")
+        self.assertIn("corrected version", review_messages(t)[0][1])
+
+    def test_a_corrected_version_that_passed_says_so(self) -> None:
+        fixed = replace(finding("review-code", Route.REPAIR, "Mutates input"), resolved=True)
+        s = replace(
+            status(ReviewState.PASSED, findings=(fixed,)),
+            pass_kind="verify",
+            reviewer="codex-review",
+            review_url="https://github.com/rNavarrete/software-factory/actions/runs/9",
+        )
+        text = review_messages(s)[0][1]
+        self.assertIn("corrected version", text)
+        self.assertIn("1 earlier finding(s) checked as fixed", text)
+        self.assertIn("actions/runs/9", text)
+
+    def test_a_failed_review_never_says_a_correction_is_running(self) -> None:
+        s = replace(
+            status(
+                ReviewState.FAILED,
+                findings=(
+                    finding("review-code", Route.REPAIR, "Mutates input"),
+                    finding("review-test", Route.REPAIR, "No test for order"),
+                ),
+            ),
+            reviewer="codex-review",
+        )
+        text = review_messages(s)[0][1]
+        self.assertIn("found 2 problem(s)", text)
+        self.assertIn("only after the previous worker is confirmed finished", text)
+        self.assertNotIn("is running", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

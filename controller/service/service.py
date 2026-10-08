@@ -64,6 +64,7 @@ from controller.repair import policy as repair_policy
 from controller.report import messages as m
 from controller.report.messages import Stage
 from controller.report.reporter import QUESTION_PREFIX
+from controller.review.report import review_messages
 from controller.service import queue as q
 from controller.service.onboarding import Onboarding, OnboardingError
 from controller.service.seams import (
@@ -963,14 +964,37 @@ class Service:
                     item.issue_id,
                     m.progress(
                         Stage.REVIEWING,
-                        f"The worker opened PR #{number}. The independent review has started.",
+                        f"The worker opened PR #{number}. The independent review has been asked"
+                        " for; it starts once CI has checked the PR.",
                         pr_url=self._pr_url(item, number),
                     ),
                     now,
                 ),
             )
+        if str(attempt) in self._view().reviews:
+            self._review_round(item, attempt, now)
         if status.state is State.MERGED:
             self._close_merged(item, status, now)
+
+    def _review_round(self, item: q.Item, attempt, now: datetime) -> None:
+        """ENG-156: where the independent review stands this round. Each new
+        verdict on each revision is reported once; nothing here approves."""
+        check = getattr(self._x.reviewer, "check", None)
+        if check is None:
+            return
+        try:
+            status = check(attempt)
+        except Exception as e:  # GitHub or the ledger busy: next round
+            log.warning("%s: review check: %s", item.issue_key, _error(e))
+            return
+        queued = self._view().queued_keys
+        events = [
+            q.message(key, item.issue_id, text, now)
+            for key, text in review_messages(status, self._pr_url(item, status.pr))
+            if key not in queued
+        ]
+        if events:
+            self._append(*events)
 
     def _check_standing_while_running(self, item: q.Item, now: datetime) -> None:
         """Rolando's move is checked again while the worker runs. A change
@@ -1030,12 +1054,31 @@ class Service:
         return f"https://github.com/{project.repository}/pull/{number}"
 
     def _close_merged(self, item: q.Item, status, now: datetime) -> None:
-        """The merge record. The service holds no review verdict yet (ENG-156),
-        so a merge is recorded as an exception that says what is missing,
-        never as verified work."""
-        evidence = m.ReviewEvidence(started=str(status.attempt) in self._view().reviews)
+        """The merge record. It counts as verified work only when the
+        independent review passed on exactly the PR's last commit; otherwise
+        it is recorded as an exception that says what is missing."""
+        attempt = status.attempt
+        started = str(attempt) in self._view().reviews
+        evidence = m.ReviewEvidence(started=started)
+        head = ""
+        recorded = getattr(self._x.reviewer, "evidence", None)
+        last = getattr(self._x.reviewer, "merged_head", None)
+        if started and recorded is not None and last is not None:
+            try:
+                verdict = recorded(attempt)
+                head = last(attempt)
+            except Exception as e:  # recorded as an exception rather than not at all
+                log.warning("%s: review evidence: %s", item.issue_key, _error(e))
+                verdict = None
+            if verdict is not None:
+                evidence = m.ReviewEvidence(
+                    started=True,
+                    reviewed_commit=verdict.reviewed_commit,
+                    passed=verdict.passed,
+                    unresolved=verdict.unresolved(),
+                )
         number = status.pull_requests[-1] if status.pull_requests else None
-        _, text = m.merged(number, "", evidence, pr_url=self._pr_url(item, number))
+        _, text = m.merged(number, head, evidence, pr_url=self._pr_url(item, number))
         self._append(
             q.item_closed(item, "merged", now),
             q.message(f"closed:{item.event_id}", item.issue_id, text, now),
