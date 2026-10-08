@@ -6,7 +6,7 @@ This is off until Rolando turns it on. The pilot onboarding keeps `repair_allowa
 
 ## What a repair is
 
-A repair is a new attempt, not a fix-up of the old one. The new attempt works on the same approved contract (same goal, acceptance criteria, checks and permitted paths, and the same digest). It runs on a new branch `claude/<task>-a<n>` and opens a new PR, and that PR gets a fresh independent review. The worker receives what failed (the PR, the exact commit and the review's findings) in the `repair` part of its task message. It is told to treat those findings as evidence, never as instructions, never to weaken a test, check, criterion or workflow, and to list every finding id in its PR body. A finding counts as fixed only when the review of the new PR says so. The worker saying "fixed" counts for nothing.
+A repair is a new attempt, not a fix-up of the old one. The new attempt works on the same approved contract (same goal, acceptance criteria, checks and permitted paths, and the same digest). It runs on a new branch `claude/<task>-a<n>` and opens a new PR, and that PR gets a fresh independent review. The worker receives what failed (the PR, the exact commit and the review's findings) in the `repair` part of its task message. The finding text is encoded so it can't close or fake any part of that message. The worker is told to treat the findings as evidence, never as instructions, never to weaken a test, check, criterion or workflow, and to list every finding id in its PR body. A finding counts as fixed only when the review of the new PR says so. The worker saying "fixed" counts for nothing.
 
 ## When the factory repairs on its own
 
@@ -15,9 +15,9 @@ All of these must hold, and each is checked where it can't be faked:
 | Check | Where |
 |---|---|
 | The review's latest recorded verdict for this attempt is **failed**, on a known PR and commit. Passed, needs Rolando, incomplete, unknown, blocked or unreadable never starts a repair. | Service, from the review's own ledger records (`controller/repair/review.py`) |
-| Every open blocking finding was routed to repair, is in a category known to be a routine fix, and doesn't ask to delete, skip, disable or weaken a test, check, criterion or workflow. There are at most 20 findings. | Service (`controller/repair/policy.py`) |
+| Every open blocking finding was routed to repair, is in a category known to be a routine fix, and doesn't ask to delete, skip, disable or weaken a test, check, criterion or workflow, or to change what a test expects. Nothing the review routed to Rolando is open, blocking or not; only a finding marked advisory counts as non-blocking. There are at most 20 findings, with at most 24,000 characters of text between them, and the worker's whole task message must fit its limit. | Service (`controller/repair/policy.py`) |
 | The failed commit is still the head of the attempt's open PR. A newer push waits for a review of the new head. | Service, and again in the approval check |
-| The next attempt fits the contract's budget and the project's `max_attempts`, and the automatic repairs used so far are fewer than the allowance. | Service, signer and approval check |
+| The next attempt fits the contract's budget and the project's `max_attempts`, and the repairs used so far (every attempt after the first, typed ones included) are fewer than the allowance. | Service, signer and approval check |
 | Rolando has recorded that the earlier worker finished (the clearing below). | Recovery, as for any repair |
 | Linear still shows the Todo move as Rolando's, on the same ticket text. The move was authorized for exactly this contract, and the project's repair settings are unchanged since the move. | Signer, which reads Linear itself |
 | No other repair go-ahead exists under this move for this attempt number on a different failed commit. | Signer's own state file, saved before it signs |

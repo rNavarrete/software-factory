@@ -200,11 +200,18 @@ def build_fire_text(
     }
     if repair is not None:
         envelope[REPAIR_KEY] = dict(repair)
-    text = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
+    text = _inert(json.dumps(envelope, sort_keys=True, separators=(",", ":")))
     errors = _text_errors(text, digest, attempt, validate_contract)
     if errors:
         raise PayloadRejected(errors)
     return text
+
+
+def _inert(text: str) -> str:
+    """JSON with ``<``, ``>`` and ``&`` written as ``\\u`` escapes: the same
+    data, but no text inside it (a finding quoting a PR, say) can close the
+    payload's tag or open another in the worker's message."""
+    return text.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
 
 
 def _text_errors(

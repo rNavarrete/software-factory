@@ -30,6 +30,10 @@ from dataclasses import dataclass
 
 from controller.repair.findings import MAX_FINDINGS, RepairFinding
 
+MAX_DETAIL_CHARS = 24_000
+"""The most finding text one repair carries, so the worker's task message
+always fits (``MAX_FIRE_TEXT_CHARS``) beside the contract."""
+
 ROUTINE_CATEGORIES = frozenset(
     {
         "markers",
@@ -64,7 +68,14 @@ _WEAKEN_RE = re.compile(
     r"\b(delet\w*|remov\w*|skip\w*|disabl\w*|weaken\w*|loosen\w*|relax\w*|xfail\w*|"
     r"comment\w*\s+out|turn\w*\s+off|ignor\w*|suppress\w*|lower\w*|drop\w*)\b"
     r"[^.]{0,60}?\b(tests?|assert\w*|checks?|criteri\w*|workflows?|ci|lint\w*|typecheck\w*|"
-    r"coverage|verification)\b",
+    r"coverage|verification)\b"
+    # Changing what a test expects, rather than the code under test.
+    r"|\b(chang\w*|updat\w*|rewrit\w*|edit\w*|modif\w*|adjust\w*|alter\w*|fix\w*)\b"
+    r"[^.]{0,60}?\b(expect\w*|snapshots?|assert\w*|test\w*\s+(data|values?|output))\b"
+    r"|\bmark\w*\b[^.]{0,60}?\b(todo|skip\w*|xfail|pending|flaky|only|known)\b"
+    r"|\bno\s+longer\b[^.]{0,30}?\b(check|assert|test|verif|cover|fail)\w*"
+    r"|\b(it|test|describe)\.(skip|todo|only)\b|\bx(it|describe)\s*\("
+    r"|\b(less\s+strict|accept\s+any|any\s+value|tolerance)\b",
     re.IGNORECASE,
 )
 
@@ -79,7 +90,7 @@ class Plan:
     allowance: int
     """The repair allowance the Todo move came with."""
     used: int
-    """Automatic repairs already used, before this one."""
+    """Repairs (typed or automatic) already used, before this one."""
 
     @property
     def failure(self) -> str:
@@ -108,24 +119,27 @@ def plan(
     contract_budget: int,
     project_max: int,
     allowance: int,
-    automatic_used: int,
+    repairs_used: int,
 ) -> Plan | Stop:
     """``attempts_used``: attempts reserved for the task so far.
-    ``automatic_used``: how many of those were automatic repairs."""
+    ``repairs_used``: how many of those were repairs, typed or automatic.
+    Every attempt after the first counts against the allowance, as the
+    signer and the approval check count it."""
     open_ = [f for f in findings if f.blocking]
-    if not open_:
-        return Stop(
-            "nothing-to-repair",
-            "the review reported no open blocking problem for a repair to fix",
-            "Look at the PR yourself.",
-        )
-    rolando = [f for f in open_ if f.route != "repair"]
+    # Anything routed to Rolando stops it, blocking or not.
+    rolando = [f for f in findings if f.route != "repair"]
     if rolando:
         return Stop(
             "needs-rolando",
             "the review raised something only you can settle: "
             + "; ".join(f.summary for f in rolando[:3]),
             "Settle it on the PR, then repair it by hand or close the attempt.",
+        )
+    if not open_:
+        return Stop(
+            "nothing-to-repair",
+            "the review reported no open blocking problem for a repair to fix",
+            "Look at the PR yourself.",
         )
     unknown = [f for f in open_ if not routine(f.category)]
     if unknown:
@@ -143,10 +157,11 @@ def plan(
             + weakening[0].summary,
             "Decide on the PR whether that change is right.",
         )
-    if len(open_) > MAX_FINDINGS:
+    if len(open_) > MAX_FINDINGS or detail_chars(open_) > MAX_DETAIL_CHARS:
         return Stop(
             "too-many-findings",
-            f"the review found {len(open_)} problems, more than a routine repair covers",
+            f"the review found {len(open_)} problems, or more detail than a routine repair"
+            " covers",
             "Look at the PR; repair it by hand or close the attempt.",
         )
     nxt = attempts_used + 1
@@ -165,14 +180,18 @@ def plan(
             "this project's Todo moves come with no automatic repairs",
             f"Allow attempt {nxt} by hand to have the factory try again, or close the attempt.",
         )
-    if automatic_used >= allowance:
+    if repairs_used >= allowance:
         return Stop(
             "allowance-used",
-            f"the factory has used its {allowance} automatic repair"
-            f"{'' if allowance == 1 else 's'} for this ticket",
+            f"this ticket has used the {allowance} repair"
+            f"{'' if allowance == 1 else 's'} its Todo move allows",
             f"Allow attempt {nxt} by hand to have the factory try again, or close the attempt.",
         )
-    return Plan(nxt, tuple(open_), allowance, automatic_used)
+    return Plan(nxt, tuple(open_), allowance, repairs_used)
+
+
+def detail_chars(findings: Sequence[RepairFinding]) -> int:
+    return sum(len(f.summary) + len(f.evidence) + len(f.suggested_action) for f in findings)
 
 
 def routine(category: str) -> bool:
@@ -187,10 +206,11 @@ def asks_to_weaken(f: RepairFinding) -> bool:
     """True if the finding's own words ask to remove or loosen a test, check,
     criterion or workflow. Errs towards yes: a false alarm only sends the
     repair to Rolando."""
-    return bool(_WEAKEN_RE.search(f"{f.summary} {f.suggested_action}"))
+    return bool(_WEAKEN_RE.search(f"{f.summary}. {f.suggested_action}"))
 
 
 __all__ = [
+    "MAX_DETAIL_CHARS",
     "ROUTINE_CATEGORIES",
     "Plan",
     "Stop",

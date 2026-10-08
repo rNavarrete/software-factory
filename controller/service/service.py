@@ -41,6 +41,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from controller import contract as contracts
+from controller.adapter import routine
+from controller.adapter.routine import PayloadRejected
 from controller.approval import ContractStore
 from controller.approval.approval import SOURCE_AUTHORIZATION
 from controller.attempts import AttemptGate
@@ -571,13 +573,6 @@ class Service:
             return
         if _open_head(self._store.events(attempt.task), attempt, report.pr) != report.head:
             return  # the PR moved on since the verdict; the review checks the new commit
-        stored = self._store.events(attempt.task)
-        reserved = {s.event.attempt for s in stored if s.event.kind == gate_events.ATTEMPT_RESERVED}
-        automatic = {
-            s.event.attempt
-            for s in stored
-            if s.event.kind == gate_events.SOURCE_REPAIR_AUTHORIZED and s.event.attempt in reserved
-        }
         budget = contract["attempt_budget"]
         decision = repair_policy.plan(
             report.findings,
@@ -585,7 +580,7 @@ class Service:
             contract_budget=budget if isinstance(budget, int) else 1,
             project_max=project.max_attempts,
             allowance=project.repair_allowance,
-            automatic_used=len(automatic),
+            repairs_used=attempt.number - 1,
         )
         what = _failed_on(report)
         base = f"repair:{attempt}:{report.head[:12]}"
@@ -617,6 +612,31 @@ class Service:
                 now,
             )
             return
+        nxt = AttemptId(attempt.task, decision.attempt)
+        findings = repair_findings.as_data(decision.findings)
+        try:  # the worker's message must fit, or nothing is signed
+            routine.build_fire_text(
+                contract,
+                contracts.digest(contract),
+                nxt,
+                repair=routine.repair_brief(attempt, report.pr, report.head, findings),
+            )
+        except PayloadRejected as e:
+            self._notice(
+                item,
+                f"{base}:stop:too-large",
+                m.progress(
+                    Stage.NEEDS_DECISION,
+                    f"{what} The factory won't repair it on its own: what failed doesn't fit in"
+                    f" the worker's task message ({'; '.join(e.reasons)[:200]})."
+                    " Your decision: look at the PR; repair it by hand or close the attempt.",
+                    pr_url=self._pr_url(item, report.pr),
+                ),
+                now,
+            )
+            return
+        if f"{item.event_id}:{base}:refused:final" in self._view().queued_keys:
+            return  # the signer said no for good to this failure; asked once, not every round
         use = getattr(self._x.authorizer, "use_repair_allowance", None)
         if use is None:
             self._notice(
@@ -636,8 +656,6 @@ class Service:
         self._dispatcher.reconcile(attempt)
         if _open_head(self._store.events(attempt.task), attempt, report.pr) != report.head:
             return
-        nxt = AttemptId(attempt.task, decision.attempt)
-        findings = repair_findings.as_data(decision.findings)
         try:
             event = use(
                 item.authorization(),

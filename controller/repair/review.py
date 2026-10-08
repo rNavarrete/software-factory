@@ -42,6 +42,10 @@ class ReviewFailures:
         )
 
 
+def _severity(value: object) -> object:
+    return getattr(value, "value", value)
+
+
 def _finding(f: object) -> RepairFinding:
     """One review finding as the repair sees it. One it can't read is kept as
     a finding only Rolando can settle, so it can never be skipped over."""
@@ -55,7 +59,9 @@ def _finding(f: object) -> RepairFinding:
             evidence=str(d["evidence"]),
             suggested_action=str(d["suggested_action"]),
             route=route if route in ("repair", "rolando") else "rolando",
-            blocking=d.get("severity") == "blocking",
+            # Only a finding the review marks advisory is left out; a
+            # missing or unexpected severity counts as blocking.
+            blocking=_severity(d.get("severity")) != "advisory",
         )
     except (AttributeError, KeyError, TypeError, ValueError):
         return RepairFinding(
