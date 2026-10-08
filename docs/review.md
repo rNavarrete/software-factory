@@ -27,8 +27,8 @@ Each verdict names the exact commit it covers. A passed verdict is evidence for 
 
 The workflow has three jobs:
 
-- **review** checks the request, checks out the PR at the exact head commit, and runs the official Codex GitHub Action (pinned to a commit) with the fixed instructions in `controller/review/codex_prompt.md` and the output schema in `controller/review/codex_schema.json`. Codex runs read-only, with sudo dropped, as the action's security guide advises. The OpenAI key is held by the action's proxy, not by Codex. Nothing from the pilot repository is installed or run in this job. Its token can only read this repository.
-- **proofs** runs the tests Codex linked, taken from the PR's head, against the base's product code. It shows whether each test would have caught the missing change. This job runs the worker's code, so it gets no secrets and no token permissions, and sudo and Docker are switched off before any of that code runs.
+- **review** checks the request, checks out the PR at the exact head commit, removes any `AGENTS*.md` files and `.codex/` folder from that checkout (Codex would otherwise take them as its own instructions), and runs the official Codex GitHub Action (pinned to a commit) with the fixed instructions in `controller/review/codex_prompt.md` and the output schema in `controller/review/codex_schema.json`. Codex runs read-only, with sudo dropped, as the action's security guide advises. The OpenAI key is held by the action's proxy, not by Codex. No pilot script, install step or test runs in this job. Its token can only read this repository.
+- **proofs** runs the tests Codex linked (test files under `tests/` only), taken from the PR's head, against the base's product code. It shows whether each test would have caught the missing change. This job runs the worker's code, so it gets no secrets and no token permissions, Docker is switched off, and that code runs as a separate user that can't use sudo or write the job's outputs. If the install fails, a test file is missing, a test doesn't run or its result can't be read, the whole review result is **unknown**: a measuring problem is never counted as a failing test.
 - **publish** puts both outputs, with the run's own identity, into one `factory-review-result` artifact. It runs no PR code and gets no key.
 
 What Codex is given: the approved contract (goal, criteria, allowed paths and actions), the exact revision, the trusted CI run's results, and on a verification pass the open findings. It reads the code and diff itself. It must report on behavior, test coverage of each criterion, regressions and edge cases, scope, weakened tests or changed controls, security and secrets, and claims the code doesn't back up. A review that doesn't cover every area and every criterion is incomplete.
@@ -44,9 +44,9 @@ The factory doesn't believe what a run says about itself. It takes the run's ide
 - It was started and run by the trusted dispatcher (the owner of the review token).
 - It was created after the factory claimed the review, and its title carries the request key.
 
-Then it reads the run's artifact. There must be exactly one `factory-review-result`, unexpired, holding only `result.json`. Its copies of the run id, run attempt, workflow commit and workflow file must match GitHub's record. The request it answers must be the exact text the factory sent (the hash recorded in the ledger), for the same key, PR, contract and commits.
+Then it reads the run's artifact. There must be exactly one `factory-review-result`, unexpired, holding only `result.json`. Its copies of the run id, run attempt, workflow commit and workflow file must match GitHub's record. The request it answers must be the exact text the factory sent (the hash recorded in the ledger), for the same key, PR, contract and commits, and it must have used the model and effort the factory is set to. If several trusted runs answer the same request, the newest one that finished cleanly counts.
 
-Anything that fails a check above is ignored, so a look-alike run or comment changes nothing. A run that passes them but gave no usable result is **unknown**, never a pass. That covers a failed or cancelled run, a missing or doubled artifact, unreadable JSON, a result for another request, or Codex output that is incomplete. "No findings", valid JSON or a finished job is never enough. A pass still needs every criterion mapped to an assertion and shown to fail without the change, or a stated reason why that isn't practical.
+Anything that fails a check above is ignored, so a look-alike run or comment changes nothing. A run that passes them but gave no usable result is **unknown**, never a pass. That covers a failed or cancelled run, a missing or doubled artifact, unreadable JSON, a result for another request, or Codex output that is incomplete. "No findings", valid JSON or a finished job is never enough. A pass still needs every criterion mapped to an assertion and shown to fail without the change, or a stated reason why that isn't practical. A criterion that has a linked test needs that test's result; a stated reason doesn't replace it.
 
 ## Findings
 
@@ -117,10 +117,11 @@ This reads the PR with `gh api` as you. It uses a throwaway ledger, sends nothin
 
 ## Limits
 
-- The review rests on the CI artifacts GitHub keeps for 90 days, and on the review's own result, kept for 30 days. After that an old PR can't be reviewed again.
+- The review rests on the CI artifacts GitHub keeps for 90 days, and on the review's own result, also kept for 90 days. After that an old PR can't be reviewed again.
 - Each move of main is a new revision, so it uses a review pass. After one full and one verification pass, a further move of main needs an explicit allowance.
-- The failure proofs run the worker's own code. That code could lie about its own test results. The proofs show the tests aren't trivially written to pass; they don't prove the worker's code is honest. Codex's review of the tests is the check on that.
-- Codex reads the pilot repository's `AGENTS.md` or similar files if there are any. Its instructions say to treat them as data, but that is a request to the model, not something enforced.
+- The failure proofs run the worker's own code, and the results are what that code reports about itself. A test written to fail only on the base would look like a good proof. The proofs show the tests aren't trivially written to pass; they don't prove the worker's code is honest. Codex's review of the tests is the check on that.
+- Agent instruction files are removed before Codex starts, but everything else in the PR (code comments, README, test names) is still read by the model. Its instructions say to treat all of it as data, which is a request to the model, not something enforced. That is why a pass is evidence for Rolando, not an approval.
+- Changing the model or effort setting while a review is running makes that review's result **unknown**.
 - Codex is a different provider from the worker, but that alone doesn't make it independent. Independence comes from the separate repository, roles, credentials and the checks above.
 - GitHub records the review runs as started by the owner of the review token (Rolando's account). A run Rolando starts by hand with the same key counts the same way.
 - A GitHub rate limit on starting a review also makes worker launches wait, because the factory has one wait.
