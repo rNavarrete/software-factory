@@ -229,6 +229,60 @@ class AppendOnlyTest(LedgerCase):
         self.store = SqliteLedgerStore(Path(self._tmp.name) / "other" / "ledger.db")
 
 
+class AppendOnlyReplaceTest(LedgerCase):
+    def test_insert_or_replace_cannot_overwrite_a_row(self):
+        self.write(self.decision())
+        raw = sqlite3.connect(self.path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                raw.execute(
+                    "INSERT OR REPLACE INTO events (seq, kind, at, data)"
+                    " VALUES (1, 'note', '2026-10-08T00:00:00+00:00', '{}')"
+                )
+        finally:
+            raw.close()
+        self.assertEqual(self.store.events()[0].event.kind, kinds.HUMAN_DECISION)
+
+    def test_store_refuses_a_ledger_with_a_neutered_trigger(self):
+        self.store.close()
+        raw = sqlite3.connect(self.path)
+        raw.executescript(
+            "DROP TRIGGER events_no_update;"
+            "CREATE TRIGGER events_no_update BEFORE UPDATE ON events BEGIN SELECT 1; END;"
+        )
+        raw.close()
+        with self.assertRaises(LedgerError):
+            SqliteLedgerStore(self.path)
+        self.store = SqliteLedgerStore(Path(self._tmp.name) / "other" / "ledger.db")
+
+    def test_a_failed_commit_keeps_the_real_error(self):
+        # SQLite rolls back by itself on some errors; the store must not mask them.
+        self.store.close()
+        with SqliteLedgerStore(self.path) as store, store.writer_lock():
+            store._db.execute(
+                "CREATE TEMP TRIGGER boom BEFORE INSERT ON main.events"
+                " BEGIN SELECT RAISE(ROLLBACK, 'disk on fire'); END"
+            )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "disk on fire"):
+                store.append(self.context())
+            self.assertEqual(store.events(), [])
+        self.store = SqliteLedgerStore(self.path)
+
+    def test_a_ledger_that_is_not_one_is_refused(self):
+        bad = Path(self._tmp.name) / "junk" / "ledger.db"
+        bad.parent.mkdir(mode=0o700)
+        bad.write_bytes(b"not a database at all" * 100)
+        with self.assertRaises(LedgerError):
+            SqliteLedgerStore(bad)
+        other = Path(self._tmp.name) / "half" / "ledger.db"
+        other.parent.mkdir(mode=0o700)
+        raw = sqlite3.connect(other)
+        raw.execute("CREATE TABLE events (x)")
+        raw.close()
+        with self.assertRaises(LedgerError):
+            SqliteLedgerStore(other)
+
+
 class PlacementTest(LedgerCase):
     def test_files_are_private(self):
         self.write(self.context())
@@ -246,6 +300,25 @@ class PlacementTest(LedgerCase):
             SqliteLedgerStore(ROOT / "ledger.db")
         self.assertFalse((checkout / "state").exists())
 
+    def test_never_changes_a_folder_it_did_not_create(self):
+        shared = Path(self._tmp.name) / "shared"
+        shared.mkdir(mode=0o755)
+        os.chmod(shared, 0o755)
+        with self.assertRaises(LedgerError):
+            SqliteLedgerStore(shared / "ledger.db")
+        self.assertEqual(stat.S_IMODE(shared.stat().st_mode), 0o755)
+
+    def test_a_symlink_shares_the_lock(self):
+        link = Path(self._tmp.name) / "link.db"
+        link.symlink_to(self.path)
+        via_link = SqliteLedgerStore(link)
+        try:
+            with self.store.writer_lock():
+                with self.assertRaises(LedgerLocked), via_link.writer_lock():
+                    pass
+        finally:
+            via_link.close()
+
     def test_default_path_is_in_the_home_directory(self):
         from controller.ledger import default_path
 
@@ -262,6 +335,12 @@ class PlacementTest(LedgerCase):
             copy.close()
         with self.assertRaises(LedgerError):
             self.store.backup(self.home / "backups", NOW)
+        local = NOW.astimezone(timezone(timedelta(hours=-5)))
+        self.assertEqual(target.name, "ledger-20261008T120000000000Z.db")
+        with self.assertRaises(LedgerError):  # same instant, so same UTC name
+            self.store.backup(self.home / "backups", local)
+        with self.assertRaises(LedgerError):
+            self.store.backup(ROOT / "backups", NOW)
 
 
 class RedactionTest(LedgerCase):
@@ -302,6 +381,41 @@ class RedactionTest(LedgerCase):
         for text, expected in cases.items():
             self.assertEqual(redact(text), expected, text)
 
+    def test_secret_named_keys_and_basic_auth(self):
+        (s,) = self.write(
+            LedgerEvent(
+                "note",
+                NOW,
+                data={
+                    "password": "hunter2",
+                    "client_secret": "abc",
+                    "token": {"nested": "x"},
+                    "header": "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+                    "token_fingerprint": "1a2b3c4d5e6f",
+                    "absent_token": None,
+                },
+            )
+        )
+        d = s.event.data
+        self.assertEqual(
+            (d["password"], d["client_secret"], d["token"]), (REDACTED, REDACTED, REDACTED)
+        )
+        self.assertEqual(d["header"], f"Authorization: Basic {REDACTED}")
+        self.assertEqual(d["token_fingerprint"], "1a2b3c4d5e6f")
+        self.assertIsNone(d["absent_token"])
+
+    def test_keys_that_would_merge_are_refused(self):
+        event = LedgerEvent("note", NOW, data={"token=aaaaaaaa1": 1, "token=bbbbbbbb2": 2})
+        with self.store.writer_lock(), self.assertRaises(ValueError):
+            self.store.append(event)
+        self.assertEqual(self.store.events(), [])
+
+    def test_unpaired_surrogates_are_kept(self):
+        raw = b"bad \xff body".decode("utf-8", "surrogateescape")
+        (s,) = self.write(records.failure("fire", raw, NOW))
+        self.reopen()
+        self.assertEqual(self.store.events()[0].event.data["detail"], raw)
+
     def test_leaves_ordinary_evidence_alone(self):
         for text in [
             DIGEST.value,
@@ -310,6 +424,8 @@ class RedactionTest(LedgerCase):
             "token fingerprint 1a2b3c4d5e6f",
             "Contract-Digest: " + DIGEST.value,
             "HTTP 500: upstream error",
+            "laughs_abcdefghijklmnopqrstuvwxyz",
+            "rate-limit-wait:2026-10-08T12:00:00+00:00",
         ]:
             self.assertEqual(redact(text), text)
 
@@ -456,6 +572,35 @@ class EventKindTest(LedgerCase):
         )
         self.assert_refused(records.attempt_abandoned(ATTEMPT, "", "Rolando", NOW))
         self.assert_refused(LedgerEvent(kinds.ATTEMPT_ABANDONED, NOW, TASK, data={}))
+
+    def test_empty_failure_detail_is_still_kept(self):
+        self.write(records.failure("fire", str(TimeoutError()), NOW, TASK))
+        self.assertEqual(self.store.events()[0].event.data["detail"], "")
+        self.assert_refused(LedgerEvent(kinds.FAILURE, NOW, data={"stage": "fire"}))
+
+    def test_gate_decisions_need_a_person_and_evidence(self):
+        from controller.attempts import events as gate
+
+        self.write(
+            gate.repair_authorized(AttemptId(TASK, 2), "CI red", "Rolando", NOW),
+            gate.refire_authorized(RUN, "Rolando", NOW),
+            gate.attempt_cleared(ATTEMPT, gate.ClearingBasis.COMPLETED, "https://x/s", "R", NOW),
+        )
+        self.assert_refused(
+            LedgerEvent(
+                gate.REPAIR_AUTHORIZED, NOW, TASK, ATTEMPT, data={"failure": "x", "by": "R"}
+            )
+        )
+        self.assert_refused(LedgerEvent(gate.REFIRE_AUTHORIZED, NOW, TASK, data={"by": "R"}))
+        self.assert_refused(
+            LedgerEvent(
+                gate.ATTEMPT_CLEARED,
+                NOW,
+                TASK,
+                ATTEMPT,
+                data={"basis": "terminated", "how_checked": "x", "by": "R"},
+            )
+        )
 
     def test_checks_need_an_exact_revision_and_known_conclusions(self):
         self.assert_refused(

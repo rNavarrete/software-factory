@@ -16,8 +16,8 @@ _PATTERNS = [
     # Anthropic API keys and routine fire tokens (sk-ant-api03-..., sk-ant-oat01-...).
     r"sk-ant-[A-Za-z0-9_-]{8,}",
     # GitHub tokens: classic (ghp_, gho_, ghu_, ghs_, ghr_) and fine-grained.
-    r"gh[pousr]_[A-Za-z0-9]{20,}",
-    r"github_pat_[A-Za-z0-9_]{20,}",
+    r"\bgh[pousr]_[A-Za-z0-9]{20,}",
+    r"\bgithub_pat_[A-Za-z0-9_]{20,}",
     # AWS access key ids.
     r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
     # Slack tokens.
@@ -34,7 +34,14 @@ _SECRET_RE = re.compile("|".join(f"(?:{p})" for p in _PATTERNS), re.DOTALL)
 # name, drop the value.
 _LABELLED_RE = re.compile(
     r"(?i)(\b(?:authorization|x-api-key|api[_-]?key|access[_-]?token|token|secret|password)"
-    r"\"?\s*[:=]\s*\"?(?:bearer\s+)?|\bbearer\s+)([^\s\"',;]{8,})"
+    r"\"?\s*[:=]\s*\"?(?:(?:bearer|basic|token)\s+)?|\b(?:bearer|basic)\s+)([^\s\"',;]{8,})"
+)
+
+
+# A value stored under one of these keys is a secret whatever it looks like.
+_SECRET_KEY_RE = re.compile(
+    r"(?i)^(?:authorization|password|passwd|secret|client[_-]?secret|api[_-]?key|x-api-key"
+    r"|(?:access|refresh|auth|bearer|fire|routine)?[_-]?token|private[_-]?key)$"
 )
 
 
@@ -45,11 +52,23 @@ def redact(text: str) -> str:
 
 
 def redact_json(value: object) -> object:
-    """A copy of a JSON value with every string (keys included) redacted."""
+    """A copy of a JSON value with every string redacted, keys included, and
+    every value under a secret-named key (``password``, ``token``...) replaced.
+
+    Raises ValueError if redacting two keys makes them the same, rather than
+    silently dropping one of the values.
+    """
     if isinstance(value, str):
         return redact(value)
     if isinstance(value, Mapping):
-        return {redact(k): redact_json(v) for k, v in value.items()}
+        out: dict[str, object] = {}
+        for k, v in value.items():
+            key = redact(k)
+            if key in out:
+                raise ValueError(f"redacting keys would merge two entries into {key!r}")
+            secret = _SECRET_KEY_RE.match(k) and v is not None
+            out[key] = REDACTED if secret else redact_json(v)
+        return out
     if isinstance(value, list | tuple):
         return [redact_json(v) for v in value]
     return value

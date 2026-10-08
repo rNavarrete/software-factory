@@ -2,10 +2,10 @@
 
 ADR 0002 section 3: ``~/.software-factory/ledger.db``, mode 0600, WAL,
 ``synchronous=FULL``. Events are append-only. SQLite triggers refuse any
-UPDATE or DELETE on them, and the store refuses to open a ledger whose
-triggers are gone, so rewriting history takes a deliberate act outside the
-controller. The worker never has a path to this file: it runs on another
-machine (G-D2).
+UPDATE, DELETE or INSERT OR REPLACE over an existing row, and the store
+refuses to open a ledger whose schema differs in any way from the one it
+created, so rewriting history takes a deliberate act outside the controller.
+The worker never has a path to this file: it runs on another machine (G-D2).
 
 The single-writer lock is an ``flock`` on ``<ledger>.lock``. The OS releases it
 when the process dies, so a crashed controller never leaves it stuck.
@@ -19,7 +19,7 @@ import os
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from controller.interfaces import (
@@ -58,7 +58,18 @@ CREATE TRIGGER events_no_update BEFORE UPDATE ON events
 BEGIN SELECT RAISE(ABORT, 'ledger events are append-only'); END;
 CREATE TRIGGER events_no_delete BEFORE DELETE ON events
 BEGIN SELECT RAISE(ABORT, 'ledger events are append-only'); END;
+CREATE TRIGGER events_no_replace BEFORE INSERT ON events
+WHEN EXISTS (SELECT 1 FROM events WHERE seq = NEW.seq)
+BEGIN SELECT RAISE(ABORT, 'ledger events are append-only'); END;
 """
+_STATEMENTS = [st.strip() for st in _SCHEMA.split(";\n") if st.strip()]
+
+
+def _normal(sql: str) -> str:
+    return " ".join(sql.replace(";", " ").split())
+
+
+_EXPECTED_SQL = {_normal(st) for st in _STATEMENTS}
 
 
 class LedgerError(Exception):
@@ -70,7 +81,12 @@ def default_path() -> Path:
 
 
 def inside_git_checkout(path: Path) -> Path | None:
-    """The checkout root if ``path`` is inside a git working tree, else None."""
+    """The checkout root if ``path`` is inside a git working tree, else None.
+
+    Every parent up to ``/`` counts, so a home directory that is itself a git
+    checkout (a dotfiles repo) can't hold the ledger either: a worker or a
+    commit could reach it from there.
+    """
     for parent in path.resolve().parents:
         if (parent / ".git").exists():
             return parent
@@ -88,15 +104,21 @@ class SqliteLedgerStore:
         _private_dir(self.path.parent)
         _private_file(self.path)
         self._db = sqlite3.connect(self.path, isolation_level=None)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute("PRAGMA foreign_keys=ON")
         try:
+            mode = self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if mode != "wal":
+                raise LedgerError(f"the ledger needs WAL journaling, got {mode!r}")
+            self._db.execute("PRAGMA synchronous=FULL")
             self._init_schema()
+        except sqlite3.DatabaseError as e:
+            self._db.close()
+            raise LedgerError(f"{self.path} is not a usable ledger: {e}") from e
         except BaseException:
             self._db.close()
             raise
-        self._lock_path = self.path.with_name(self.path.name + ".lock")
+        # From the resolved path, so a symlink to the ledger shares its lock.
+        real = self.path.resolve()
+        self._lock_path = real.with_name(real.name + ".lock")
         self._lock_fd: int | None = None
 
     # --- LedgerStore -------------------------------------------------------------
@@ -123,7 +145,7 @@ class SqliteLedgerStore:
             ]
             db.execute("COMMIT")
         except BaseException:
-            db.execute("ROLLBACK")
+            _rollback(db)
             raise
         return [StoredEvent(s, e) for s, e in zip(seqs, clean, strict=True)]
 
@@ -161,8 +183,12 @@ class SqliteLedgerStore:
         Dispatch and reconcile call this after they write. Returns the new file.
         """
         target_dir = Path(backups_dir).expanduser()
+        checkout = inside_git_checkout(target_dir / "x")
+        if checkout is not None:
+            raise LedgerError(f"backups must live outside every git checkout, not in {checkout}")
         _private_dir(target_dir)
-        target = target_dir / f"ledger-{now.strftime('%Y%m%dT%H%M%S%fZ')}.db"
+        stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        target = target_dir / f"ledger-{stamp}.db"
         if target.exists():
             raise LedgerError(f"backup {target} already exists")
         _private_file(target)
@@ -185,34 +211,51 @@ class SqliteLedgerStore:
     # --- Internals -------------------------------------------------------------------
 
     def _init_schema(self) -> None:
-        """Create a new ledger, or check an existing one is intact. An existing
-        ledger is never repaired silently: missing triggers mean someone
-        changed it outside the controller."""
+        """Create a new ledger, or check an existing one is exactly as created.
+        An existing ledger is never repaired silently: a missing or changed
+        trigger means someone altered it outside the controller."""
         db = self._db
         db.execute("BEGIN IMMEDIATE")
         try:
-            names = {r[0] for r in db.execute("SELECT name FROM sqlite_master")}
-            if "events" not in names:
-                for statement in _SCHEMA.split(";\n"):
-                    if statement.strip():
-                        db.execute(statement)
+            if db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0:
+                for statement in _STATEMENTS:
+                    db.execute(statement)
                 db.execute("INSERT INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
-                names = {r[0] for r in db.execute("SELECT name FROM sqlite_master")}
-            row = db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+            found = {
+                _normal(r[0])
+                for r in db.execute(
+                    "SELECT sql FROM sqlite_master"
+                    " WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+                )
+            }
+            row = None
+            if found == _EXPECTED_SQL:
+                row = db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
             db.execute("COMMIT")
         except BaseException:
-            db.execute("ROLLBACK")
+            _rollback(db)
             raise
+        if found != _EXPECTED_SQL:
+            raise LedgerError("the ledger's tables or triggers were changed outside the controller")
         if row is None or row[0] != str(SCHEMA_VERSION):
-            found = row[0] if row else "unknown"
-            raise LedgerError(f"ledger schema {found}, this controller needs {SCHEMA_VERSION}")
-        if not {"events_no_update", "events_no_delete"} <= names:
-            raise LedgerError("the ledger's append-only triggers are missing; it was changed")
+            have = row[0] if row else "unknown"
+            raise LedgerError(f"ledger schema {have}, this controller needs {SCHEMA_VERSION}")
+
+
+def _rollback(db: sqlite3.Connection) -> None:
+    # SQLite may already have rolled back (disk full, I/O error); keep the real error.
+    if db.in_transaction:
+        db.execute("ROLLBACK")
 
 
 def _private_dir(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path, 0o700)
+    """Create ``path`` private, or check an existing one is private. A folder
+    someone else made is never re-permissioned."""
+    if not path.exists():
+        path.mkdir(mode=0o700, parents=True)
+        os.chmod(path, 0o700)
+    elif path.stat().st_mode & 0o077:
+        raise LedgerError(f"{path} is readable by other users; make it 0700 first")
 
 
 def _private_file(path: Path) -> None:
@@ -235,7 +278,7 @@ def _thaw(value: object) -> object:
 
 
 def _row(e: LedgerEvent) -> tuple[object, ...]:
-    data = json.dumps(_thaw(e.data), ensure_ascii=False, allow_nan=False)
+    data = json.dumps(_thaw(e.data), ensure_ascii=True, allow_nan=False)
     return (
         e.kind,
         e.at.isoformat(),

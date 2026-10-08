@@ -6,7 +6,13 @@ escalations. The kinds here record the rest of a run's evidence and the
 human side of the factory. ``SqliteLedgerStore.append`` checks every event of
 a kind listed here and refuses the whole write if one is malformed, so a
 decision without a named person or an exact digest never reaches the ledger
-(G-D3). Events of other kinds are stored as they are; their writers check them.
+(G-D3).
+
+The gate's own decision kinds (repair, re-fire, clearing) are checked here
+too, to the shape the gate's constructors write: a named person and the
+evidence the decision rests on. They carry no digest or authentication yet;
+approval binding (ENG-151) decides whether they should. Other gate kinds are
+stored as they are; the gate checks them.
 
 ``task``, ``attempt`` and ``run`` live on the event itself, never in ``data``.
 """
@@ -17,6 +23,7 @@ import re
 from collections.abc import Callable, Mapping
 from datetime import datetime
 
+from controller.attempts import events as gate
 from controller.interfaces import LedgerEvent
 
 # What dispatch knows about a run just before it fires: the exact contract,
@@ -190,7 +197,9 @@ def _attempt_abandoned(event: LedgerEvent, errors: list[str]) -> None:
 
 def _failure(event: LedgerEvent, errors: list[str]) -> None:
     _text(errors, event.data, "stage")
-    _text(errors, event.data, "detail")
+    # Kept even when empty: str(TimeoutError()) is "", and the failure still happened.
+    if not isinstance(event.data.get("detail"), str):
+        errors.append("detail must be text")
 
 
 def _human_decision(event: LedgerEvent, errors: list[str]) -> None:
@@ -232,6 +241,30 @@ def _metric(event: LedgerEvent, errors: list[str]) -> None:
     _text(errors, d, "source")
 
 
+def _repair_authorized(event: LedgerEvent, errors: list[str]) -> None:
+    _needs(errors, event, "attempt")
+    if event.attempt is not None and event.attempt.number < 2:
+        errors.append("attempt 1 needs the contract approval, not a repair authorization")
+    _text(errors, event.data, "failure")
+    _text(errors, event.data, "by")
+
+
+def _refire_authorized(event: LedgerEvent, errors: list[str]) -> None:
+    _needs(errors, event, "run")
+    _text(errors, event.data, "by")
+
+
+def _attempt_cleared(event: LedgerEvent, errors: list[str]) -> None:
+    _needs(errors, event, "attempt")
+    _text(errors, event.data, "by")
+    try:
+        basis = gate.ClearingBasis(event.data.get("basis"))
+    except ValueError:
+        errors.append("basis must be one of " + ", ".join(b.value for b in gate.ClearingBasis))
+        return
+    _text(errors, event.data, gate.clearing_evidence_field(basis))
+
+
 _RULES: dict[str, Callable[[LedgerEvent, list[str]], None]] = {
     RUN_CONTEXT: _run_context,
     CANDIDATE: _candidate,
@@ -242,6 +275,9 @@ _RULES: dict[str, Callable[[LedgerEvent, list[str]], None]] = {
     HUMAN_DECISION: _human_decision,
     HUMAN_TIME: _human_time,
     METRIC: _metric,
+    gate.REPAIR_AUTHORIZED: _repair_authorized,
+    gate.REFIRE_AUTHORIZED: _refire_authorized,
+    gate.ATTEMPT_CLEARED: _attempt_cleared,
 }
 
 CHECKED_KINDS: frozenset[str] = frozenset(_RULES)

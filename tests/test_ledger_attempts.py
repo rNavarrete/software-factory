@@ -12,8 +12,8 @@ from pathlib import Path
 
 from controller.attempts import AttemptGate
 from controller.attempts import events as ev
-from controller.interfaces import LedgerLocked
-from controller.ledger import SqliteLedgerStore
+from controller.interfaces import AttemptId, LedgerEvent, LedgerLocked, TaskId
+from controller.ledger import InvalidEvent, SqliteLedgerStore
 from tests.test_attempts import (
     DIGEST,
     LOST,
@@ -94,6 +94,58 @@ class SqliteAttemptGateTests(AttemptGateTests):
             [(r["outcome"], r["session_id"]) for r in results],
             [("not-launched", None), ("launch-outcome-unknown", None), ("launched", "cse_3")],
         )
+
+    # The two tests below replace inherited ones. In memory, malformed decision
+    # records are stored and the gate ignores them. On disk the ledger refuses
+    # them at write time, so they never exist; the lane stays just as blocked.
+
+    def test_decisions_without_a_named_person_grant_nothing(self):
+        first = self.run_attempt(TASK, not_launched(400))
+        for event in [
+            LedgerEvent(ev.REFIRE_AUTHORIZED, NOW, TASK, first.attempt, first, {"by": None}),
+            LedgerEvent(ev.REFIRE_AUTHORIZED, NOW, TASK, first.attempt, first, {"by": " "}),
+            LedgerEvent(
+                ev.REPAIR_AUTHORIZED,
+                NOW,
+                TASK,
+                AttemptId(TASK, 2),
+                data={"failure": None, "by": None},
+            ),
+            LedgerEvent(
+                ev.REPAIR_AUTHORIZED, NOW, TASK, AttemptId(TASK, 2), data={"by": "Rolando"}
+            ),
+            LedgerEvent(ev.REPAIR_AUTHORIZED, NOW, TASK, data={"failure": "x", "by": "R"}),
+        ]:
+            with self.assertRaises(InvalidEvent):
+                self.append(event)
+        self.refused("refire-not-authorized", refire_of=first)
+        self.refused("repair-not-authorized")
+        run = self.run_attempt(OTHER, launched())
+        with self.assertRaises(InvalidEvent):
+            self.append(
+                LedgerEvent(
+                    ev.ATTEMPT_CLEARED,
+                    NOW,
+                    OTHER,
+                    run.attempt,
+                    data={"basis": "completed", "session_url": "https://x", "by": None},
+                )
+            )
+        self.refused("unresolved-attempt", task=TaskId("third"))
+
+    def test_malformed_clearing_record_does_not_clear(self):
+        self.run_attempt(TASK, launched())
+        for data in [
+            {"basis": "completed", "by": "Rolando"},
+            {"basis": "routine-deleted", "session_url": "x", "by": "R"},
+            {"basis": "write-access-removed", "session_url": "x", "by": "R"},
+        ]:
+            with self.assertRaises(InvalidEvent, msg=data):
+                self.append(
+                    LedgerEvent(ev.ATTEMPT_CLEARED, NOW, TASK, AttemptId(TASK, 1), data=data)
+                )
+        self.assertEqual(self.kinds(ev.ATTEMPT_CLEARED), [])
+        self.refused("unresolved-attempt", task=OTHER)
 
 
 # Imported only to subclass; keep unittest from running the in-memory copy twice.
