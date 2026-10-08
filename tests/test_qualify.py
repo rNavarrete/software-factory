@@ -157,6 +157,43 @@ class QualifierTest(unittest.TestCase):
             self.q.fire("trig_01X", "l4")
         self.assertEqual(len(self.sent), 1)
 
+    def test_refire_after_a_rejected_key_needs_a_signed_decision(self):
+        self.ready("l1")
+        self.answer = LaunchResult(LaunchOutcome.NOT_LAUNCHED, http_status=401)
+        self.q.fire("trig_01X", "l1")
+        with self.assertRaises(qualify.QualifyRefused):
+            self.q.fire("trig_01X", "l1")
+        self.answer = launched()
+        self.now += timedelta(minutes=1)
+        result = self.q.refire("trig_01X", "l1")
+        self.assertIs(result.outcome, LaunchOutcome.LAUNCHED)
+        fires = [s.event.run.fire for s in self.store.events() if s.event.kind == ev.FIRE_INTENT]
+        self.assertEqual(fires, [1, 2])
+        # Same branch: it is the same attempt, fired again.
+        self.assertEqual(json.loads(self.sent[1][1])["branch"], "claude/qual-smoke-l1-a1")
+
+    def test_refire_is_refused_once_a_worker_may_have_started(self):
+        self.ready("l1")
+        self.q.fire("trig_01X", "l1")
+        with self.assertRaises(qualify.QualifyRefused):
+            self.q.refire("trig_01X", "l1")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_refire_declined_at_the_terminal_sends_nothing(self):
+        self.ready("l1")
+        self.answer = LaunchResult(LaunchOutcome.NOT_LAUNCHED, http_status=401)
+        self.q.fire("trig_01X", "l1")
+        self.approvals._confirm = lambda summary, code: False
+        with self.assertRaises(qualify.QualifyRefused):
+            self.q.refire("trig_01X", "l1")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_refire_of_an_unfired_step_is_refused(self):
+        self.ready("l1")
+        with self.assertRaises(qualify.QualifyRefused):
+            self.q.refire("trig_01X", "l1")
+        self.assertEqual(self.sent, [])
+
     def test_ctrl_c_during_the_send_is_recorded_unknown(self):
         self.ready("l1")
         self.answer = routine.LaunchInterrupted(
