@@ -1,0 +1,5 @@
+#!/bin/sh
+# The controller's commands on the service machine, with the same home and
+# secret files the service uses. Used over `fly ssh console`.
+export HOME=/data/qualification FACTORY_SECRETS_DIR=/run/factory-secrets
+cd /app && exec python3 -m controller "$@"

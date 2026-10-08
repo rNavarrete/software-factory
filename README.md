@@ -35,6 +35,7 @@ Each directory belongs to one ticket so parallel work never edits the same files
 | `verify/` | ENG-156, ENG-157 | Criterion verifier and assertion mapper |
 | `controller/loop/collect.py`, `verify/review.py` | ENG-145 | Reading a worker PR's evidence from GitHub, and the independent mapper's review comment |
 | `controller/loop/` | ENG-145 | `python3 -m controller.loop run <contract.json>`: one task from contract to a PR ready for Rolando's review |
+| `controller/service/`, `deploy/`, `docs/service.md` | ENG-194 | The background service on Fly.io (`python3 -m controller.service`) and the seams the Linear tickets plug into (`controller/service/seams.py`) |
 | `tasks/samples/` | ENG-145 | The sample task contracts for the first full runs |
 | `redteam/` | ENG-158 | Red-team checks |
 | `controller/audit/`, `docs/control-audit*.md` | ENG-163 | The full control check: `python3 -m controller.audit` checks every governance-map control against its evidence |

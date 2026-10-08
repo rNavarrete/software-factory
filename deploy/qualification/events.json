@@ -1,0 +1,13 @@
+[
+  {
+    "type": "authorization",
+    "event_id": "qual-move-1",
+    "issue_id": "qual-issue-1",
+    "issue_key": "QUAL-1",
+    "project_id": "qualification",
+    "actor": "Rolando",
+    "moved_at": "2026-10-08T17:00:00+00:00",
+    "revision": "0000000000000000000000000000000000000000000000000000000000000000",
+    "evidence": "qualification fixture, not a real Linear move"
+  }
+]
