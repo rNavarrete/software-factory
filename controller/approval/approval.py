@@ -14,8 +14,8 @@ secret-looking text before writing and that must not break the signature.
 
 Rules ``Approvals.check`` applies at dispatch, reading the ledger afresh:
 
-- Only the newest signed approval of a task counts; approving a revised
-  contract retires the old version.
+- Only the task's newest signed approval that hasn't been withdrawn counts;
+  approving a revised contract retires the old version.
 - A rejection or revocation of a contract cancels every approval of it made
   before it; a fresh approval afterwards is needed.
 - A signed record counts once: a copy appended later (same decision id) is
@@ -358,9 +358,12 @@ class Verdict:
 class Approvals:
     """Rolando's decisions about contracts: write them, and check them at dispatch.
 
-    ``store`` is the ledger. ``key`` signs and verifies (KeychainKey on the Mac);
-    ``retired_keys`` only verify, so records signed before a key change still
-    count. ``confirm`` asks Rolando to type a code before anything is written.
+    ``store`` is the ledger. ``key`` signs and verifies (KeychainKey on the Mac).
+    ``retired_keys`` pairs each old key with the ledger's last seq when it was
+    retired: its records up to that seq still count, so a key change doesn't
+    undo past decisions, and nothing it signs later counts, so a leaked old key
+    is useless. ``confirm`` asks Rolando to type a code before anything is
+    written.
     ``contracts`` (optional) keeps each approved contract's exact bytes.
     """
 
@@ -373,14 +376,16 @@ class Approvals:
         identity: str = APPROVER,
         os_user: str | None = None,
         approvers: frozenset[str] = frozenset({APPROVER}),
-        retired_keys: Sequence[ApprovalKey] = (),
+        retired_keys: Sequence[tuple[ApprovalKey, int]] = (),
         contracts: ContractStore | None = None,
     ) -> None:
         if identity not in approvers:
             raise ValueError(f"{identity!r} is not an approver")
         self._store = store
         self._key = key
-        self._keys = (key, *retired_keys)
+        if any(k.key_id == key.key_id for k, _ in retired_keys):
+            raise ValueError("the current key can't also be retired")
+        self._retired = {k.key_id: (k, last_seq) for k, last_seq in retired_keys}
         self._confirm = confirm
         self._identity = identity
         self._os_user = os_user or getpass.getuser()
@@ -408,6 +413,9 @@ class Approvals:
         bound = contracts.binding(contract)
         digest = ContractDigest(str(bound["digest"]))
         task = TaskId(str(contract["task_id"]))
+        _, withdrawals, _ = self._decisions(self._store.events(), task)
+        if any(at is not None and now < at for _, at, _ in withdrawals.get(digest.value, ())):
+            raise ApprovalRefused("this contract was withdrawn at a later time than now")
         summary = _contract_summary("Approve dispatch of this contract", bound, expires)
         self._ask(summary, digest.short)
         if self._contracts is not None and self._contracts.save(contract) != digest:
@@ -606,76 +614,82 @@ class Approvals:
         seen: set[str] = set()
         for item in sorted(stored, key=lambda s: s.seq):
             e = item.event
-            signed = e.kind in _SIGNED_FIELDS and authentic(e, self._keys, self._approvers)
+            # Store-assigned seq, not the signer's own date, decides whether a
+            # retired key still counts.
+            keys = [self._key] + [k for k, last in self._retired.values() if item.seq <= last]
+            signed = e.kind in _SIGNED_FIELDS and authentic(e, keys, self._approvers)
             if signed:
                 decision_id = str(e.data["decision_id"])
                 signed = decision_id not in seen
                 seen.add(decision_id)
             yield item, signed
 
-    def _approval_block(
-        self, stored: Sequence[StoredEvent], task: TaskId, digest: ContractDigest, now: datetime
-    ) -> Notice | None:
-        newest: str | None = None  # digest of the task's newest signed approval
-        approvals: list[tuple[int, datetime, datetime]] = []
-        withdrawals: list[tuple[int, datetime | None, str]] = []
-        unsigned = False
+    def _decisions(
+        self, stored: Sequence[StoredEvent], task: TaskId
+    ) -> tuple[list[tuple[int, str, datetime, datetime]], dict[str, list], set[str]]:
+        """The task's signed approvals (seq, digest, decided, expires), its
+        withdrawals by digest (seq, signed time or None, decision), and the
+        digests that have an unsigned or malformed approval."""
+        approvals: list[tuple[int, str, datetime, datetime]] = []
+        withdrawals: dict[str, list[tuple[int, datetime | None, str]]] = {}
+        unsigned: set[str] = set()
         for item, signed in self._signed(stored):
             e = item.event
             d = e.data
             if e.kind != HUMAN_DECISION or e.task != task or d.get("scope") != SCOPE:
                 continue
-            ours = d.get("digest") == digest.value
-            decision = d.get("decision")
+            digest, decision = d.get("digest"), d.get("decision")
+            if not isinstance(digest, str):
+                continue
             if decision in (REJECTED, REVOKED):
-                if ours:
-                    # Counted even if unsigned: a withdrawal can only stop dispatch.
-                    # Only a signed one's own time counts, so an unsigned one can't
-                    # reach forward and cancel approvals made after it.
-                    at = _time(d.get("decided_at")) if signed else None
-                    withdrawals.append((item.seq, at, str(decision)))
-                continue
-            if decision != APPROVED:
-                continue
-            decided, expires = _time(d.get("decided_at")), _time(d.get("expires_at"))
-            if (
-                not signed
-                or decided is None
-                or expires is None
-                or not timedelta(0) < expires - decided <= MAX_TTL
-            ):
-                unsigned = unsigned or ours
-                continue
-            newest = str(d["digest"])
-            if ours:
-                approvals.append((item.seq, decided, expires))
+                # Counted even if unsigned: a withdrawal can only stop dispatch.
+                # Only a signed one's own time counts, so an unsigned one can't
+                # reach forward and cancel approvals made after it.
+                at = _time(d.get("decided_at")) if signed else None
+                withdrawals.setdefault(digest, []).append((item.seq, at, str(decision)))
+            elif decision == APPROVED:
+                decided, expires = _time(d.get("decided_at")), _time(d.get("expires_at"))
+                if (
+                    not signed
+                    or decided is None
+                    or expires is None
+                    or not timedelta(0) < expires - decided <= MAX_TTL
+                ):
+                    unsigned.add(digest)
+                else:
+                    approvals.append((item.seq, digest, decided, expires))
+        return approvals, withdrawals, unsigned
 
-        def withdrawn(seq: int, decided: datetime) -> bool:
+    def _approval_block(
+        self, stored: Sequence[StoredEvent], task: TaskId, digest: ContractDigest, now: datetime
+    ) -> Notice | None:
+        approvals, withdrawals, unsigned = self._decisions(stored, task)
+
+        def withdrawn(seq: int, digest: str, decided: datetime) -> bool:
             return any(
-                w_seq > seq or (w_at is not None and decided <= w_at)
-                for w_seq, w_at, _ in withdrawals
+                w_seq > seq or (w_at is not None and decided < w_at)
+                for w_seq, w_at, _ in withdrawals.get(digest, ())
             )
 
-        live = [
-            (decided, expires) for seq, decided, expires in approvals if not withdrawn(seq, decided)
-        ]
-        if newest is not None and newest != digest.value:
+        live = [a for a in approvals if not withdrawn(a[0], a[1], a[2])]
+        ours = [(decided, expires) for _, d, decided, expires in live if d == digest.value]
+        if not ours and digest.value in withdrawals:
+            last = withdrawals[digest.value][-1][2]
+            return Notice(f"approval-{last}", f"Rolando {last} this exact contract.")
+        if live and live[-1][1] != digest.value:
             return Notice(
                 "approval-for-different-contract",
                 "Rolando's newest approval for this task is for a different version of the"
                 " contract. Any change (content, scope, base commit or budget) needs a fresh"
                 " approval.",
             )
-        if any(decided <= now < expires for decided, expires in live):
+        if any(decided <= now < expires for decided, expires in ours):
             return None
-        if any(now < decided for decided, _ in live):
+        if any(now < decided for decided, _ in ours):
             return Notice("approval-not-yet-valid", "The approval is dated after now.")
-        if live:
+        if ours:
             return Notice("approval-expired", "The approval has expired; approve it again.")
-        if withdrawals:
-            last = withdrawals[-1][2]
-            return Notice(f"approval-{last}", f"Rolando {last} this exact contract.")
-        if unsigned:
+        if digest.value in unsigned:
             return Notice(
                 "approval-unauthenticated",
                 "An approval record for this contract is not signed with the operator key.",
@@ -719,6 +733,12 @@ class Approvals:
         signed = _sign(event, self._key)
         with self._store.writer_lock():
             (stored,) = self._store.append(signed)
+        if not authentic(stored.event, [self._key], self._approvers):
+            raise ApprovalRefused(
+                "the ledger changed this record as it wrote it (usually by blanking text"
+                " that looks like a secret, such as a version label like 'token: ...'),"
+                " so it will never count. Change that text and decide again."
+            )
         return stored
 
 

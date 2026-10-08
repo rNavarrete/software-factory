@@ -674,7 +674,8 @@ class ApprovalTests(unittest.TestCase):
         self.desk.approve(self.contract, NOW)
         a1 = self.dispatch()
         self.finish(a1.attempt)
-        new = Approvals(self.store, OTHER_KEY, confirm=yes, retired_keys=(KEY,))
+        retired_at = self.store.events()[-1].seq
+        new = Approvals(self.store, OTHER_KEY, confirm=yes, retired_keys=[(KEY, retired_at)])
         new.authorize_repair(self.contract, 2, "CI red", NOW)
         self.assertTrue(new.check(self.contract, NOW).approved)
         # Without the retired key the old approval and clearing no longer count.
@@ -682,6 +683,41 @@ class ApprovalTests(unittest.TestCase):
         verdict = only_new.check(self.contract, NOW)
         self.assert_refused(verdict, "approval-unauthenticated")
         self.assert_refused(verdict, "unresolved-attempt")
+
+    def test_a_retired_key_cannot_make_new_decisions(self):
+        self.desk.approve(self.contract, NOW)
+        a1 = self.dispatch(result=LOST)
+        retired_at = self.store.events()[-1].seq
+        new = Approvals(self.store, OTHER_KEY, confirm=yes, retired_keys=[(KEY, retired_at)])
+        self.assertTrue(new.check(self.contract, NOW).blocks)
+        # Whoever still holds the old key signs a clearing and a repair.
+        old = Approvals(self.store, KEY, confirm=yes)
+        old.record_clearing(a1.attempt, ev.ClearingBasis.UNRESOLVED_ACCEPTED, "forged", NOW)
+        old.authorize_repair(self.contract, 2, "forged", NOW)
+        verdict = new.check(self.contract, NOW)
+        self.assert_refused(verdict, "unresolved-attempt")
+        self.assert_refused(verdict, "repair-not-authorized")
+        with self.assertRaises(ValueError):
+            Approvals(self.store, KEY, confirm=yes, retired_keys=[(KEY, 1)])
+
+    def test_reapproving_at_the_same_instant_as_a_revocation_counts(self):
+        self.desk.approve(self.contract, NOW)
+        self.desk.revoke(self.task, self.digest, "wait", NOW)
+        self.desk.approve(self.contract, NOW)
+        self.assertTrue(self.desk.check(self.contract, NOW).approved)
+
+    def test_an_approval_dated_before_a_withdrawal_is_refused_up_front(self):
+        self.desk.revoke(self.task, self.digest, "no", NOW + timedelta(minutes=10))
+        with self.assertRaises(ApprovalRefused):
+            self.desk.approve(self.contract, NOW + timedelta(minutes=5))
+
+    def test_a_withdrawn_newer_version_does_not_retire_the_older_one(self):
+        self.desk.approve(self.contract, NOW)
+        narrow = example(permitted_paths=["src/books.ts", "tests/books.test.ts"])
+        self.desk.approve(narrow, NOW + timedelta(minutes=1))
+        self.desk.revoke(self.task, contracts.digest(narrow), "wrong", NOW + timedelta(minutes=2))
+        self.assertTrue(self.desk.check(self.contract, NOW + timedelta(minutes=3)).approved)
+        self.assert_refused(self.desk.check(narrow, NOW + timedelta(minutes=3)), "approval-revoked")
 
     # --- AC6: repair attempts need a new go-ahead within the total cap ---
 
@@ -863,6 +899,14 @@ class SqliteApprovalTests(ApprovalTests):
         repair = [s.event for s in self.store.events() if s.event.kind == ev.REPAIR_AUTHORIZED]
         self.assertIn("[REDACTED]", repair[0].data["failure"])
         self.assertTrue(authentic(repair[0], KEY, frozenset({APPROVER})))
+
+    def test_a_record_the_ledger_rewrites_is_reported_not_silently_dead(self):
+        secretish = example(version="token: 2026-10-08a")
+        self.assertEqual(contracts.approval_errors(secretish), [])
+        with self.assertRaises(ApprovalRefused) as caught:
+            self.desk.approve(secretish, NOW)
+        self.assertIn("changed this record", str(caught.exception))
+        self.assert_refused(self.desk.check(secretish, NOW), "approval-unauthenticated")
 
 
 if __name__ == "__main__":
