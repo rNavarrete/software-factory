@@ -15,8 +15,9 @@ from controller.intake import LinearSource, LinearUnavailable, policy_from
 from controller.intake.linear import SETTLE
 from controller.interfaces import AttemptId
 from controller.recovery import Recovery, State
+from controller.repair.findings import RepairFinding
 from controller.service.fixtures import FixturePreparer
-from controller.service.seams import Integrations
+from controller.service.seams import FailureReport, Integrations
 from tests.test_approval import yes
 from tests.test_intake_linear import (
     BACKLOG,
@@ -39,14 +40,23 @@ FACTORY_TICKETS = ["ENG-187", "ENG-188", "ENG-189", "ENG-191"]
 
 
 class Advise:
-    """A repair advisor that always suggests one, to show when none is asked for."""
+    """A failure source that always reports a routine failure, to show when
+    a repair is never even considered."""
 
     def __init__(self):
         self.calls = []
 
-    def advise(self, attempt, detail):
+    def failure(self, attempt):
         self.calls.append(attempt)
-        return "the tests failed"
+        finding = RepairFinding(
+            id="F-000000000001",
+            category="checks-failed",
+            summary="the tests failed",
+            evidence="CI run",
+            suggested_action="Fix the failing test's code.",
+            route="repair",
+        )
+        return FailureReport(attempt, 7, SHA_A, (finding,), "review")
 
 
 class IntakeServiceCase(ServiceCase):

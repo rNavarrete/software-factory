@@ -23,6 +23,9 @@ one JSON request per connection:
   Linear itself and the contract against the onboarding file before it
   signs anything (``authorize.py``). It answers with the signed
   ``source-authorization`` record, or ``{"refused": reason, "final": bool}``.
+- ``{"op": "use-repair-allowance", ...}`` (ENG-160): the same checks, then a
+  ``source-repair-authorized`` record for one repair attempt within the
+  repair allowance the onboarding file gives Todo moves (``authorize.py``).
 
 The kernel reports the caller's user id (``SO_PEERCRED``); only the allowed
 user ids are answered.
@@ -215,15 +218,34 @@ def authorize_handler(authorizer: object) -> Handler:
         event_id, issue_id, revision = req.get("event_id"), req.get("issue_id"), req.get("revision")
         if not all(isinstance(v, str) for v in (event_id, issue_id, revision)):
             return {"error": "event_id, issue_id and revision must be text"}
+        repair = req.get("op") == REPAIR_OP
         try:
-            event = authorizer.authorize(event_id, issue_id, req.get("contract"), revision)  # type: ignore[attr-defined]
+            if repair:
+                event = authorizer.use_repair_allowance(  # type: ignore[attr-defined]
+                    event_id,
+                    issue_id,
+                    req.get("contract"),
+                    revision,
+                    req.get("attempt"),
+                    req.get("prior_pr"),
+                    req.get("prior_head"),
+                    req.get("failure"),
+                    req.get("findings"),
+                )
+            else:
+                event = authorizer.authorize(event_id, issue_id, req.get("contract"), revision)  # type: ignore[attr-defined]
         except Refused as e:
-            log.info("refused to authorize %s: %s", event_id, e.reason)
+            log.info("refused to %s %s: %s", req.get("op"), event_id, e.reason)
             return {"refused": e.reason, "final": e.final}
-        log.info("authorized %s for %s", event_id, event.data.get("digest"))
+        log.info("%s %s for %s", req.get("op"), event_id, event.data.get("digest"))
         return {"event": event_to_json(event)}
 
     return handle
+
+
+REPAIR_OP = "use-repair-allowance"
+"""The signer request for a repair under a Todo move's allowance (ENG-160).
+The same handler as ``authorize`` answers it."""
 
 
 class SignerAuthorizer:
@@ -249,10 +271,43 @@ class SignerAuthorizer:
             raise AuthorizationRefused(str(answer["refused"]), final=answer.get("final") is True)
         return event_from_json(answer["event"])  # type: ignore[arg-type]
 
+    def use_repair_allowance(
+        self,
+        authorization: object,
+        contract: Mapping[str, object],
+        attempt: object,
+        prior_pr: int,
+        prior_head: str,
+        failure: str,
+        findings: object,
+    ):
+        """Ask for a repair go-ahead under the Todo move's allowance (ENG-160)."""
+        from controller.service.seams import AuthorizationRefused
+        from controller.signer.authorize import event_from_json
+
+        req = {
+            "op": REPAIR_OP,
+            "event_id": authorization.event_id,  # type: ignore[attr-defined]
+            "issue_id": authorization.issue_id,  # type: ignore[attr-defined]
+            "revision": authorization.revision,  # type: ignore[attr-defined]
+            "contract": json.loads(json.dumps(contract, default=_plain)),
+            "attempt": attempt.number,  # type: ignore[attr-defined]
+            "prior_pr": prior_pr,
+            "prior_head": prior_head,
+            "failure": failure,
+            "findings": json.loads(json.dumps(findings, default=_plain)),
+        }
+        answer = self._call(self._path, req)
+        if "refused" in answer:
+            raise AuthorizationRefused(str(answer["refused"]), final=answer.get("final") is True)
+        return event_from_json(answer["event"])  # type: ignore[arg-type]
+
 
 def _plain(value: object) -> object:
     if isinstance(value, Mapping):
         return dict(value)
+    if isinstance(value, tuple):
+        return list(value)
     raise TypeError(f"not JSON: {type(value).__name__}")
 
 

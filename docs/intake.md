@@ -64,7 +64,7 @@ Rolando chose this on 2026-10-08: his own Todo move approves the task the factor
 - It reads the onboarding file from the image, which the service can't change, and refuses unless intake is switched on. The contract must be for that ticket and stay inside the project's limits: repository, routine, actions, checks and attempt budget. Its permitted paths must stay clear of the project's `protected_paths` (for the pilot: workflows, agent instructions, package and build config). Anything that could touch them needs Rolando's typed approval.
 - Each Todo move can authorize one contract only. A changed task needs a new Todo move. The signer keeps that record in its own folder.
 - It then signs a record of its own kind, `source-authorization`. It is never a typed `human-decision`, so it can't pass for one. The record names the move, the ticket revision, the routine, the onboarding entry and the contract digest. It lasts 30 minutes, and the approval check accepts at most one hour. While a ticket waits for the lane, the service asks again when the record expires.
-- It counts only for the service's routine and only for attempt 1. Repairs, re-fires and clearings still need Rolando's typed records.
+- It counts only for the service's routine and only for attempt 1. Re-fires and clearings still need Rolando's typed records. A repair needs either his typed go-ahead or the signer's repair go-ahead within the move's allowance ([repair.md](repair.md)).
 - Once Rolando rejects or revokes a contract, no Todo-move record for that contract counts again, whenever it was signed. The signer can't read the ledger, so this rule lives in the approval check, not in the service. Only his typed approval brings that contract back.
 
 If the signer refuses for good (someone else moved the ticket, the contract is out of bounds, a different contract was already approved for that move), the queued ticket closes with the reason. If the problem is passing (Linear is down, intake is off), the ticket waits.
@@ -73,37 +73,15 @@ Rolando's typed approval over `fly ssh console` still works and always counts.
 
 What the Todo move does not check: the signer can't judge whether the drafted goal and acceptance criteria match the ticket, and it doesn't check the base commit (the dispatcher refuses one that isn't on main). Inside the limits above, the Todo move approves whatever the factory drafted from that ticket. The independent review (ENG-156), CI and Rolando's merge are the checks on the result.
 
-### Repair allowance recorded with the move (ENG-160, first part)
+### Repair allowance recorded with the move (ENG-160)
 
-Onboarding can now declare `repair_allowance`, default **0**. It counts corrections
-inside `max_attempts`, not on top of it: three total attempts allow at most two
-repairs. The signer further reduces the recorded allowance if the specific
-contract has a smaller attempt budget. Neither ticket text nor the drafting
-model chooses this number.
+Onboarding can declare `repair_allowance`, default **0**. It counts corrections inside `max_attempts`, not on top of it: three total attempts allow at most two repairs. The signer lowers the recorded allowance if the contract has a smaller attempt budget. Neither ticket text nor the drafting model chooses this number.
 
-A positive allowance also requires `repair_allowance_since`, an ISO timestamp
-with a time zone. Set this to the activation time whenever establishing or
-changing repair terms; do not backdate it. A Todo move before that time is
-refused, even if the factory is only now reading it. Rolando must make a new
-move to accept the new terms.
+A positive allowance also needs `repair_allowance_since`, an ISO timestamp with a time zone. Set it to the time repairs are switched on, every time the repair settings change, and don't backdate it. A Todo move made before that time is refused for a task that would get repairs, even if the factory only reads the move now. A task whose budget leaves no room for repairs isn't held to it. Rolando moves the ticket to Todo again to accept the new terms.
 
-The signer includes the allowance in the signature alongside the task digest,
-source revision and policy hash. It saves the move's terms durably before
-returning a signature. Renewal extends the expiry, never the allowance. Changing
-a positive allowance's policy or source revision requires a new move. Legacy
-digest-only move records remain valid for zero repairs and cannot be upgraded.
-Old signed records without this field still verify but carry no allowance.
-The new move records are objects; rolling back to an older signer refuses them
-rather than accepting different terms. Preserve the signer's state file.
+The signer signs the allowance together with the task digest, ticket revision and policy hash, and saves the move's terms to disk before it answers. Renewing extends the expiry, never the allowance. A change to the repair settings (the allowance or its start time) or to the ticket text needs a new move. Other onboarding edits, such as listing the next pilot ticket, don't affect queued moves. Older move records that hold only a digest keep zero repairs and can't be upgraded. Older signed approvals without the field still verify but carry no allowance. Only the Todo move's approval and the signer's repair go-ahead may carry an allowance; on any other record it makes the record fail verification. Keep the signer's state file: rolling back to an older signer refuses the new records rather than accepting different terms.
 
-**This records the terms; it does not enable automatic repairs.** The current
-dispatcher still requires a typed repair go-ahead and qualified writer-clearing
-evidence. The pilot configuration remains at zero. ENG-160 still needs the
-independent failure handoff from ENG-156, bounded dispatch and new-candidate
-verification, followed by the live successful/capped repair demonstrations.
-Future repair dispatch must recheck current policy, source standing, expiry,
-revocation and remaining total attempts under the existing launch lock; the
-presence of a signed allowance alone is insufficient.
+How the factory uses the allowance to start a repair on its own, and the clearing step that still needs Rolando, is in [repair.md](repair.md).
 
 ## Before switching intake on
 

@@ -534,14 +534,7 @@ class ServiceTests(ServiceCase):
         self.assertIn("evt-3", self.view().items)
         self.assertEqual(len(self.adapter.requests), 1)
 
-    def test_repair_advice_closes_the_item_and_asks(self):
-        class Advise:
-            def advise(self, attempt, detail):
-                return "the tests failed"
-
-        self.service._x = Integrations(
-            self.source, self.preparer, self.reporter, self.reviewer, Advise()
-        )
+    def test_attempt_rolando_closed_ends_the_item_without_a_repair(self):
         self.rolando_approves()
         self.tick()
         a1 = AttemptId(self.task(), 1)
@@ -550,9 +543,37 @@ class ServiceTests(ServiceCase):
         self.tick(minutes=6)
         self.recovery_close(a1)
         self.tick(minutes=6)
-        self.assertEqual(self.view().items["evt-1"].closed, "repair-suggested")
-        self.assertTrue(any("go-ahead" in t for t in self.reporter.texts()))
+        self.assertEqual(self.view().items["evt-1"].closed, "failed")
+        self.assertTrue(any("stopped work" in t for t in self.reporter.texts()))
         self.assertEqual(len(self.adapter.requests), 1)
+
+    def test_typed_repair_after_a_failed_pr_starts_the_next_attempt(self):
+        """ENG-160: Rolando's typed go-ahead for attempt 2 puts the work back
+        in the queue; the service starts it through dispatch, once."""
+        self.rolando_approves()
+        self.tick()
+        a1 = AttemptId(self.task(), 1)
+        self.github.branches[a1.branch] = SHA_A
+        self.github.pulls = [self.pr()]
+        self.tick(minutes=6)
+        session = next(
+            s.event.data["session_url"]
+            for s in self.store.events(a1.task)
+            if s.event.kind == ev.FIRE_RESULT and s.event.data.get("session_url")
+        )
+        rolando = Approvals(self.store, KEY, confirm=yes, os_user="rolando")
+        rolando.record_clearing(a1, ev.ClearingBasis.COMPLETED, session, self.now)
+        self.tick(minutes=6)
+        self.assertEqual(len(self.adapter.requests), 1)  # nothing without his go-ahead
+        rolando.authorize_repair(contract_for("ENG-186"), 2, "the tests failed", self.now)
+        r = self.tick(minutes=6)
+        self.assertEqual(r.fired, ["eng-186-a2-f1"])
+        self.assertIsNone(self.view().items["evt-1"].closed)
+        for _ in range(3):
+            self.tick(minutes=6)
+        self.assertEqual(len(self.adapter.requests), 2)
+        # A typed repair fires with the contract alone, as before.
+        self.assertNotIn('"repair"', self.adapter.requests[1].text)
 
     def recovery_close(self, attempt):
         rec = Recovery(

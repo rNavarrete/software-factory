@@ -99,7 +99,7 @@ The service never approves, merges or releases anything, and it never signs a de
 - `linear_project_id`, `name`
 - `repository` and `routine_id`. In v1 these must be the pilot repo and the factory routine, and any other value refuses the whole file.
 - `allowed_actions`, `checks` and `max_attempts`. These are the most a drafted contract may ask for. A contract that names another repository, another task, a new action, a new check or a bigger budget is refused before dispatch.
-- `repair_allowance` (default zero) records how many of those attempts may be corrections. A positive value needs `repair_allowance_since`, the policy activation timestamp; only later Todo moves may acquire it. This is signed groundwork for ENG-160 and does not enable automatic repair. See [repair terms](intake.md#repair-allowance-recorded-with-the-move-eng-160-first-part).
+- `repair_allowance` (default zero) is how many of those attempts the factory may start on its own as repairs. A positive value needs `repair_allowance_since`, the time repairs were switched on; only later Todo moves get it. See [repair.md](repair.md) and [repair terms](intake.md#repair-allowance-recorded-with-the-move-eng-160).
 - `status_issue_id`: a Linear ticket for notices that concern the whole factory, such as outages and pause.
 - `intake_enabled` (top level). This is off unless set. While it is off, every Todo move is refused, and only work already queued continues. It stays off until the full path is qualified (ENG-163).
 
@@ -140,7 +140,8 @@ The service posts this on the ticket: "It is unclear whether worker … started"
 | `Reporter.post(issue_id, key, text)` | ENG-178 | Posts on Linear. Must be idempotent per `key`, because the service retries when it can't tell a failure from a lost answer. Built: `LinearReporter` (`--reporter linear`), see `docs/reporting.md`. |
 | `DecisionReader.answers(issue_id)` | ENG-178 | Rolando's own, unedited replies to the factory's product questions, for later use in drafting. Never an approval. |
 | `ReviewStarter.start(pr, key)` | ENG-156 | Called when an attempt's PR first appears. The request and its key are saved in the ledger before the call, and after a crash the same key is sent again, so the reviewer must treat a repeated key as the review it already started. Runs under the reviewer's own identity. |
-| `RepairAdvisor.advise(attempt, detail)` | ENG-160 | Suggests a repair. The service only posts the suggestion; a repair still needs its signed go-ahead. |
+| `FailureSource.failure(attempt)` | ENG-160 | The review's failed verdict for an attempt, as a `FailureReport` (PR, exact commit, findings), or None. Built: `controller/repair/review.py` reads the ENG-156 review's own records. |
+| `RepairAuthorizer.use_repair_allowance(...)` | ENG-160 | The signer's repair go-ahead for one attempt within the Todo move's allowance. See [repair.md](repair.md). |
 
 The worker itself sits behind the existing runtime boundary: `RuntimeAdapter` in `controller/interfaces.py`, which the service reaches only through the `adapter` factory `Dispatcher` takes. A worker pool (ENG-154) plugs in there. The first deployment keeps one worker at a time.
 
@@ -150,5 +151,5 @@ ENG-174 settled how a verified Todo move becomes the approval: Rolando chose it 
 
 - **Only the signer holds the approval key (ENG-174).** The key is HMAC, so whoever can check a signature can also make one. On the machine it therefore lives only in a small signer process running as its own user (`factory-signer`). The service runs as `factory`, can't read the key file, and can only ask the signer whether a signature is good. Code that reads Linear text, model output or GitHub data can't forge an approval. Rolando's own commands over `fly ssh console` run as root and sign as before. If the signer or the service stops, the start script stops the other and exits, and Fly starts the machine again with both. See docs/intake.md.
 - **Each ticket gets one task and one attempt budget for its whole life.** If a ticket the factory already worked on is moved to Todo again, the service says so and does nothing. New work needs a new ticket.
-- **A suggested repair closes the ticket's queue entry.** A repair still needs Rolando's signed go-ahead. How that go-ahead puts the work back in the queue is ENG-160's job.
+- **A repair waits for Rolando to confirm the earlier worker finished.** The factory can't read or stop a session, so the ticket note gives him the exact clearing command. After that the repair goes on by itself if the move's allowance covers it; otherwise his typed go-ahead starts it, and the queued ticket stays open for it. See [repair.md](repair.md).
 - **The GitHub token expires.** Fine-grained tokens last at most a year. When it expires, the service can't read GitHub and says so every round. Renewing it is one `fly secrets import` (see the setup steps in the PR).

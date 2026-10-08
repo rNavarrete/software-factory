@@ -31,6 +31,10 @@ DISPATCH_REFUSED = "dispatch-refused"
 
 # Human decisions the gate reads.
 REPAIR_AUTHORIZED = "repair-authorized"
+SOURCE_REPAIR_AUTHORIZED = "source-repair-authorized"
+"""A repair started under the repair allowance of Rolando's Todo move (ENG-160),
+signed by the signer process, never by Rolando at a terminal. The gate counts
+it like a repair go-ahead; whether it really counts is ``Approvals``' call."""
 REFIRE_AUTHORIZED = "refire-authorized"
 ATTEMPT_CLEARED = "attempt-cleared"
 

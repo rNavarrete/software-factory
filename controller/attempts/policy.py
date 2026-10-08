@@ -164,7 +164,9 @@ class LedgerView:
             evidence = d[ev.clearing_evidence_field(basis)]
             if _text(evidence) and _text(d.get("by")):
                 self.attempts[e.attempt].cleared = basis
-        elif e.kind == ev.REPAIR_AUTHORIZED and e.attempt is not None:
+        elif (
+            e.kind in (ev.REPAIR_AUTHORIZED, ev.SOURCE_REPAIR_AUTHORIZED) and e.attempt is not None
+        ):
             if e.attempt.number >= 2 and _text(d.get("failure")) and _text(d.get("by")):
                 self.repairs.add(e.attempt)
                 failed = AttemptId(e.attempt.task, e.attempt.number - 1)
