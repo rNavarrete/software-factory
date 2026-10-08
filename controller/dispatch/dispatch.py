@@ -12,11 +12,12 @@ ledger at the moment it is made. In order:
    (dispatching, unknown, running, a PR open, waiting on Rolando, merged) is
    not fired again: its recorded state is returned. That makes a repeated
    ``dispatch`` safe.
-4. If Rolando hasn't approved this exact contract, he is shown it and types
-   the code (the same signed approval as ``factory approve``). If its last fire
-   was definitely not launched (a 429, say), he is asked to sign a re-fire,
-   but only once the gate would otherwise allow it, so a wait is reported
-   without asking him anything.
+4. Anything Rolando can't settle by typing a code here (a hold, a rate-limit
+   wait, the single lane, a cap, a withdrawn approval) refuses now, before he
+   is asked anything. Then, if he hasn't approved this exact contract, he is
+   shown it and types the code (the same signed approval as ``factory
+   approve``); if its last fire was definitely not launched (a 429, say), he
+   signs the re-fire the same way.
 5. ``Launcher.fire``: approvals, recovery and the attempt gate are checked;
    the fire text and start key are prepared; the gate reserves the run under
    the ledger's writer lock, re-running the approval and recovery checks
@@ -80,6 +81,9 @@ _LOCK_WAIT_SECONDS = 0.2
 
 # Approval blocks Rolando can settle by approving the contract in front of him.
 _APPROVABLE = frozenset({"approval-missing", "approval-expired", "approval-for-different-contract"})
+
+# What dispatch asks Rolando for itself, at the terminal.
+_ASKABLE = _APPROVABLE | {"refire-not-authorized"}
 
 # Attempt states where a repeated dispatch returns what is on record.
 _GOING = frozenset(
@@ -376,6 +380,7 @@ class Dispatcher:
                     )
                 refire_of = last.run
 
+        self._preview(contract, digest, now, refire_of)
         self._approve_if_needed(contract, now, refire_of)
         if refire_of is not None:
             self._authorize_refire(contract, digest, refire_of)
@@ -449,12 +454,32 @@ class Dispatcher:
             f" ({status.detail}).{note} Next: {status.next_step}",
         )
 
+    def _preview(
+        self,
+        contract: Mapping[str, object],
+        digest: ContractDigest,
+        now: datetime,
+        refire_of: RunId | None,
+    ) -> None:
+        """Refuse before asking Rolando anything if something he can't settle by
+        typing a code here would stop the fire anyway: a hold, a rate-limit
+        wait, the single lane, a cap, a missing repair go-ahead, a withdrawn
+        approval."""
+        task = TaskId(str(contract["task_id"]))
+        decision = self._gate.decide(task, digest, now, refire_of=refire_of)
+        _, _, checked = self.launcher.check(contract, now, refire_of)
+        blocks: list[Notice] = []
+        for b in (*decision.blocks, *checked):
+            if b.code not in _ASKABLE and b not in blocks:
+                blocks.append(b)
+        if blocks:
+            raise Refused(blocks)
+
     def _approve_if_needed(
         self, contract: Mapping[str, object], now: datetime, refire_of: RunId | None
     ) -> None:
         verdict = self._approvals.check(contract, now, refire_of=refire_of)
-        codes = {b.code for b in verdict.blocks}
-        if not codes & _APPROVABLE:
+        if not {b.code for b in verdict.blocks} & _APPROVABLE:
             return
         try:
             self._approvals.approve(contract, now)
@@ -464,20 +489,11 @@ class Dispatcher:
     def _authorize_refire(
         self, contract: Mapping[str, object], digest: ContractDigest, prior: RunId
     ) -> None:
-        now = self._now()
         trusted = self._approvals.trusted_events(self._store.events(), digest)
         if prior in LedgerView.build(trusted).refires:
             return
-        # Ask only once the gate would otherwise let the fire go, so a rate
-        # limit wait or a hold is reported without asking Rolando anything.
-        decision = self._gate.decide(prior.attempt.task, digest, now, refire_of=prior)
-        waiting = [b for b in decision.blocks if b.code != "refire-not-authorized"]
-        _, _, others = self.launcher.check(contract, now, prior)
-        waiting += [b for b in others if b.code != "refire-not-authorized"]
-        if waiting:
-            raise Refused(waiting)
         try:
-            self._approvals.authorize_refire(contract, prior, now)
+            self._approvals.authorize_refire(contract, prior, self._now())
         except ApprovalRefused as e:
             raise Refused([Notice("refire-not-authorized", str(e))]) from None
 
