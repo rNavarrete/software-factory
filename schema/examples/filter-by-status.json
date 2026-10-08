@@ -1,0 +1,43 @@
+{
+  "format": "factory-contract/v1",
+  "task_id": "filter-by-status",
+  "version": "1",
+  "goal": "Let the reader show only the books with one status (to-read, reading or done), or all of them.",
+  "inputs": [
+    "README.md describes the app.",
+    "src/books.ts holds the pure domain functions; new logic goes there with unit tests."
+  ],
+  "repository": "rNavarrete/factory-pilot-demo",
+  "base_commit": "6c6badb8f086b7c4a3eaf3ba43317854e87e9b96",
+  "permitted_paths": ["src/books.ts", "src/main.ts", "src/style.css", "index.html", "tests/books.test.ts"],
+  "permitted_actions": ["modify-files", "add-tests"],
+  "risk_markers": [],
+  "acceptance_criteria": [
+    {
+      "id": "ac1",
+      "statement": "filterByStatus(books, status) returns only the books with that status, in their original order, without changing the input array.",
+      "evidence": {"type": "automated-check", "command": "npm test"},
+      "status": "ready"
+    },
+    {
+      "id": "ac2",
+      "statement": "filterByStatus(books, 'all') returns every book.",
+      "evidence": {"type": "automated-check", "command": "npm test"},
+      "status": "ready"
+    },
+    {
+      "id": "ac3",
+      "statement": "The page has a status filter control above the list that updates the list when changed.",
+      "evidence": {
+        "type": "observable-behavior",
+        "steps": "Add three books, mark one reading and one done, then pick 'reading' in the filter.",
+        "expected": "Only the book marked reading is listed; picking 'all' lists all three again."
+      },
+      "status": "ready"
+    }
+  ],
+  "verification_commands": ["npm run typecheck", "npm test", "npm run build"],
+  "attempt_budget": 3,
+  "escalate_to": "rNavarrete",
+  "depends_on": []
+}

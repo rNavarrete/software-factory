@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rNavarrete/software-factory/schema/contract-v1.schema.json",
+  "title": "Factory single-task contract, version 1",
+  "description": "One bounded task for one worker. Rolando approves a contract by the sha256 of its canonical bytes (controller/contract). That module is the authority; this file documents the format and is kept in step with it by tests/test_contract.py. Rules a JSON Schema can't express: an automated-check command must be one of verification_commands; the add-dependency and change-control-files actions need the new-dependency and control-change risk markers; list entries and criterion ids must be unique; no floats anywhere; permitted paths have no '.' or '..' parts; a criterion marked needs-clarification makes the contract unapprovable.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format", "task_id", "version", "goal", "inputs", "repository", "base_commit",
+    "permitted_paths", "permitted_actions", "risk_markers", "acceptance_criteria",
+    "verification_commands", "attempt_budget", "escalate_to", "depends_on"
+  ],
+  "properties": {
+    "format": {"const": "factory-contract/v1"},
+    "task_id": {
+      "description": "Used in the marker branch claude/<task_id>-a<n> and the PR title marker.",
+      "type": "string", "maxLength": 64, "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+    },
+    "version": {
+      "description": "A label for people. Approval binds to the digest, not this label.",
+      "$ref": "#/$defs/text", "maxLength": 40
+    },
+    "goal": {"$ref": "#/$defs/text"},
+    "inputs": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/text"}},
+    "repository": {"$ref": "#/$defs/repository"},
+    "base_commit": {"$ref": "#/$defs/commit"},
+    "permitted_paths": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {
+        "description": "Repo-relative path or glob; no leading slash and no empty, '.' or '..' parts.",
+        "type": "string", "pattern": "^[A-Za-z0-9._*-]+(/[A-Za-z0-9._*-]+)*$"
+      }
+    },
+    "permitted_actions": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"enum": ["modify-files", "add-files", "delete-files", "add-tests", "add-dependency", "change-control-files"]}
+    },
+    "risk_markers": {
+      "type": "array", "uniqueItems": true,
+      "items": {"enum": ["control-change", "new-dependency", "user-data", "security", "external-service", "data-migration"]}
+    },
+    "acceptance_criteria": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"$ref": "#/$defs/criterion"}
+    },
+    "verification_commands": {
+      "type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/text"}
+    },
+    "attempt_budget": {"type": "integer", "minimum": 1, "maximum": 3},
+    "escalate_to": {"$ref": "#/$defs/login"},
+    "depends_on": {
+      "description": "Earlier results this task builds on, each named by its exact commit.",
+      "type": "array", "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["repository", "commit", "reason"],
+        "properties": {
+          "repository": {"$ref": "#/$defs/repository"},
+          "commit": {"$ref": "#/$defs/commit"},
+          "reason": {"$ref": "#/$defs/text"}
+        }
+      }
+    },
+    "notes": {"$ref": "#/$defs/text"}
+  },
+  "$defs": {
+    "text": {"type": "string", "minLength": 1, "maxLength": 4000, "pattern": "\\S"},
+    "commit": {
+      "description": "A full commit id. Branch and tag names are refused because they move.",
+      "type": "string", "pattern": "^[0-9a-f]{40}$"
+    },
+    "repository": {"type": "string", "pattern": "^[A-Za-z0-9](-?[A-Za-z0-9]){0,38}/[A-Za-z0-9._-]{1,100}$"},
+    "login": {"type": "string", "pattern": "^[A-Za-z0-9](-?[A-Za-z0-9]){0,38}$"},
+    "criterion": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "statement", "evidence", "status"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^ac[1-9][0-9]*$"},
+        "statement": {"$ref": "#/$defs/text"},
+        "evidence": {
+          "oneOf": [
+            {
+              "type": "object", "additionalProperties": false, "required": ["type", "command"],
+              "properties": {"type": {"const": "automated-check"}, "command": {"$ref": "#/$defs/text"}}
+            },
+            {
+              "type": "object", "additionalProperties": false, "required": ["type", "steps", "expected"],
+              "properties": {
+                "type": {"const": "observable-behavior"},
+                "steps": {"$ref": "#/$defs/text"},
+                "expected": {"$ref": "#/$defs/text"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false, "required": ["type", "reviewer", "question"],
+              "properties": {
+                "type": {"const": "human-review"},
+                "reviewer": {"$ref": "#/$defs/login"},
+                "question": {"$ref": "#/$defs/text"}
+              }
+            }
+          ]
+        },
+        "status": {"enum": ["ready", "needs-clarification"]},
+        "clarification": {
+          "description": "What must be made clear. Present exactly when status is needs-clarification.",
+          "$ref": "#/$defs/text"
+        }
+      },
+      "if": {"required": ["status"], "properties": {"status": {"const": "needs-clarification"}}},
+      "then": {"required": ["clarification"]},
+      "else": {"not": {"required": ["clarification"]}}
+    }
+  }
+}
