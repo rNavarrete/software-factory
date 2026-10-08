@@ -863,9 +863,8 @@ class ContractStoreTests(unittest.TestCase):
 
 
 try:
-    from controller.ledger.store import SqliteLedgerStore
-
     from controller.ledger import kinds as ledger_kinds
+    from controller.ledger.store import SqliteLedgerStore
 except ImportError:  # the durable ledger (ENG-147) is not merged yet
     SqliteLedgerStore = None
 
