@@ -36,9 +36,9 @@ fi
 echo "== Read-only GitHub token"
 if ! fly secrets list --app "$APP" | grep -q FACTORY_GITHUB_TOKEN; then
     echo "Paste the read-only GitHub token and press Enter (nothing will show):"
-    stty -echo
-    read -r TOKEN
-    stty echo
+    stty -echo </dev/tty
+    read -r TOKEN </dev/tty
+    stty echo </dev/tty
     printf 'FACTORY_GITHUB_TOKEN=%s\n' "$TOKEN" | fly secrets import --app "$APP" --stage
     unset TOKEN
 fi
@@ -53,9 +53,9 @@ fly ssh console --app "$APP" --pty \
 
 echo "== Usage reading (claude.ai usage page of the factory account)"
 printf "Current session usage %%: "
-read -r SESSION
+read -r SESSION </dev/tty
 printf "Weekly usage %%: "
-read -r WEEKLY
+read -r WEEKLY </dev/tty
 case "$SESSION$WEEKLY" in
     *[!0-9.]* | "") echo "Numbers only, please. Run this script again." >&2; exit 1 ;;
 esac
