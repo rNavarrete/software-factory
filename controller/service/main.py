@@ -381,7 +381,7 @@ def _reporter(args: argparse.Namespace, secrets):
     from controller.report.reporter import LinearReporter
 
     return LinearReporter(
-        HttpTransport(lambda: secrets.get("linear-key")),
+        HttpTransport(lambda: secrets.get("linear-key"), forbidden_user=args.approver_linear_id),
         approver_id=args.approver_linear_id,
     )
 

@@ -216,10 +216,19 @@ class QuestionTests(unittest.TestCase):
         self.assertTrue(text.endswith("factory-question: q-sort options=A"))
 
     def test_question_repeat(self) -> None:
-        text = m.question_repeat()
+        text = m.question_repeat(sort_question())
         self.assertEqual(stage_of(text), "Needs your decision")
         self.assertIn("hasn't changed", text)
         self.assertNotIn("factory-question:", text)
+
+    def test_repeat_of_a_factory_failure_stays_a_stop(self) -> None:
+        for kind in ("factory", "changed"):
+            with self.subTest(kind):
+                q = Question("The factory couldn't read the repository.", kind=kind)
+                text = m.question_repeat(q)
+                self.assertEqual(stage_of(text), "Stopped")
+                self.assertIn("couldn't read the repository", text)
+                self.assertNotIn("answer", text.lower())
 
 
 class ProgressTests(unittest.TestCase):
@@ -228,7 +237,7 @@ class ProgressTests(unittest.TestCase):
         texts = [
             m.progress(Stage.WORKING, "x"),
             m.question(sort_question()),
-            m.question_repeat(),
+            m.question_repeat(sort_question()),
             m.observation_request(SHA, "Look?"),
             m.ready(Readiness(PR, SHA, "x")),
             m.merged(1, SHA, ReviewEvidence())[1],

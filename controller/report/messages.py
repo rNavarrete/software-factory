@@ -177,8 +177,17 @@ def question(q: Question) -> str:
     return "\n".join(lines)
 
 
-def question_repeat() -> str:
-    """The same question came back because the ticket text didn't change."""
+def question_repeat(q: Question) -> str:
+    """The same question came back because the ticket text didn't change.
+    Keeps the original meaning: a factory failure or a changed ticket stays
+    a stop notice, and only a real question asks for an answer."""
+    kind = str(getattr(q, "kind", "product") or "product")
+    if kind in NOTICE_KINDS:
+        return progress(
+            Stage.STOPPED,
+            "The factory stopped again, for the same reason as in its notice above:"
+            f" {_line(q.text, 500)} Nothing will start until that is resolved.",
+        )
     return progress(
         Stage.NEEDS_DECISION,
         "The ticket hasn't changed since the factory's question above, so the answer isn't"
@@ -298,16 +307,24 @@ def missing_evidence(evidence: ReviewEvidence, merged_head: str) -> list[str]:
     return missing
 
 
-def merged(pr_number: int | None, merged_head: str, evidence: ReviewEvidence) -> tuple[Stage, str]:
+def merged(
+    pr_number: int | None, merged_head: str, evidence: ReviewEvidence, *, pr_url: str = ""
+) -> tuple[Stage, str]:
     """The merge record. A merge without complete review evidence is
     recorded as an exception and lists what is missing."""
     head = f"`{short_sha(merged_head)}`" if merged_head else "an unrecorded commit"
     missing = missing_evidence(evidence, merged_head)
+    link = _url(pr_url)
+    tail = [f"Pull request: {link}"] if link else []
     if not missing:
-        return Stage.MERGED, (
-            f"**Factory: Merged**\n\n{_pr(pr_number)} was merged at {head}. The independent"
-            " review passed on that exact commit. Nothing has been released; that needs its"
-            " own approval."
+        return Stage.MERGED, "\n".join(
+            [
+                "**Factory: Merged**",
+                "",
+                f"{_pr(pr_number)} was merged at {head}. The independent review passed on that"
+                " exact commit. Nothing has been released; that needs its own approval.",
+            ]
+            + ([""] + tail if tail else [])
         )
     lines = [
         "**Factory: Merged as an exception**",
@@ -317,7 +334,7 @@ def merged(pr_number: int | None, merged_head: str, evidence: ReviewEvidence) ->
         "",
         "This merge is recorded as an exception, not as verified work. Nothing has been"
         " released; that needs its own approval.",
-    ]
+    ] + ([""] + tail if tail else [])
     return Stage.MERGED_EXCEPTION, "\n".join(lines)
 
 

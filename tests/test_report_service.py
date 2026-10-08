@@ -22,9 +22,10 @@ from controller.service import queue as q
 from controller.service.seams import Option, Question
 from tests.linear_world import FACTORY, ROLANDO, FakeLinear, issue_uuid
 from tests.test_recovery import SHA_A
-from tests.test_service import ServiceCase, move
+from tests.test_service import REPO, ServiceCase, move
 
 ISSUE = "issue-ENG-186"
+OTHER_ISSUE = "issue-ENG-187"
 HEADER_RE = re.compile(r"^\*\*Factory: (?P<stage>[^*]+)\*\*$")
 STAGES = {s.value for s in Stage}
 LIN_KEY = "lin_api_" + "Zq9" * 12
@@ -95,10 +96,12 @@ class OutboxTests(LinearServiceCase):
         queued = len(self.view().outbox)
 
         self.linear.down = None
-        r = self.tick(minutes=1)  # the failed one is backing off; the others go
-        self.assertEqual(r.sent, queued - 1)
+        # The failed one is backing off, and the ticket's newer messages wait
+        # behind it so its comments stay in the order they were written.
+        r = self.tick(minutes=1)
+        self.assertEqual(r.sent, 0)
         r = self.tick(minutes=5)
-        self.assertEqual(r.sent, 1)
+        self.assertEqual(r.sent, queued)
         self.assertEqual(self.view().outbox, {})
         self.assertEqual(len(self.bodies()), queued)
         self.assert_one_comment_per_key()
@@ -115,7 +118,8 @@ class OutboxTests(LinearServiceCase):
         self.tick()
         queued = len(self.view().outbox)
         self.assertGreaterEqual(queued, 2)
-        self.assertEqual(len(self.failed()), queued)  # each was tried
+        # Only the oldest was tried: the ticket's later messages wait behind it.
+        self.assertEqual(len(self.failed()), 1)
         del self.linear.refuse_create[issue_uuid(ISSUE)]
         self.tick(minutes=5)
         self.assertEqual(self.view().outbox, {})
@@ -290,3 +294,80 @@ class MergeServiceTests(LinearServiceCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrderTests(LinearServiceCase):
+    def test_comments_keep_their_order_after_an_outage(self) -> None:
+        """Rolando's report: Working showed before Queued after an outage."""
+        self.rolando_approves()
+        self.linear.down = LinearDown("Linear answered HTTP 503")
+        self.tick()  # queued + working are both written; nothing posts
+        self.linear.down = None
+        for _ in range(8):
+            self.tick(minutes=1)  # the service's own pace: inside the retry wait
+        self.assertEqual(self.view().outbox, {})
+        expected = [
+            s.event.data["key"]
+            for s in self.store.events()
+            if s.event.kind == q.OUTBOX_QUEUED and s.event.data["issue_id"] == ISSUE
+        ]
+        refs = [b.rsplit("factory-ref: ", 1)[1] for b in self.bodies()]
+        self.assertEqual(refs, expected)
+        stages = [b.split("**", 2)[1] for b in self.bodies()]
+        self.assertEqual(stages[0], "Factory: Queued")
+
+    def test_a_held_ticket_does_not_hold_another(self) -> None:
+        from controller.report.linear_api import LinearRefused
+
+        self.rolando_approves()
+        self.service._append(
+            q.message("other:1", OTHER_ISSUE, "**Factory: Notice**\n\nx", self.now)
+        )
+        self.linear.refuse_create[issue_uuid(ISSUE)] = LinearRefused("bad", "INVALID")
+        self.tick()
+        self.assertEqual(len(self.bodies(OTHER_ISSUE)), 1)
+
+
+class FactoryFailureRepeatTests(LinearServiceCase):
+    """Rolando's report: a repeated factory failure became a fake question."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        failure = Question("The factory couldn't read the repository.", kind="factory", key="f-1")
+        self.preparer = QuestionPreparer(failure)  # type: ignore[assignment]
+        self.build()
+
+    def test_repeat_stays_a_stop_notice(self) -> None:
+        self.tick()
+        self.source.events.append(move(2))
+        self.tick(minutes=6)
+        self.assertEqual(self.view().items["evt-2"].closed, "question-factory")
+        bodies = [b for b in self.bodies() if "read the repository" in b]
+        self.assertEqual(len(bodies), 2)  # the notice and its repeat
+        for b in bodies:
+            self.assertTrue(b.startswith("**Factory: Stopped**"), b)
+            self.assertNotIn("Needs your decision", b)
+            self.assertIn("read the repository", b)
+
+
+class PullRequestLinkTests(LinearServiceCase):
+    """Rolando's report: review messages named PR #7 but gave no link."""
+
+    def test_review_and_merge_messages_link_the_pr(self) -> None:
+        self.rolando_approves()
+        self.tick()
+        a1 = AttemptId(self.task(), 1)
+        self.github.branches[a1.branch] = SHA_A
+        self.github.pulls = [self.pr()]
+        self.tick(minutes=6)
+        self.tick(minutes=6)
+        link = f"https://github.com/{REPO}/pull/7"
+        review = [b for b in self.bodies() if b.startswith("**Factory: Reviewing**")]
+        self.assertEqual(len(review), 1)
+        self.assertIn(f"Pull request: {link}", review[0])
+        self.github.pulls = [self.pr(state="closed", merged=True, merge_commit="c" * 40)]
+        for _ in range(2):
+            self.tick(minutes=6)
+        merged = [b for b in self.bodies() if b.startswith("**Factory: Merged")]
+        self.assertEqual(len(merged), 1)
+        self.assertIn(f"Pull request: {link}", merged[0])

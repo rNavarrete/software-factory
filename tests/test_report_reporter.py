@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import unittest
 import urllib.error
 
@@ -49,8 +50,22 @@ class CommentIdTests(unittest.TestCase):
         self.assertNotEqual(a, comment_id(ISSUE, "intake:evt-2"))
 
     def test_clean_key_has_no_spaces_and_is_capped(self) -> None:
-        self.assertEqual(clean_key("  a b\tc\n "), "a_b_c")
-        self.assertEqual(len(clean_key("k" * 500)), 200)
+        spaced = clean_key("  a b\tc\n ")
+        self.assertTrue(spaced.startswith("a_b_c~"), spaced)
+        self.assertNotRegex(spaced, r"\s")
+        self.assertLessEqual(len(clean_key("k" * 500)), 200)
+        self.assertEqual(clean_key("intake:evt-1"), "intake:evt-1")  # clean keys stay as they are
+
+    def test_long_keys_that_share_a_start_stay_different(self) -> None:
+        """Rolando's report: truncation made two different keys one comment."""
+        a, b = "k" * 300 + "a", "k" * 300 + "b"
+        self.assertNotEqual(clean_key(a), clean_key(b))
+        self.assertNotEqual(comment_id(ISSUE, clean_key(a)), comment_id(ISSUE, clean_key(b)))
+        linear = FakeLinear()
+        r = reporter(linear)
+        r.post(ISSUE, a, text())
+        r.post(ISSUE, b, text())
+        self.assertEqual(len(linear.on(ISSUE)), 2)
 
 
 class DuplicateTests(unittest.TestCase):
@@ -72,11 +87,12 @@ class DuplicateTests(unittest.TestCase):
         self.assertEqual(len(self.linear.on(ISSUE)), 1)
         self.assertEqual(self.linear.creates(), 1)
 
-    def test_key_with_spaces_is_the_same_message_as_its_clean_form(self) -> None:
+    def test_key_with_spaces_is_not_the_same_message_as_another_key(self) -> None:
         r = reporter(self.linear)
         r.post(ISSUE, "intake: evt-1", text())
         r.post(ISSUE, "intake:_evt-1", text())
-        self.assertEqual(len(self.linear.on(ISSUE)), 1)
+        r.post(ISSUE, "intake: evt-1", text())  # the same key again: still one
+        self.assertEqual(len(self.linear.on(ISSUE)), 2)
 
     def test_lost_answer_then_retry_shows_one_comment(self) -> None:
         self.linear.lose_next_create = 1
@@ -174,7 +190,8 @@ class ForeignCommentTests(unittest.TestCase):
 
 class OutageTests(unittest.TestCase):
     def post_via_http(self, answer: object) -> ReportFailed:
-        transport = HttpTransport(lambda: LIN_KEY, Opener(answer))
+        viewer = {"data": {"viewer": {"id": FACTORY}}}
+        transport = HttpTransport(lambda: LIN_KEY, Opener(answer, first=[viewer]))
         with self.assertRaises(ReportFailed) as cm:
             LinearReporter(transport, ROLANDO).post(ISSUE, "k1", text())
         return cm.exception
@@ -457,3 +474,73 @@ class RenderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CredentialSwapTests(unittest.TestCase):
+    """Rolando's report: the identity was checked once while the key could change."""
+
+    def test_swapping_in_rolandos_key_stops_posting_with_it(self) -> None:
+        keys = {"current": "lin_api_" + "f" * 30}
+        users = {"lin_api_" + "f" * 30: FACTORY, "lin_api_" + "r" * 30: ROLANDO}
+        sent: list[str] = []
+
+        def opener(req, timeout=None):  # type: ignore[no-untyped-def]
+            key = req.get_header("Authorization")
+            body = json.loads(req.data)
+            sent.append(key)
+            if "viewer" in body["query"]:
+                answer = {"data": {"viewer": {"id": users[key]}}}
+            elif "commentCreate" in body["query"]:
+                answer = {"data": {"commentCreate": {"success": True, "comment": {"id": "x"}}}}
+            elif "issue(" in body["query"]:
+                answer = {"data": {"issue": {"id": ISSUE}}}
+            else:
+                answer = {"errors": [{"message": "Entity not found"}]}
+            from tests.linear_world import Resp
+
+            return Resp(json.dumps(answer).encode())
+
+        transport = HttpTransport(lambda: keys["current"], opener, forbidden_user=ROLANDO)
+        r = LinearReporter(transport, ROLANDO)
+        r.post(ISSUE, "k1", text())
+        keys["current"] = "lin_api_" + "r" * 30
+        sent.clear()
+        with self.assertRaises(ReportFailed) as cm:
+            r.post(ISSUE, "k2", text())
+        self.assertTrue(cm.exception.hold_all)
+        self.assertIn("acts as Rolando", str(cm.exception))
+        # Only the identity question went out with his key; nothing was posted.
+        self.assertEqual(len(sent), 1)
+        with self.assertRaises(LinearDown):
+            transport("mutation { commentCreate }", {})
+
+
+class ProbeTests(unittest.TestCase):
+    """Rolando's report: the probe passed even when the marker was gone."""
+
+    def test_probe_needs_the_question_marker_back(self) -> None:
+        from controller.report.__main__ import marker_survived
+        from controller.report.messages import QUESTION_MARK
+        from controller.report.replies import parse_comment
+        from controller.report.reporter import QUESTION_PREFIX, render
+
+        key = QUESTION_PREFIX + "probe-1"
+        issue = issue_uuid(ISSUE)
+        cid = comment_id(issue, key)
+
+        def stored(body: str):  # type: ignore[no-untyped-def]
+            return parse_comment(
+                {
+                    "id": cid,
+                    "body": body,
+                    "createdAt": "2026-10-08T12:00:00Z",
+                    "user": {"id": FACTORY},
+                }
+            )
+
+        good = render(f"x\n\n{QUESTION_MARK} probe options=-", key)
+        self.assertTrue(marker_survived(stored(good), issue, FACTORY))
+        lost = render("x", key)  # Linear dropped the marker line
+        self.assertFalse(marker_survived(stored(lost), issue, FACTORY))
+        other = render(f"x\n\n{QUESTION_MARK} not-probe options=-", key)
+        self.assertFalse(marker_survived(stored(other), issue, FACTORY))

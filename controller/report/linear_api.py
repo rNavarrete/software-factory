@@ -18,6 +18,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import urllib.error
@@ -77,8 +78,18 @@ def _first_error(body: object) -> tuple[str, str]:
     return str(first.get("message") or ""), code.upper()
 
 
+VIEWER_QUERY = "query { viewer { id name app } }"
+
+
 class HttpTransport:
-    """POSTs a GraphQL request with the factory's Linear key."""
+    """POSTs a GraphQL request with the factory's Linear key.
+
+    The key is read again for every request, so a replaced secret takes
+    effect at once. Whose key it is gets checked against that same key
+    value: before the first request made with a key it hasn't seen, the
+    transport asks Linear who the key acts as, and refuses every request
+    made with a key that acts as ``forbidden_user`` (Rolando) or as anyone
+    but ``expected_user``. A key swapped in later can't skip the check."""
 
     def __init__(
         self,
@@ -86,13 +97,51 @@ class HttpTransport:
         opener: Callable[..., object] | None = None,
         *,
         agent: str = "software-factory-reporter",
+        forbidden_user: str | None = None,
+        expected_user: str | None = None,
     ) -> None:
         self._key = key
         self._open = opener or urllib.request.build_opener(_NoRedirect()).open
         self._agent = agent
+        self._forbidden = forbidden_user
+        self._expected = expected_user
+        self._viewers: dict[str, str] = {}
+        """sha256 of a key -> the user it acts as, once checked."""
+
+    def checked_viewer(self) -> str:
+        """The Linear user the current key acts as, checked."""
+        return self._viewer(self._key())
 
     def __call__(self, query: str, variables: Mapping[str, object]) -> Mapping[str, object]:
         key = self._key()
+        if self._forbidden or self._expected:
+            self._viewer(key)  # with this same key value, before it is used
+        return self._post(key, query, variables)
+
+    def _viewer(self, key: str) -> str:
+        fp = hashlib.sha256(key.encode()).hexdigest()
+        known = self._viewers.get(fp)
+        if known is not None:
+            return known
+        viewer = self._post(key, VIEWER_QUERY, {}).get("viewer")
+        vid = str(viewer.get("id") or "") if isinstance(viewer, Mapping) else ""
+        if not vid:
+            raise LinearDown("Linear did not say whose key this is", "IDENTITY")
+        if self._forbidden and vid == self._forbidden:
+            raise LinearDown(
+                "the factory's Linear key acts as Rolando, so anything it posted would look like"
+                " his. Nothing is sent until the factory has its own Linear identity.",
+                "IDENTITY",
+            )
+        if self._expected and vid != self._expected:
+            raise LinearDown(
+                "the factory's Linear key acts as a different user than the one configured",
+                "IDENTITY",
+            )
+        self._viewers[fp] = vid
+        return vid
+
+    def _post(self, key: str, query: str, variables: Mapping[str, object]) -> Mapping[str, object]:
         auth = key if key.startswith("lin_api_") else f"Bearer {key}"
         req = urllib.request.Request(
             API,

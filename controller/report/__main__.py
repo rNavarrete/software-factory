@@ -21,11 +21,17 @@ from datetime import UTC, datetime
 
 from controller.report.linear_api import HttpTransport
 from controller.report.messages import QUESTION_MARK, Stage, progress
-from controller.report.replies import LinearDecisions, own_markers
+from controller.report.replies import Comment, LinearDecisions, own_markers
 from controller.report.reporter import QUESTION_PREFIX, LinearReporter, comment_id
 from controller.service.main import ROLANDO_LINEAR_ID
 from controller.service.seams import ReportFailed
 from controller.service.secrets import FileSecrets
+
+
+def marker_survived(comment: Comment, issue: str, me: str) -> bool:
+    """The probe's question marker came back exactly as posted."""
+    marks = own_markers(comment, issue, me)
+    return marks is not None and marks.question_key == "probe"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,7 +43,9 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(sys.argv[1:] if argv is None else argv)
 
     secrets = FileSecrets(os.environ.get("FACTORY_SECRETS_DIR", "/run/factory-secrets"))
-    transport = HttpTransport(lambda: secrets.get("linear-key"))
+    transport = HttpTransport(
+        lambda: secrets.get("linear-key"), forbidden_user=args.approver_linear_id
+    )
     reporter = LinearReporter(transport, args.approver_linear_id)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     key = f"{QUESTION_PREFIX}probe-{stamp}"
@@ -62,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     if mine[0].bot is not None:
         print(f"FAIL: Linear marks the factory's comments as made by a bot ({mine[0].bot})")
         return 1
-    if own_markers(mine[0], issue, me) is None:
+    if not marker_survived(mine[0], issue, me):
         print("FAIL: the factory's marker lines did not survive Linear's storage unchanged")
         return 1
     print("OK: posted once under the factory's own user; retries showed nothing twice;")

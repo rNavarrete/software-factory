@@ -31,9 +31,9 @@ The factory does not change the team's states or add labels. It must not overwri
 
 Every message has a unique key in the service's outbox. The reporter turns the key into the comment's id, so the same message always has the same id. Before creating a comment it asks Linear whether that id exists. If it does, an earlier try worked and nothing more is posted. A restart, a crash between posting and saving, a timeout or a lost answer therefore never shows the same message twice. Once a message is recorded as posted it is never posted again, even if someone deletes the comment.
 
-When Linear is down or rate limiting the factory, the reporter says so and the service stops posting for that round. The messages wait in the ledger and go out later, with growing waits between tries. Retrying a message never repeats a launch.
+When Linear is down or rate limiting the factory, the reporter says so and the service stops posting for that round. The messages wait in the ledger and go out later, with growing waits between tries. Retrying a message never repeats a launch. A ticket's comments always go out in the order they were written. While an older one waits to be retried, newer ones for the same ticket wait behind it, so the newest comment is always the current stage.
 
-The factory posts as its own Linear user. If its key acts as Rolando, nothing is posted, and the reason is recorded every round, because a comment that looked like his could pass for his decision.
+The factory posts as its own Linear user. Whose key it is gets checked for each key value before that key is used, so replacing the secret takes effect at once and can't skip the check. If the key acts as Rolando, nothing is posted, and the reason is recorded every round, because a comment that looked like his could pass for his decision.
 
 ## What goes into a comment
 
@@ -79,5 +79,5 @@ These belong to the qualification run in ENG-163.
 ## Known limits
 
 - **Linear's comment ids.** The reporter relies on Linear accepting a comment id chosen by the client, as its API documents for create inputs. The probe above checks it. If Linear ever stopped accepting it, every post would fail visibly rather than repeat.
-- **A message that can never post** (its ticket was deleted) is retried at most once an hour, for good. It costs one request an hour and is recorded each time.
+- **A message that can never post** (its ticket was deleted) is retried at most once an hour, for good. It costs one request an hour and is recorded each time. Because a ticket's comments keep their order, the newer messages for that ticket wait behind it.
 - **Comments past the 2,000th on one ticket are not read.**

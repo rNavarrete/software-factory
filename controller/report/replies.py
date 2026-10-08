@@ -338,10 +338,17 @@ class LinearDecisions:
     _viewer: str | None = None
 
     def factory_id(self) -> str:
-        if self._viewer is not None:
+        bound = getattr(self.transport, "checked_viewer", None)
+        if bound is not None:
+            try:
+                vid = str(bound())  # checked per key value (see HttpTransport)
+            except (LinearDown, LinearRefused) as e:
+                raise ReadFailed(str(e)) from None
+        elif self._viewer is not None:
             return self._viewer
-        viewer = self._call(VIEWER_QUERY, {}).get("viewer")
-        vid = str(viewer.get("id") or "") if isinstance(viewer, Mapping) else ""
+        else:
+            viewer = self._call(VIEWER_QUERY, {}).get("viewer")
+            vid = str(viewer.get("id") or "") if isinstance(viewer, Mapping) else ""
         if not vid:
             raise ReadFailed("Linear did not say whose key this is")
         if vid == self.approver_id:

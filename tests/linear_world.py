@@ -14,7 +14,7 @@ import json
 import re
 import urllib.error
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -242,19 +242,22 @@ class Resp:
 class Opener:
     """Records requests; answers with a body or raises what it is given."""
 
-    def __init__(self, answer: object) -> None:
+    def __init__(self, answer: object, *, first: Sequence[object] = ()) -> None:
         self.answer = answer
+        self.first = list(first)
+        """Answers given, in order, before ``answer`` (e.g. the viewer check)."""
         self.requests: list[object] = []
         self.timeouts: list[object] = []
 
     def __call__(self, req: object, timeout: object = None) -> Resp:
         self.requests.append(req)
         self.timeouts.append(timeout)
-        if isinstance(self.answer, BaseException):
-            raise self.answer
-        if isinstance(self.answer, bytes):
-            return Resp(self.answer)
-        return Resp(json.dumps(self.answer).encode())
+        answer = self.first.pop(0) if self.first else self.answer
+        if isinstance(answer, BaseException):
+            raise answer
+        if isinstance(answer, bytes):
+            return Resp(answer)
+        return Resp(json.dumps(answer).encode())
 
 
 def http_error(code: int, body: object = None) -> urllib.error.HTTPError:

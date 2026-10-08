@@ -766,6 +766,7 @@ class Service:
                     m.progress(
                         Stage.REVIEWING,
                         f"The worker opened PR #{number}. The independent review has started.",
+                        pr_url=self._pr_url(item, number),
                     ),
                     now,
                 ),
@@ -823,13 +824,20 @@ class Service:
             q.message(f"closed:{item.event_id}", item.issue_id, m.progress(stage, text), now),
         )
 
+    def _pr_url(self, item: q.Item, number: int | None) -> str:
+        """The PR's GitHub address, from the project's onboarded repository."""
+        project = self._config.project(item.project_id) if self._config else None
+        if project is None or not number:
+            return ""
+        return f"https://github.com/{project.repository}/pull/{number}"
+
     def _close_merged(self, item: q.Item, status, now: datetime) -> None:
         """The merge record. The service holds no review verdict yet (ENG-156),
         so a merge is recorded as an exception that says what is missing,
         never as verified work."""
         evidence = m.ReviewEvidence(started=str(status.attempt) in self._view().reviews)
         number = status.pull_requests[-1] if status.pull_requests else None
-        _, text = m.merged(number, "", evidence)
+        _, text = m.merged(number, "", evidence, pr_url=self._pr_url(item, number))
         self._append(
             q.item_closed(item, "merged", now),
             q.message(f"closed:{item.event_id}", item.issue_id, text, now),
@@ -849,7 +857,10 @@ class Service:
         else:
             events.append(
                 q.message(
-                    f"{item.event_id}:question-repeat", item.issue_id, m.question_repeat(), now
+                    f"{item.event_id}:question-repeat",
+                    item.issue_id,
+                    m.question_repeat(question),
+                    now,
                 )
             )
         self._append(*events)
@@ -862,18 +873,26 @@ class Service:
     # --- 4. outbox --------------------------------------------------------------------
 
     def _flush(self, r: TickReport) -> None:
+        # The comments on a ticket are its status board, so they go out in the
+        # order they were written: while an older message for a ticket waits to
+        # be retried, newer ones for that ticket wait behind it.
+        held: set[str] = set()
         for msg in sorted(self._view().outbox.values(), key=lambda x: x.seq):
             now = self._now()
+            if msg.issue_id in held:
+                continue
             if msg.last_failed_at is not None:
                 wait = min(
                     self._s.outbox_retry_after * (2 ** min(msg.failures - 1, 10)),
                     self._s.outbox_retry_max,
                 )
                 if now - msg.last_failed_at < wait:
+                    held.add(msg.issue_id)
                     continue
             try:
                 self._x.reporter.post(msg.issue_id, msg.key, msg.text)
             except Exception as e:
+                held.add(msg.issue_id)
                 self._append(q.send_failed(msg.key, _error(e), now))
                 if isinstance(e, ReportFailed) and e.hold_all:
                     break  # Linear itself is down or rate limiting: try again next round

@@ -81,8 +81,19 @@ def comment_id(issue_id: str, key: str) -> str:
     return str(uuid.UUID(bytes=digest[:16], version=4))
 
 
+KEY_LIMIT = 200
+
+
 def clean_key(key: str) -> str:
-    return _KEY_SPACE_RE.sub("_", key.strip())[:200]
+    """The key as it goes into the comment id and the ref line: no spaces,
+    at most ``KEY_LIMIT`` characters. When cleaning would change the key, a
+    hash of the whole original key is kept, so two different keys never
+    end up as the same comment."""
+    plain = _KEY_SPACE_RE.sub("_", key.strip())
+    if plain == key and len(plain) <= KEY_LIMIT:
+        return plain
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    return f"{plain[: KEY_LIMIT - 34]}~{digest}"
 
 
 def render(text: str, key: str) -> str:
@@ -138,12 +149,25 @@ class LinearReporter:
         return self._issues[issue_id]
 
     def viewer(self) -> str:
-        """The factory's own Linear user id, checked once."""
-        if self._viewer is not None:
+        """The factory's own Linear user id.
+
+        With ``HttpTransport`` this is asked of the transport on every post:
+        it checks each key value it sends with, so replacing the secret with
+        Rolando's own key stops posting at once. Any other transport is
+        checked once."""
+        bound = getattr(self.transport, "checked_viewer", None)
+        if bound is not None:
+            try:
+                vid = str(bound())
+            except (LinearDown, LinearRefused) as e:
+                # Whose key it is can't be confirmed: nothing may be posted.
+                raise ReportFailed(str(e), hold_all=True) from None
+        elif self._viewer is not None:
             return self._viewer
-        data = self._call(VIEWER_QUERY, {})
-        viewer = data.get("viewer")
-        vid = str(viewer.get("id") or "") if isinstance(viewer, Mapping) else ""
+        else:
+            data = self._call(VIEWER_QUERY, {})
+            viewer = data.get("viewer")
+            vid = str(viewer.get("id") or "") if isinstance(viewer, Mapping) else ""
         if not vid:
             raise ReportFailed("Linear did not say whose key this is", hold_all=True)
         if vid == self.approver_id:
