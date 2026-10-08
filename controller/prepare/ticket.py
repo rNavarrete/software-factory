@@ -33,6 +33,9 @@ class Snapshot:
     team_id: str | None
     parent_id: str | None
     labels: tuple[str, ...]
+    attachments: tuple[str, ...] = ()
+    """Observed URLs only, not part of intake authorization. Never treated as captured content."""
+    attachments_complete: bool = True
 
 
 def revision(s: Snapshot) -> str:
