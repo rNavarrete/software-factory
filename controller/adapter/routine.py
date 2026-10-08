@@ -8,8 +8,8 @@ and PR on GitHub (ADR 0002 section 6).
 
 The fire ``text`` is a JSON envelope the routine's saved prompt checks again
 (defense in depth). ``build_fire_text`` makes it; ``RoutineAdapter.launch``
-re-checks it, together with the contract validator from controller/contract/
-(ENG-144), and refuses before any network call if anything is wrong.
+re-checks it, together with ``controller.contract.validate`` (ENG-144), and
+refuses before any network call if anything is wrong.
 
 The start key is read from macOS Keychain for each launch and never stored,
 logged or returned.
@@ -27,6 +27,7 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from controller import contract as contract_format
 from controller.interfaces import (
     LAUNCH_TIMEOUT_SECONDS,
     MAX_FIRE_TEXT_CHARS,
@@ -117,7 +118,7 @@ def build_fire_text(
     digest: ContractDigest,
     attempt: AttemptId,
     summary: str,
-    validate_contract: ContractValidator,
+    validate_contract: ContractValidator = contract_format.validate,
 ) -> str:
     """The fire text for one attempt. Raises PayloadRejected rather than return
     anything the adapter or the worker would refuse."""
@@ -144,9 +145,10 @@ def _text_errors(
     if len(text) > MAX_FIRE_TEXT_CHARS:
         return [f"fire text is {len(text)} chars, limit {MAX_FIRE_TEXT_CHARS}"]
     try:
+        contract_format.loads(text)  # refuses duplicate keys, NaN and Infinity
         envelope = json.loads(text)
-    except ValueError:
-        return ["fire text is not JSON"]
+    except ValueError as e:
+        return [f"fire text is not plain JSON: {e}"]
     errors = envelope_errors(envelope, digest, attempt)
     contract = envelope.get("contract") if isinstance(envelope, dict) else None
     if isinstance(contract, dict):
@@ -217,7 +219,7 @@ class RoutineAdapter:
     def __init__(
         self,
         trig_id: str,
-        validate_contract: ContractValidator,
+        validate_contract: ContractValidator = contract_format.validate,
         *,
         start_key: Callable[[str], str] = keychain_key,
         url: str = FIRE_URL,

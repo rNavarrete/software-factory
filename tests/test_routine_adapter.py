@@ -10,8 +10,10 @@ import struct
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
+from controller import contract as contract_format
 from controller.adapter import routine
 from controller.adapter.routine import PayloadRejected, RoutineAdapter, build_fire_text
 from controller.interfaces import (
@@ -338,6 +340,60 @@ class RetryAfterTest(unittest.TestCase):
         self.assertIsNone(routine.parse_retry_after(None, 0))
         self.assertIsNone(routine.parse_retry_after("soon", 0))
         self.assertEqual(routine.parse_retry_after("Thu, 01 Jan 1970 00:00:00 GMT", 100), 0)
+
+
+class RealContractTest(unittest.TestCase):
+    """The adapter with ENG-144's real validator and a committed example contract."""
+
+    def setUp(self):
+        path = Path(__file__).resolve().parent.parent / "schema/examples/filter-by-status.json"
+        self.contract = json.loads(path.read_text())
+        self.digest = contract_format.digest(self.contract)
+        self.attempt = AttemptId(TaskId(self.contract["task_id"]), 1)
+        self.sent = []
+
+        class Opener:
+            def open(opener_self, req, timeout):
+                self.sent.append(req)
+                raise OSError("stop before the network")
+
+        self.adapter = RoutineAdapter(TRIG, start_key=lambda t: KEY, opener=Opener())
+
+    def launch(self, contract, digest=None):
+        digest = digest or self.digest
+        envelope = json.loads(build_fire_text(self.contract, self.digest, self.attempt, "Filter"))
+        envelope["contract"] = contract
+        envelope["contract_digest"] = digest.value
+        envelope["pr_title"] = f"{self.attempt.pr_title_marker(digest)} Filter"
+        return self.adapter.launch(
+            LaunchRequest(RunId(self.attempt, 1), digest, json.dumps(envelope))
+        )
+
+    def test_approved_example_reaches_the_network(self):
+        result = self.launch(self.contract)
+        self.assertIs(result.outcome, LaunchOutcome.OUTCOME_UNKNOWN)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_changed_contract_is_refused(self):
+        changed = dict(self.contract, permitted_paths=["package.json"])
+        with self.assertRaises(PayloadRejected) as caught:
+            self.launch(changed)
+        self.assertIn("digest", str(caught.exception))
+        self.assertEqual(self.sent, [])
+
+    def test_needs_clarification_is_refused_even_with_its_own_digest(self):
+        unclear = json.loads(json.dumps(self.contract))
+        unclear["acceptance_criteria"][0]["status"] = "needs-clarification"
+        with self.assertRaises(PayloadRejected):
+            self.launch(unclear, contract_format.digest(unclear))
+        self.assertEqual(self.sent, [])
+
+    def test_duplicate_keys_are_refused(self):
+        good = build_fire_text(self.contract, self.digest, self.attempt, "Filter")
+        doubled = good[:-1] + ',"branch":"claude/other-a1"}'
+        with self.assertRaises(PayloadRejected):
+            self.adapter.launch(LaunchRequest(RunId(self.attempt, 1), self.digest, doubled))
+        self.assertEqual(self.sent, [])
 
 
 if __name__ == "__main__":
