@@ -162,6 +162,18 @@ class AuthorizationSource(Protocol):
 @dataclass(frozen=True)
 class Prepared:
     contract: Mapping[str, object]
+    summary: str = ""
+    """A few plain sentences on what the worker will change and how it will be
+    checked, posted once on the ticket. Information only: it asks for nothing."""
+
+
+QUESTION_KINDS = ("product", "split", "scope", "changed", "factory")
+"""Why the preparer stopped: ``product`` missing or unclear behavior; ``split``
+the ticket is too big (the text may propose a split); ``scope`` it asks for
+something this project's policy doesn't allow; ``changed`` the ticket no longer
+matches the move that authorized it; ``factory`` the factory couldn't draft a
+task it trusts (its own fault, not the ticket's). ``changed`` and ``factory``
+are notices, not questions: they carry no options."""
 
 
 @dataclass(frozen=True)
@@ -200,9 +212,13 @@ class Question:
     key: str = ""
     """Stable for the same question on the same ticket text, so it is never
     asked twice. Letters, digits, - and _ only."""
+    kind: str = "product"
+    """One of ``QUESTION_KINDS``."""
 
     def __post_init__(self) -> None:
         _text(self.text, "question text")
+        if self.kind not in QUESTION_KINDS:
+            raise ValueError(f"question kind must be one of {QUESTION_KINDS}, got {self.kind!r}")
         ids = [o.id.lower() for o in self.options]
         if len(set(ids)) != len(ids):
             raise ValueError("option ids must be unique")
@@ -319,6 +335,7 @@ class Integrations:
 
 __all__ = [
     "CONTROLS",
+    "QUESTION_KINDS",
     "Answer",
     "Authorization",
     "AuthorizationSource",
