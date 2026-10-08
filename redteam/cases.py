@@ -126,6 +126,7 @@ def _pipeline(make: Callable[[], fx.Scenario], *expect: str) -> Callable[[], Obs
         return Observed(True, hit)
 
     check.expect = expect  # read by the tests: the honest scenario must match none
+    check.make = make  # read by redteam.replay, which re-applies the change to real records
     return check
 
 
