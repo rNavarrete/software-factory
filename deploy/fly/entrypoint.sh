@@ -5,7 +5,31 @@
 # secret.
 set -eu
 umask 077
+# FACTORY_MODE picks what the service runs. Unset, it is the qualification
+# fixture with the fake worker, which never starts a real worker. `live`
+# reads Todo moves, drafts contracts and posts progress through Linear, with
+# its own ledger in /data/factory; the pilot's onboarding file keeps intake
+# off until that file says otherwise.
+case "${FACTORY_MODE:-qualification}" in
+qualification)
+    HOME=/data/qualification
+    ONBOARDING=/app/deploy/qualification/onboarding.json
+    set -- --fixtures /app/deploy/qualification
+    ;;
+live)
+    HOME=/data/factory
+    ONBOARDING=/app/deploy/pilot/onboarding.json
+    set -- --live --real-runtime
+    ;;
+*)
+    echo "unknown FACTORY_MODE: use qualification or live" >&2
+    exit 1
+    ;;
+esac
+export HOME
 mkdir -p "$HOME/.software-factory"
+# Rolando's commands over `fly ssh console` (/app/factory) use the same home.
+printf '%s\n' "$HOME" >/run/factory-home
 # Root's copy, for Rolando's commands over `fly ssh console` and the signer.
 python3 -s -m controller.service install-secrets "$FACTORY_SECRETS_DIR"
 # The service's copy: never the approval key.
@@ -15,9 +39,8 @@ for name in APPROVAL_KEY ROUTINE_TOKEN GITHUB_TOKEN LINEAR_KEY; do
     unset "FACTORY_$name"
 done
 chown -R factory:factory "$HOME"
-# The one onboarding file both read. It is in the image, owned by root, so
-# the service can't widen what the signer will approve.
-ONBOARDING=/app/deploy/qualification/onboarding.json
+# The one onboarding file both read ($ONBOARDING, above). It is in the image,
+# owned by root, so the service can't widen what the signer will approve.
 python3 -s -m controller.service signer --socket /run/factory-signer/signer.sock \
     --onboarding "$ONBOARDING" --state /data/signer/moves.json &
 signer=$!
@@ -30,13 +53,10 @@ until [ -S /run/factory-signer/signer.sock ]; do
     fi
     sleep 0.1
 done
-# Until the Linear integrations land, the service runs the qualification
-# fixture with the fake worker: it never starts a real worker.
 env FACTORY_SECRETS_DIR=/run/factory-service-secrets \
     FACTORY_SIGNER_SOCKET=/run/factory-signer/signer.sock \
     python3 -s -m controller.service run --user factory \
-    --fixtures /app/deploy/qualification \
-    --onboarding "$ONBOARDING" &
+    --onboarding "$ONBOARDING" "$@" &
 service=$!
 # A stop request lets the service finish its round. If either process ends,
 # both stop and the machine exits, so Fly starts it again with both.
