@@ -38,6 +38,7 @@ Each directory belongs to one ticket so parallel work never edits the same files
 | `controller/service/`, `deploy/`, `docs/service.md` | ENG-194 | The background service on Fly.io (`python3 -m controller.service`) and the seams the Linear tickets plug into (`controller/service/seams.py`) |
 | `tasks/samples/` | ENG-145 | The sample task contracts for the first full runs |
 | `redteam/` | ENG-158 | Red-team checks |
+| `controller/audit/`, `docs/control-audit*.md` | ENG-163 | The full control check: `python3 -m controller.audit` checks every governance-map control against its evidence |
 | `docs/adr/0001-operating-model.md` | ENG-134 | Operating model and human authority |
 | `docs/adr/0002-runtime-controller-identity.md` | ENG-136 (ENG-183 owns section 11) | Runtime and controller |
 | `docs/adr/0003-pilot-and-value-thresholds.md` | ENG-137 | Pilot and value thresholds |
