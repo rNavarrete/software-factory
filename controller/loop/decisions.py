@@ -16,6 +16,7 @@ shows him, and he can add time spent elsewhere (reading a PR on GitHub) with
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,6 +33,58 @@ SCOPE = "candidate-review"
 ``contract-dispatch``) and never as a PR approval, merge or release."""
 OBSERVED, CLEARED = "observed", "cleared-flag"
 MIN_MINUTES = 0.01
+_SEP = " > "
+
+
+def flag_names(flag: str) -> tuple[str, ...]:
+    """The names a note clearing ``flag`` may use to say what was looked at.
+
+    A flag's key is ``<kind>:<subject>``, and its subject is a file path, a
+    test (``<path> > <describe> > <test>``), a criterion id or ``ci-report``.
+    Its names are the whole subject, the file's path and its file name, the
+    criterion id, or for ``ci-report`` "ci-report" or "CI report". A test's
+    own title is not one: titles are often everyday words ("works"). A note
+    that names none of them is about something else (in the first live run a
+    note about a button cleared a test-file flag), so it never clears the flag.
+    """
+    _, _, subject = flag.partition(":")
+    subject = subject.strip()
+    names = {subject}
+    first = subject.split(_SEP)[0].strip()
+    if "/" in first or "." in first:
+        names.add(first)
+        names.add(first.rsplit("/", 1)[-1])
+    if subject == "ci-report":
+        names.add("ci report")
+    return tuple(sorted(n for n in names if n))
+
+
+def flag_label(flag: str) -> str:
+    """The short name to show Rolando for what ``flag`` points at."""
+    _, _, subject = flag.partition(":")
+    first = subject.split(_SEP)[0].strip()
+    if subject.strip() == "ci-report":
+        return "the CI report"
+    if "/" in first or "." in first:
+        return first.rsplit("/", 1)[-1]
+    return subject.strip()
+
+
+# A name counts only as a whole word: not inside a longer path or file name
+# ("tests/e2e/books.test.ts" doesn't name "tests/unit/books.test.ts", and
+# "old-books.test.ts" doesn't name "books.test.ts"). A sentence's full stop
+# after it is fine.
+_BEFORE = r"(?<![\w./\\-])"
+_AFTER = r"(?![\w/\\-]|\.\w)"
+
+
+def names_flag(flag: str, note: str) -> bool:
+    """Whether ``note`` names what ``flag`` points at (see ``flag_names``)."""
+    text = " ".join(note.lower().split())
+    for name in flag_names(flag):
+        if re.search(_BEFORE + re.escape(" ".join(name.lower().split())) + _AFTER, text):
+            return True
+    return False
 
 
 class ReviewDecisions:
@@ -82,6 +135,11 @@ class ReviewDecisions:
         note: str,
         now: datetime,
     ) -> None:
+        if not names_flag(flag, note):
+            raise ApprovalRefused(
+                f"the note doesn't name what the flag points at ({_or(flag_names(flag))}),"
+                " so it can't clear it"
+            )
         self._write(attempt, digest, candidate, CLEARED, now, flag=flag, note=note)
 
     def observations(
@@ -113,6 +171,19 @@ class ReviewDecisions:
                 note=b["note"],
             )
             for b in self._bindings(attempt, digest, candidate, CLEARED)
+            if names_flag(str(b.get("flag", "")), str(b.get("note", "")))
+        )
+
+    def unnamed_clearances(
+        self, attempt: AttemptId, digest: ContractDigest, candidate: Candidate
+    ) -> tuple[tuple[str, str], ...]:
+        """Signed clearings for this revision whose note doesn't name their
+        flag (written before notes had to), as (flag, note). They never count;
+        the loop says so instead of dropping them silently."""
+        return tuple(
+            (str(b.get("flag", "")), str(b.get("note", "")))
+            for b in self._bindings(attempt, digest, candidate, CLEARED)
+            if not names_flag(str(b.get("flag", "")), str(b.get("note", "")))
         )
 
     def _write(self, attempt, digest, candidate, decision, now, **fields) -> None:
@@ -174,6 +245,11 @@ class ReviewDecisions:
                 continue
             out.append(dict(b))
         return out
+
+
+def _or(names: Sequence[str]) -> str:
+    quoted = [f"'{n}'" for n in names] or ["(nothing)"]
+    return quoted[0] if len(quoted) == 1 else ", ".join(quoted[:-1]) + " or " + quoted[-1]
 
 
 @dataclass

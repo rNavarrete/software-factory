@@ -117,6 +117,8 @@ class World:
             "changed_files": 3,
         }
         self.merge_base = fx.BASE
+        self.main_changes: list[dict] = []
+        """What a compare of a commit with main lists as changed on main."""
         self.files = [
             {"filename": "src/books.ts", "status": "modified"},
             {"filename": "src/main.ts", "status": "modified"},
@@ -193,7 +195,10 @@ class World:
         if rest == f"pulls/{NUMBER}/files":
             return copy.deepcopy(self.files[(page - 1) * 100 : page * 100])
         if rest.startswith("compare/"):
-            return {"merge_base_commit": {"sha": self.merge_base}}
+            return {
+                "merge_base_commit": {"sha": self.merge_base},
+                "files": copy.deepcopy(self.main_changes),
+            }
         if rest == f"issues/{NUMBER}/comments":
             return copy.deepcopy(self.comments[(page - 1) * 100 : page * 100])
         if rest == "actions/workflows/ci.yml/runs":
