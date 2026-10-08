@@ -276,13 +276,15 @@ class Recovery:
             e = s.event
             if e.attempt != attempt:
                 continue
-            if e.kind == ev.PR_OBSERVED:
-                observed[int(e.data["number"])] = e.data
-            elif e.kind == ledger_kinds.CANDIDATE:
-                number = e.data.get("pr_number")
-                candidates.add(
-                    (number if isinstance(number, int) else None, str(e.data["candidate_commit"]))
-                )
+            try:
+                if e.kind == ev.PR_OBSERVED:
+                    observed[int(e.data["number"])] = e.data
+                elif e.kind == ledger_kinds.CANDIDATE:
+                    number = e.data.get("pr_number")
+                    commit = e.data["candidate_commit"]
+                    candidates.add((number if isinstance(number, int) else None, str(commit)))
+            except (KeyError, TypeError, ValueError):
+                continue  # a malformed record is never read as already seen
         new: list[LedgerEvent] = []
         for pr, problems in seen:
             data = _observation(pr, problems)

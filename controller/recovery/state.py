@@ -113,6 +113,8 @@ class _Facts:
     late_urls: list[str] = field(default_factory=list)
     prs: dict[int, _Pr] = field(default_factory=dict)
     branch_pushed: bool = False
+    work_recorded: bool = False
+    """A candidate or a matching PR was ever recorded, whatever happened after."""
     closed: tuple[State, str] | None = None
     clearings: list[tuple[gate.ClearingBasis, str]] = field(default_factory=list)
 
@@ -129,7 +131,7 @@ class _Facts:
     @property
     def work_seen(self) -> bool:
         """GitHub shows a matching PR or a push to the marker branch."""
-        return bool(self.prs) or self.branch_pushed
+        return bool(self.prs) or self.work_recorded
 
     def session_urls(self) -> tuple[str, ...]:
         urls: list[str] = []
@@ -169,7 +171,11 @@ def _apply(item, facts, checks, releases) -> None:
     d = e.data
     if e.kind == ledger.CHECKS:
         results = d["results"]
-        if isinstance(d["revision"], str) and isinstance(results, tuple):
+        if (
+            isinstance(d["revision"], str)
+            and isinstance(results, tuple)
+            and all(isinstance(r, Mapping) for r in results)
+        ):
             checks[d["revision"]] = results
         return
     if e.kind == ev.RELEASE_STATUS and e.task is not None:
@@ -189,9 +195,14 @@ def _apply(item, facts, checks, releases) -> None:
         if d.get("outcome") == LaunchOutcome.LAUNCHED.value and isinstance(url, str):
             f.late_urls.append(ev.session_url(url))
     elif e.kind == ev.PR_OBSERVED and d["matches"] is not True:
-        # A PR edited so it no longer carries the markers stops counting.
-        f.prs.pop(int(d["number"]), None)
+        # A PR edited so it no longer carries the markers stops counting for
+        # the state, unless it was already merged. It still counts as work
+        # seen on GitHub (``work_recorded``), so the edit hides nothing.
+        number = int(d["number"])
+        if number in f.prs and not f.prs[number].merged:
+            del f.prs[number]
     elif e.kind == ev.PR_OBSERVED:
+        f.work_recorded = True
         f.prs[int(d["number"])] = _Pr(
             int(d["number"]),
             str(d["url"]),
@@ -200,8 +211,10 @@ def _apply(item, facts, checks, releases) -> None:
             d["merged"] is True,
             str(d["head_sha"]),
         )
-    elif e.kind == ledger.CANDIDATE and "pr_number" not in d:
-        f.branch_pushed = True
+    elif e.kind == ledger.CANDIDATE:
+        f.work_recorded = True
+        if "pr_number" not in d:
+            f.branch_pushed = True
     elif e.kind == ledger.ATTEMPT_ABANDONED:
         # A plain abandoned record (controller/ledger/records.py) means failed.
         outcome = State(d.get("outcome", State.FAILED.value))
@@ -225,7 +238,7 @@ def _writer(f: _Facts) -> tuple[str, bool, str | None]:
     access_removed = accepted = False
     for basis, evidence in f.clearings:
         if basis in (gate.ClearingBasis.COMPLETED, gate.ClearingBasis.TERMINATED):
-            covered.update(ev.SESSION_URL_RE.findall(evidence))
+            covered.update(ev.listed_urls(evidence))
         elif basis is gate.ClearingBasis.WRITE_ACCESS_REMOVED:
             access_removed = True
         elif basis is gate.ClearingBasis.UNRESOLVED_ACCEPTED:
@@ -447,7 +460,7 @@ def restore_problems(stored: Sequence[StoredEvent], now: datetime) -> tuple[str,
             url
             for basis, evidence in f.clearings
             if basis in (gate.ClearingBasis.COMPLETED, gate.ClearingBasis.TERMINATED)
-            for url in ev.SESSION_URL_RE.findall(evidence)
+            for url in ev.listed_urls(evidence)
         }
         if not known:
             out.append(f"{a}: no session is on record, so none can be confirmed finished.")

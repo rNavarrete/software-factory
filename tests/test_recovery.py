@@ -30,11 +30,12 @@ from controller.interfaces import (
     AttemptId,
     LaunchOutcome,
     LaunchRequest,
+    LedgerEvent,
     LedgerLocked,
     RunId,
     TaskId,
 )
-from controller.ledger import SqliteLedgerStore, records
+from controller.ledger import InvalidEvent, SqliteLedgerStore, records
 from controller.ledger import kinds as ledger_kinds
 from controller.recovery import (
     FINISHED,
@@ -1275,6 +1276,70 @@ class RecoverySpecTests(unittest.TestCase):
         self.assertFalse(st.writer_cleared)
         self.assertEqual(st.state, State.UNKNOWN)
         self.assert_replacement_refused(STALE)
+
+    # --- regressions from the adversarial review ---
+
+    def test_review_editing_the_pr_title_does_not_hide_unexplained_work(self):
+        self.dispatch(not_launched(400))
+        self.publish(self.pr())
+        self.recovery.reconcile(self.a1, NOW)
+        self.assertIn("unexplained-work", self.block_codes(NOW))
+        self.publish(self.pr(title="Filter books by status"))
+        self.recovery.reconcile(self.a1, NOW)
+        st = self.status(NOW)
+        self.assertFalse(st.writer_cleared)
+        self.assertIn("unexplained-work", self.block_codes(NOW))
+
+    def test_review_a_url_in_the_clearing_note_is_not_vouched_for(self):
+        run = self.dispatch(LOST)
+        self.recovery.record_launch_finding(run, Finding.SESSION_FOUND, [URL1], "run list", NOW)
+        self.recovery.clear(
+            self.a1,
+            ev.ClearingBasis.COMPLETED,
+            NOW,
+            session_urls=[URL1],
+            note=f"have not checked {URL2}, may be running",
+        )
+        self.recovery.record_launch_finding(
+            run, Finding.DUPLICATES, [URL1, URL2], "run list again", NOW
+        )
+        st = self.status(NOW)
+        self.assertFalse(st.writer_cleared)
+        self.assertIn("clearing-invalid", self.block_codes(NOW))
+        self.assertFalse(self.recovery.may_restore_bot_access(NOW)[0])
+
+    def test_review_malformed_checks_record_does_not_crash_status(self):
+        run = self.dispatch()
+        self.publish(self.pr())
+        self.recovery.reconcile(self.a1, NOW)
+        bad = LedgerEvent(
+            ledger_kinds.CHECKS, NOW, self.task, self.a1, run, {"revision": SHA_A, "results": ["x"]}
+        )
+        try:
+            self.append(bad)
+        except InvalidEvent:
+            return  # the durable ledger refuses it outright
+        self.assertEqual(self.status(NOW).state, State.VERIFYING)
+
+    def test_review_malformed_pr_observation_does_not_break_reconcile(self):
+        run = self.dispatch()
+        self.append(LedgerEvent(PR_OBSERVED, NOW, self.task, self.a1, run, {"number": "x"}))
+        self.publish(self.pr())
+        result = self.recovery.reconcile(self.a1, NOW)
+        self.assertGreater(result.recorded, 0)
+        self.assertEqual(self.status(NOW).pull_requests, (7,))
+
+    def test_review_a_merged_pr_stays_merged_when_its_title_is_edited(self):
+        self.dispatch()
+        merged = {"state": "closed", "merged": True, "merge_commit": "c" * 40}
+        self.publish(self.pr(**merged))
+        self.recovery.reconcile(self.a1, NOW)
+        self.assertEqual(self.status(NOW).state, State.MERGED)
+        self.publish(self.pr(title="x", **merged))
+        self.recovery.reconcile(self.a1, NOW)
+        self.assertEqual(self.status(NOW).state, State.MERGED)
+        with self.assertRaises(RecoveryRefused):
+            self.recovery.close_attempt(self.a1, State.FAILED, "no", NOW)
 
 
 class SqliteRecoverySpecTests(RecoverySpecTests):

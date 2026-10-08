@@ -55,6 +55,19 @@ def session_url(value: str) -> str:
     return value
 
 
+def listed_urls(evidence: str) -> tuple[str, ...]:
+    """The session URLs a completed or terminated clearing vouches for: the
+    whitespace-separated URLs at the start of its evidence, up to the first
+    word that is not one. A URL mentioned later, in a note ("have not checked
+    https://..."), is not vouched for."""
+    out = []
+    for word in evidence.split():
+        if SESSION_URL_RE.fullmatch(word) is None:
+            break
+        out.append(word)
+    return tuple(out)
+
+
 def launch_reconciled(
     run: RunId,
     finding: Finding,
