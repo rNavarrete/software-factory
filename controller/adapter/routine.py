@@ -255,10 +255,16 @@ class RoutineAdapter:
         errors = _text_errors(request.text, request.digest, attempt, self._validate_contract)
         if errors:
             raise PayloadRejected(errors)
+        return self._post(request.text)
+
+    def _post(self, text: str) -> LaunchResult:
+        """The single POST, with no payload checks. Only ``launch`` and the
+        qualification step that proves the worker refuses a malformed payload
+        (adapter/qualify.py, step l2) call it."""
         key = self._start_key(self.trig_id)
         http_request = urllib.request.Request(
             self._url,
-            data=json.dumps({"text": request.text}).encode(),
+            data=json.dumps({"text": text}).encode(),
             method="POST",
             headers={
                 "Authorization": f"Bearer {key}",
