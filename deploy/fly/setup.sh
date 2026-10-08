@@ -7,6 +7,8 @@
 #   2. typing the approval code for the qualification contract,
 #   3. typing your current usage numbers.
 set -eu
+# flyctl's own installer puts it here; Homebrew's folders are usually on PATH.
+PATH="$HOME/.fly/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 APP=rnavarrete-factory
 REGION=iad
 
@@ -16,7 +18,8 @@ if [ ! -f deploy/fly/fly.toml ]; then
 fi
 
 echo "== App"
-fly apps list | grep -q "^$APP " || fly apps create "$APP"
+# Listing the app's volumes works only if the app exists and is yours.
+fly volumes list --app "$APP" >/dev/null 2>&1 || fly apps create "$APP"
 
 echo "== Volume (1 GB, daily snapshots kept 14 days)"
 if ! fly volumes list --app "$APP" | grep -q factory_data; then
