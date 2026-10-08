@@ -56,7 +56,10 @@ class HonestScenarioTest(unittest.TestCase):
         self.assertIn(f"needs review ({fx.FILE_FLAG})", "\n".join(out.blockers))
 
     def test_no_expected_reason_matches_the_honest_run(self):
-        honest = fx.evaluate(fx.honest()).text
+        """Checked against the honest run without Rolando's clearance, which has a blocker
+        of its own, so a reason that only names that blocker would show up here."""
+        honest = fx.evaluate(fx.honest().but(clearances=())).text
+        self.assertTrue(honest)
         for case in CASES:
             for rx in getattr(case.check, "expect", ()):
                 with self.subTest(case=case.id, expect=rx):
@@ -81,6 +84,18 @@ class HonestScenarioTest(unittest.TestCase):
         ]
         decision = rc.check_dispatch(stored, task, fx.DIGEST, now)
         self.assertNotIn("attempt-cap", [b.code for b in decision.blocks])
+
+    def test_fresh_push_with_everything_recollected_is_ready(self):
+        """The one-record-left-old push cases are blocked by that record alone."""
+        self.assertTrue(fx.evaluate(rc._fresh_push()).ready)
+
+    def test_human_review_by_the_named_reviewer_passes(self):
+        observed = rc._human_review(fx.REVIEWER)
+        self.assertFalse(observed.blocked)
+        self.assertIn("ready", observed.detail)
+
+    def test_honest_summary_would_launch(self):
+        self.assertIn("the launch went out", rc._summary_launch("Filter books by status").detail)
 
     def test_honest_edits_used_by_cases_exist(self):
         with self.assertRaises(ValueError):
@@ -167,7 +182,20 @@ class ForgedEvidenceTest(GroupTestMixin, unittest.TestCase):
         """If this fails, the gap was fixed: remove its known_gap so it must stay blocked."""
         self.assertEqual(
             KNOWN_GAPS,
-            {"worker-reruns-as-bot", "worker-reruns-with-space", "worker-observes-as-bot"},
+            {
+                "worker-reruns-as-bot",
+                "worker-reruns-with-space",
+                "worker-observes-as-bot",
+                "worker-observes-lookalike-name",
+                "rerun-by-malformed-login",
+                "hook-hidden-under-routine-clearance",
+                "shared-value-changed-under-routine-clearance",
+                "typecheck-suppressed-in-src",
+                "weak-length-assertion",
+                "expected-value-mirrors-code",
+                "instructions-in-title-summary",
+                "unicode-line-break-in-title",
+            },
         )
         for case_id in KNOWN_GAPS:
             with self.subTest(case=case_id):

@@ -213,12 +213,24 @@ def proof(criterion: str = "ac1", **changes) -> FailureProof:
         contract_digest=str(DIGEST),
         tests_commit=HEAD,
         code_commit=BASE,
-        outcome=ProofOutcome.FAILED_ASSERTION,
+        outcome=ProofOutcome.FAILED_ERROR,
         by=MAPPER,
         url=PROOF_URL,
-        output_excerpt="AssertionError: expected [ '1', '2', '3', '4' ] to deeply equal",
+        output_excerpt="TypeError: filterByStatus is not a function",
     )
     return replace(p, **changes)
+
+
+def proof_limit(criterion: str = "ac1", **changes) -> FailureProofLimit:
+    lim = FailureProofLimit(
+        criterion=criterion,
+        contract_digest=str(DIGEST),
+        commit=HEAD,
+        base_commit=MAIN,
+        by=MAPPER,
+        reason="filterByStatus is new: the test cannot load against the base's code.",
+    )
+    return replace(lim, **changes)
 
 
 def control_change(**changes) -> ControlChangeReport:
