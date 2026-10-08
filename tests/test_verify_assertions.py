@@ -1675,8 +1675,8 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn("\n- Ready for Rolando's review: **yes**", render(report))
 
 
-class ReviewFindingsTest(unittest.TestCase):
-    """AC1/AC3/AC5: ways a worker-written test could look like coverage, found in review."""
+class ProbeCase(unittest.TestCase):
+    """Helpers for linking ac1 to a probe test."""
 
     BODY = TestThatMayNotRunTest.BODY
     QUOTE = TestThatMayNotRunTest.QUOTE
@@ -1700,6 +1700,14 @@ class ReviewFindingsTest(unittest.TestCase):
         self.assertIn(why, " ".join(f.detail for f in flags))
         self.assertFalse(report.ready)
         return report
+
+    def prefixed(self, prefix, body=None):
+        text = probe_file(probe_test(body or self.BODY))
+        return text.replace("\nconst NOW", "\n" + prefix + "const NOW", 1)
+
+
+class ReviewFindingsTest(ProbeCase):
+    """AC1/AC3/AC5: ways a worker-written test could look like coverage, found in review."""
 
     def test_good_probe_is_ready(self):
         report = self.status(probe_file(probe_test(self.BODY)))
@@ -1922,12 +1930,8 @@ class ReviewFindingsTest(unittest.TestCase):
         self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
 
 
-class SecondReviewTest(ReviewFindingsTest):
+class SecondReviewTest(ProbeCase):
     """AC1/AC3: tricks and false alarms found in the second review round."""
-
-    def prefixed(self, prefix, body=None):
-        text = probe_file(probe_test(body or self.BODY))
-        return text.replace("\nconst NOW", "\n" + prefix + "const NOW", 1)
 
     def test_options_that_cannot_be_read_make_it_unknown(self):
         for call in (
@@ -1945,7 +1949,7 @@ class SecondReviewTest(ReviewFindingsTest):
         text = probe_file(
             "  it('checks it', (ctx) => {\n    ctx['skip']();\n" + self.BODY + "\n  });\n"
         )
-        self.assert_unknown(text, "in a string")
+        self.assert_unknown(text, "computed key")
 
     def test_replacing_globals_makes_it_unknown(self):
         for prefix in (
@@ -2096,6 +2100,47 @@ class SecondReviewTest(ReviewFindingsTest):
         quote = "expect<Book[]>(filterByStatus(shelf, 'reading')).toHaveLength(1)"
         report = self.status(probe_file(probe_test(f"    {quote};")), quote=quote)
         self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
+
+
+class ThirdReviewTest(ProbeCase):
+    """AC1/AC3: deliberately hostile code and false alarms found in the third review round."""
+
+    def test_hostile_indirection_makes_it_unknown(self):
+        cases = {
+            "computed skip": (
+                "",
+                "    (ctx as any)['sk' + 'ip']();\n" + self.BODY,
+            ),
+            "Object bracket": ("Object['assign'](globalThis, { it: () => {} });\n", None),
+            "eval": ("eval('globalThis.it = () => {}');\n", None),
+            "new Function": ("new Function('globalThis.it = () => {}')();\n", None),
+        }
+        for label, (prefix, body) in cases.items():
+            with self.subTest(label):
+                if body:
+                    text = probe_file("  it('checks it', (ctx) => {\n" + body + "\n  });\n")
+                else:
+                    text = self.prefixed(prefix)
+                self.assert_unknown(text, "")
+
+    def test_ordinary_code_near_the_hostile_patterns_is_fine(self):
+        for setup in (
+            "const page = { skip: 0 };\nconst offset = page.skip;\n",
+            "const words = ['test', 'only', 'todo', 'it', 'expect'];\n",
+            "Object.defineProperty(window, 'matchMedia', { writable: true, value: vi.fn() });\n",
+            "const copy = Object.assign({}, { a: 1 });\n",
+            "const first = [() => 1][0]();\n",
+        ):
+            with self.subTest(setup=setup):
+                report = self.status(self.prefixed(setup))
+                self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
+                self.assertTrue(report.ready, report.blockers)
+
+    def test_prettier_trailing_comma_is_not_weak(self):
+        quote = "expect(\n      filterByStatus(shelf, 'reading'),\n    ).toHaveLength(1)"
+        report = self.status(probe_file(probe_test(f"    {quote};")), quote=quote)
+        self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
+        self.assertNotIn(FlagKind.WEAK_ASSERTION, open_kinds(report))
 
 
 if __name__ == "__main__":

@@ -649,17 +649,20 @@ _SHADOW_RES = (
 _DESTRUCTURE_RE = re.compile(r"(?<![\w$.])(?:const|let|var)\s*([\[{])")
 # Ways to skip, or reach a test function, that are not part of a test's declaration.
 _RUNTIME_SKIP_RES = (
-    re.compile(r"\.\s*skip(?![\w$])"),
+    re.compile(r"\.\s*skip\s*(?:\?\.\s*)?\("),
     re.compile(r"(?<![\w$.])skip\s*\("),
 )
+_GLOBALS = r"(?:globalThis|global|window|self)"
 _GLOBAL_WRITE_RES = (
-    re.compile(r"(?<![\w$.])(?:globalThis|global|window|self)\s*(?:\?\.\s*)?\["),
-    re.compile(rf"(?<![\w$.])(?:globalThis|global|window|self)\s*\.\s*(?:{_GUARDED})(?![\w$])"),
-    re.compile(
-        r"(?<![\w$.])(?:Reflect|Object)\s*\.\s*"
-        r"(?:set|assign|defineProperty|defineProperties|setPrototypeOf)\s*\("
-    ),
+    re.compile(rf"(?<![\w$.]){_GLOBALS}\s*\.\s*(?:{_GUARDED})(?![\w$])"),
+    re.compile(r"(?<![\w$.])(?:Reflect|Object)\s*\["),
+    re.compile(r"(?<![\w$.])(?:eval|Function)\s*\("),
 )
+# Object.assign(globalThis, ...), Reflect.set(window, ...): checked for guarded names.
+_GLOBAL_CALL_RE = re.compile(
+    rf"(?<![\w$.])(?:Reflect|Object)\s*\.\s*[A-Za-z]+\s*\(\s*(?:\(\s*)?{_GLOBALS}(?![\w$])"
+)
+_GUARDED_WORD_RE = re.compile(rf"(?<![\w$.])(?:{_GUARDED})(?![\w$])(?!\s*\.)")
 _INDIRECT_WORDS = frozenset(
     _GUARDED.split("|") + ["skip", "only", "todo", "fails", "skipIf", "runIf", "skipped"]
 )
@@ -840,21 +843,41 @@ def _parse(text: str) -> _File:
         )
         if hit:
             problems.append(f"line {line(hit.start())}: skips tests at runtime")
+    indirect = "reaches globals or code indirectly, which can replace the test functions"
     for rx in _GLOBAL_WRITE_RES:
-        for hit in rx.finditer(masked):
-            problems.append(
-                f"line {line(hit.start())}: reaches globals or sets properties indirectly, which "
-                "can replace the test functions"
-            )
+        hit = next(rx.finditer(masked), None)
+        if hit:
+            problems.append(f"line {line(hit.start())}: {indirect}")
+    for hit in _GLOBAL_CALL_RE.finditer(masked):
+        try:
+            args = text[hit.start() : _match(masked, masked.index("(", hit.start())) + 1]
+        except ParseError:
+            args = "["
+        if _GUARDED_WORD_RE.search(args) or "[" in args or "..." in args:
+            problems.append(f"line {line(hit.start())}: {indirect}")
             break
-    titles = {_skip_ws(masked, b.head_end + 1) for b in blocks}
-    for q, (_, value) in scan.strings.items():
-        if value in _INDIRECT_WORDS and q not in titles and not in_import(q):
+    for q, (end, value) in scan.strings.items():
+        # A guarded word as a computed key: x['skip'](), globalThis['it'] = ...
+        if (
+            value in _INDIRECT_WORDS
+            and _before(masked, q) == "["
+            and masked[_skip_ws(masked, end + 1) : _skip_ws(masked, end + 1) + 1] == "]"
+        ):
             problems.append(
-                f"line {line(q)}: names {value!r} in a string, which can reach test "
+                f"line {line(q)}: uses {value!r} as a computed key, which can reach test "
                 "functions or skip tests indirectly"
             )
             break
+    for close in re.finditer(r"\]\s*(?:\?\.\s*)?\(", masked):
+        k = _match_back(masked, close.start(), 0)
+        if k > 0 and (masked[k - 1].isalnum() or masked[k - 1] in "_$)]"):
+            key = masked[k + 1 : close.start()].strip()
+            if not re.fullmatch(r"\d+", key):
+                problems.append(
+                    f"line {line(k)}: calls a computed member, which can skip tests or reach "
+                    "test functions indirectly"
+                )
+                break
 
     return _File(
         text=text,
@@ -952,6 +975,14 @@ def _function_body(masked: str, a: int, e: int) -> tuple[int, int] | None:
         end = _match(masked, i)
         return (i + 1, end) if _skip_ws(masked, end + 1) >= e else None
     return None
+
+
+def _before(masked: str, i: int) -> str:
+    """The last non-space character before ``i``, or ""."""
+    b = i - 1
+    while b >= 0 and masked[b] in _WS:
+        b -= 1
+    return masked[b] if b >= 0 else ""
 
 
 def _is_key(masked: str, start: int, end: int) -> bool:
@@ -1285,6 +1316,7 @@ def _split_args(masked: str) -> list[str]:
 
 
 def _top_level_operator(masked: str) -> str | None:
+    masked = re.sub(r",\s*$", "", masked)  # prettier's trailing comma
     depth = 0
     for i, c in enumerate(masked):
         if c in _OPEN:
