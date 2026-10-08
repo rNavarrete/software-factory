@@ -125,12 +125,16 @@ class ApprovalRefused(Exception):
 
 
 class ApprovalKey(Protocol):
-    """Signs decision records. Only Rolando's login can read the real key."""
+    """Signs and checks decision records. Only Rolando's login can read the
+    real key. A key that can only check (the service's ``SignerKey``, which
+    asks the signer process) raises from ``sign``."""
 
     @property
     def key_id(self) -> str: ...
 
     def sign(self, payload: bytes) -> str: ...
+
+    def verify(self, payload: bytes, mac: str) -> bool: ...
 
 
 class StaticKey:
@@ -149,6 +153,9 @@ class StaticKey:
 
     def sign(self, payload: bytes) -> str:
         return hmac.new(self._secret, payload, hashlib.sha256).hexdigest()
+
+    def verify(self, payload: bytes, mac: str) -> bool:
+        return hmac.compare_digest(self.sign(payload), mac)
 
     def __repr__(self) -> str:
         return f"StaticKey(key_id={self.key_id!r})"
@@ -209,6 +216,9 @@ class KeychainKey:
 
     def sign(self, payload: bytes) -> str:
         return self._load().sign(payload)
+
+    def verify(self, payload: bytes, mac: str) -> bool:
+        return self._load().verify(payload, mac)
 
     def __repr__(self) -> str:
         return f"KeychainKey(service={self._service!r}, account={self._account!r})"
@@ -314,9 +324,17 @@ def authentic(
         payload = _payload(event.kind, event.task, event.attempt, event.run, d)
         if payload is None:
             return False
-        return hmac.compare_digest(keyring[key_id].sign(payload), mac)
+        return _verify(keyring[key_id], payload, mac)
     except (TypeError, ValueError, UnicodeError):
         return False
+
+
+def _verify(key: ApprovalKey, payload: bytes, mac: str) -> bool:
+    """Check a signature without needing the power to make one."""
+    verify = getattr(key, "verify", None)
+    if verify is not None:
+        return bool(verify(payload, mac))
+    return hmac.compare_digest(key.sign(payload), mac)
 
 
 def _time(value: object) -> datetime | None:

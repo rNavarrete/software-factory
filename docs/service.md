@@ -110,7 +110,7 @@ The service posts this on the ticket: "It is unclear whether worker … started"
 
 | Protocol | Ticket | Contract |
 |---|---|---|
-| `AuthorizationSource.poll(cursor)` / `.revalidate(authorization)` | ENG-174 | Returns only Todo moves it has proved were made by Rolando on an exact ticket revision. Each has a stable `event_id`, so a replay is ignored. Also returns the moves it refused, and pause/resume controls. `revalidate` is checked again right before the first fire. |
+| `AuthorizationSource.poll(cursor)` / `.standing(authorization)` | ENG-174 (`controller/intake`, docs/intake.md) | Returns only Todo moves it has proved were made by Rolando on an exact ticket revision. Each has a stable `event_id`, so a replay is ignored. Also returns the moves it refused, and pause/resume controls. `revalidate` is checked again right before the first fire. |
 | `ContractPreparer.prepare(authorization, project)` | ENG-175 | Returns a contract, or a product question. A question closes the item, and moving the ticket to Todo again starts a new one. |
 | `Reporter.post(issue_id, key, text)` | ENG-178 | Posts on Linear. Must be idempotent per `key`, because the service retries when it can't tell a failure from a lost answer. |
 | `ReviewStarter.start(pr)` | ENG-156 | Called once per attempt, when its PR first appears. Runs under the reviewer's own identity. |
@@ -122,7 +122,7 @@ ENG-174 also has to settle how a verified Todo move becomes a signed contract ap
 
 ## Known limits
 
-- **The machine holds the approval key, and the same key that checks an approval can create one.** The signatures are HMAC, so whoever can check them can also sign. The service process never writes a decision, because every confirmation it gives says no and a test makes sure it never calls the approval writers. But any code in the same process could forge one, and that will include the Linear integrations, which read untrusted ticket text. Python's standard library has no public-key signatures, so this can't be closed without adding a dependency. ENG-174 should decide how to handle it: either run the Linear-reading code in a separate process that doesn't have the key, or accept the risk and record it in the governance map.
+- **Only the signer holds the approval key (ENG-174).** The key is HMAC, so whoever can check a signature can also make one. On the machine it therefore lives only in a small signer process running as its own user (`factory-signer`). The service runs as `factory`, can't read the key file, and can only ask the signer whether a signature is good. Code that reads Linear text, model output or GitHub data can't forge an approval. Rolando's own commands over `fly ssh console` run as root and sign as before. If the signer or the service stops, the start script stops the other and exits, and Fly starts the machine again with both. See docs/intake.md.
 - **Each ticket gets one task and one attempt budget for its whole life.** If a ticket the factory already worked on is moved to Todo again, the service says so and does nothing. New work needs a new ticket.
 - **A suggested repair closes the ticket's queue entry.** A repair still needs Rolando's signed go-ahead. How that go-ahead puts the work back in the queue is ENG-160's job.
 - **The GitHub token expires.** Fine-grained tokens last at most a year. When it expires, the service can't read GitHub and says so every round. Renewing it is one `fly secrets import` (see the setup steps in the PR).

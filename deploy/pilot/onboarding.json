@@ -1,0 +1,34 @@
+{
+  "format": "factory-onboarding/v1",
+  "intake_enabled": false,
+  "approver_linear_user_id": "cd9ec650-f957-4f25-b5f0-9c14bcae49c8",
+  "intake_since": "2026-10-09T00:00:00+00:00",
+  "projects": [
+    {
+      "linear_project_id": "58d48e11-3a45-4431-92b7-19b51a4e9539",
+      "name": "Factory Pilot Demo",
+      "repository": "rNavarrete/factory-pilot-demo",
+      "routine_id": "trig_01CHWbQ267i1CMLGUym1kGd9",
+      "allowed_actions": [
+        "modify-files",
+        "add-files",
+        "add-tests"
+      ],
+      "checks": [
+        "npm run typecheck",
+        "npm test",
+        "npm run build"
+      ],
+      "max_attempts": 2,
+      "issues": [
+        "ENG-187",
+        "ENG-188",
+        "ENG-189",
+        "ENG-191"
+      ],
+      "skip_labels": [
+        "baseline"
+      ]
+    }
+  ]
+}

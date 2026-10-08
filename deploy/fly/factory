@@ -1,5 +1,11 @@
 #!/bin/sh
 # The controller's commands on the service machine, with the same home and
-# secret files the service uses. Used over `fly ssh console`.
+# secret files the service uses. Used over `fly ssh console`, as root: these
+# are Rolando's own commands, signed with the key file directly. Afterwards
+# the files go back to the service's user so the service can keep using them.
 export HOME=/data/qualification FACTORY_SECRETS_DIR=/run/factory-secrets
-cd /app && exec python3 -m controller "$@"
+cd /app || exit 1
+status=0
+python3 -m controller "$@" || status=$?
+chown -R factory:factory "$HOME/.software-factory"
+exit "$status"

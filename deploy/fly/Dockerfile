@@ -10,6 +10,11 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/data/qualification \
     FACTORY_SECRETS_DIR=/run/factory-secrets
 
+# Two users (ENG-174): the service runs as `factory`; the approval key lives
+# only in the signer process, which runs as `factory-signer`.
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin factory \
+ && useradd --system --no-create-home --shell /usr/sbin/nologin factory-signer
+
 WORKDIR /app
 COPY controller /app/controller
 COPY deploy/qualification /app/deploy/qualification
