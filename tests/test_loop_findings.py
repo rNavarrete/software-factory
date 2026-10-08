@@ -226,7 +226,7 @@ class StaleReviewTests(LoopFindingCase):
         text = self.text()
         self.assertIn("Review comment not used:", text)
         self.assertIn("main moved after the review was posted", text)
-        self.assertIn("Update branch", text)
+        self.assertIn("posted again for the new main", text)
         self.assertNotIn("python3 -m controller repair", text)  # not the worker's fault
         self.assertNotIn("Ready for your review", text)
         self.assertEqual(self.stdin.read(), answers)  # nothing asked of him

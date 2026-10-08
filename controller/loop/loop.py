@@ -255,9 +255,11 @@ class Loop:
         self.say(f"Full report: {path}")
         if any(_base_moved(why) for why in assessment.review.ignored):
             self.say(
-                "Main moved after this PR was checked. That is not the worker's fault: bring"
-                " main into the PR branch on GitHub (Update branch) so CI runs again, have the"
-                " review posted again for the new main, then run this same command again."
+                "Main moved after this PR was checked, so its review (and any check bound to"
+                " main) is for the old main. That is not the worker's fault, and no repair is"
+                " needed: the review has to be posted again for the new main, and a check still"
+                " for the old main needs CI to run again on the new main. Then run this same"
+                " command again."
             )
         elif assessment.conclusion() == "action_required":
             self.say("Only your answers are missing: run this same command again to give them.")

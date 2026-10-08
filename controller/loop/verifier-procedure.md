@@ -71,8 +71,8 @@ terminal by `python3 -m controller.loop run`.
   `base.sha`), not the contract's base; `merge_base` is where the branch
   starts. If main moves before the loop reads the review, the review stops
   counting and the loop says so ("main moved after the review was posted").
-  Then main has to be brought into the PR so CI runs again, and the review
-  posted again for the new main.
+  Then the review has to be posted again for the new main, and any CI
+  record still bound to the old main needs a CI run on the new main.
 - Who mapped and who ran the proofs is the comment's author as GitHub
   records it. Names inside the JSON are ignored.
 - The block carries mapping work only. Anything in it that looks like a
