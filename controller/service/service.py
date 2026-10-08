@@ -510,6 +510,8 @@ class Service:
         contract = contracts.freeze(out.contract)
         digest = self._contracts.save(contract)
         self._append(q.item_contract(item, digest.value, now))
+        if out.summary.strip():
+            self._notice(item, f"summary:{digest.value[:12]}", out.summary, now)
         return contract
 
     def _within(
