@@ -14,13 +14,22 @@ its test names the real mapped tests, and so on. Values the case invented
 (an older commit, another workflow, the worker's login) stay as they are.
 
 A case that rewrites the made-up test file's text, or swaps in a precomputed
-report, has no real counterpart and is reported as not replayable: those stay
-offline-only, and the report says so rather than counting them.
+report, or touches a by-hand criterion when the task has none, stays
+offline-only, and the summary says why for each. A case that should apply but
+finds nothing to change in the real records (no real failure proof for ac1,
+say) counts as a difference, as does a case whose expected reason the honest
+real run already gives: neither is allowed to pass quietly.
+
+When a case moves the head, real records the made-up run has no counterpart
+for (a failure-proof limit, a second test file) move with it, and the records
+the case deliberately left at the old commit must exist in the real run.
 
 Rolando's own decisions (his observations of by-hand criteria and his looks at
 flags) live in his signed ledger, not on GitHub. Where the real baseline needs
 them, ``stand_in_decisions`` supplies them, each labelled as a stand-in, so the
-honest real run comes out ready and a blocked case means something.
+honest real run comes out ready and a blocked case means something. It only
+ever stands in for a look at an edited test file (see ``STAND_IN_FLAGS``); any
+other flag on the real run is refused, and the summary lists every stand-in.
 
 ``python3 -m redteam.replay <contract.json> <pr-number>`` collects one pilot
 PR through ``controller.loop.collect`` (``gh api`` under the caller's login),
@@ -48,14 +57,23 @@ STAND_IN = "Stand-in for Rolando's own signed record, which lives in his ledger,
 
 
 class NotReplayable(Exception):
-    """The case's change has no counterpart in the real records."""
+    """The case has no counterpart in real records by its nature (it edits the
+    made-up test text, or the task has nothing for it to change)."""
+
+
+class NoCounterpart(NotReplayable):
+    """The case should apply, but nothing in the real records matches what it
+    changes. Shown as a difference: a replay that quietly drops cases proves
+    less than it says."""
 
 
 class Replayed(Enum):
     BLOCKED = "blocked"
     GOT_THROUGH = "got through"
     WRONG_REASON = "stopped, but not by the expected control"
-    NOT_REPLAYABLE = "offline only (no real counterpart)"
+    NOT_REPLAYABLE = "offline only"
+    NO_COUNTERPART = "nothing in the real records to apply it to"
+    UNCLEAR = "can't tell: the real run already gives this reason"
     ERROR = "error"
 
 
@@ -71,7 +89,7 @@ class ReplayResult:
     def same_as_offline(self) -> bool:
         if self.result is Replayed.NOT_REPLAYABLE:
             return True
-        return self.result.value == self.offline.value
+        return self.result.value == self.offline.value  # never for NO_COUNTERPART or UNCLEAR
 
 
 # --- The real baseline --------------------------------------------------------------
@@ -106,15 +124,28 @@ def real_scenario(
     )
 
 
-def stand_in_decisions(s: fx.Scenario) -> fx.Scenario:
-    """``s`` with a stand-in for each decision only Rolando can make: an
-    observation of every by-hand criterion, and a look at every open flag."""
-    c = s.candidate
-    observable = [
+STAND_IN_FLAGS = ("changed-test",)
+"""The only flag kind a stand-in may clear: an honest change to an existing test
+file outside its tests raises it. Any other flag on the real run (a control
+change, a test that passes without the change, a weakened or deleted test, a
+missing failure proof, a weak assertion) points at a real problem, so the
+replay refuses rather than clearing it for Rolando."""
+
+
+def observable_criteria(contract: Mapping[str, object]) -> list[str]:
+    return [
         a["id"]
-        for a in s.contract["acceptance_criteria"]
+        for a in contract["acceptance_criteria"]
         if a["evidence"]["type"] in ("observable-behavior", "human-review")
     ]
+
+
+def stand_in_decisions(s: fx.Scenario) -> fx.Scenario:
+    """``s`` with a stand-in for each decision only Rolando can make: an
+    observation of every by-hand criterion, and a look at every open flag of a
+    kind in ``STAND_IN_FLAGS``. Raises ValueError for any other open flag."""
+    c = s.candidate
+    observable = observable_criteria(s.contract)
     have = {o.criterion for o in s.observations}
     observations = tuple(s.observations) + tuple(
         Observation(
@@ -131,6 +162,12 @@ def stand_in_decisions(s: fx.Scenario) -> fx.Scenario:
     )
     s = s.but(observations=observations)
     flags = fx.evaluate(s).assertions.open_flags
+    serious = [f.key for f in flags if f.kind.value not in STAND_IN_FLAGS]
+    if serious:
+        raise ValueError(
+            "the real run has flags a stand-in may not clear, so it is no honest baseline: "
+            + ", ".join(serious)
+        )
     clearances = tuple(s.clearances) + tuple(
         Clearance(
             flag=f.key,
@@ -146,6 +183,9 @@ def stand_in_decisions(s: fx.Scenario) -> fx.Scenario:
 
 
 # --- Carrying a case's change over ----------------------------------------------------
+
+MADE_UP_OBSERVABLE = "ac3"
+"""The made-up contract's by-hand criterion; it stands for the real one."""
 
 
 def _names(real: fx.Scenario) -> list[tuple[str, str]]:
@@ -170,6 +210,9 @@ def _names(real: fx.Scenario) -> list[tuple[str, str]]:
     ):
         if cid in by_criterion:
             pairs += [(test, by_criterion[cid].test), (assertion, by_criterion[cid].assertion)]
+    observable = observable_criteria(real.contract)
+    if observable:
+        pairs.append((MADE_UP_OBSERVABLE, observable[0]))
     test_file = _real_test_file(real)
     if test_file:
         pairs.append((fx.TEST_FILE, test_file))
@@ -186,19 +229,27 @@ def _names(real: fx.Scenario) -> list[tuple[str, str]]:
 
 
 def _real_test_file(real: fx.Scenario) -> str | None:
+    """The real file standing for the made-up test file: the one ac1's test is in."""
+    for lk in real.links:
+        if lk.criterion == "ac1":
+            return lk.path
     paths = {lk.path for lk in real.links}
     return next(iter(paths)) if len(paths) == 1 else None
 
 
 def _swap(value: object, names: Sequence[tuple[str, str]]) -> object:
+    """``value`` with made-up names replaced by real ones, in one pass: an exact
+    match first, else every made-up name of 8 or more characters inside it. A
+    real value put in is never matched again."""
     if isinstance(value, str):
         for made_up, actual in names:
             if value == made_up:
                 return actual
-        for made_up, actual in names:
-            if len(made_up) >= 8:
-                value = value.replace(made_up, actual)
-        return value
+        lookup = {a: b for a, b in names if len(a) >= 8}
+        if not lookup:
+            return value
+        pattern = "|".join(re.escape(a) for a in sorted(lookup, key=len, reverse=True))
+        return re.sub(pattern, lambda m: lookup[m[0]], value)
     if isinstance(value, ContractDigest):
         return ContractDigest(str(_swap(str(value), names)))
     if isinstance(value, tuple):
@@ -234,6 +285,12 @@ def _record_key(field: str, record: object, honest_head: str) -> object:
     return None  # clearances and claims: every real record
 
 
+def _real_key(field: str, made_up_record: object, names) -> object:
+    """The key a made-up record has among the real records."""
+    key = _record_key(field, made_up_record, fx.HEAD)
+    return _swap(key, names) if isinstance(key, str) and field != "sources" else key
+
+
 def _matches(field: str, key: object, record: object, real: fx.Scenario) -> bool:
     if key is None:
         return True
@@ -244,12 +301,22 @@ def _matches(field: str, key: object, record: object, real: fx.Scenario) -> bool
     return _record_key(field, record, real.candidate.head_commit) == key
 
 
+def _no_by_hand_criterion(field: str, record: object, real: fx.Scenario) -> None:
+    if observable_criteria(real.contract):
+        return
+    if field == "observations" or getattr(record, "criterion", None) == MADE_UP_OBSERVABLE:
+        raise NotReplayable("this task has no criterion checked by hand")
+
+
 def _carry_record(field, h_rec, m_rec, real_recs, real, names):
     """Apply the attribute changes h_rec -> m_rec to every matching real record."""
-    key = _record_key(field, h_rec, fx.HEAD)
+    _no_by_hand_criterion(field, h_rec, real)
+    key = _real_key(field, h_rec, names)
     targets = [i for i, r in enumerate(real_recs) if _matches(field, key, r, real)]
     if not targets:
-        raise NotReplayable(f"no real {field[:-1]} matches the changed one ({key})")
+        if m_rec == _swap(h_rec, [(fx.HEAD, fx.NEW_HEAD)]):
+            return list(real_recs)  # only collected afresh at the new head: nothing to carry
+        raise NoCounterpart(f"no real {field[:-1]} matches the changed one ({key})")
     changed = {
         f.name: getattr(m_rec, f.name)
         for f in dataclasses.fields(h_rec)
@@ -270,26 +337,54 @@ def _carry_record(field, h_rec, m_rec, real_recs, real, names):
     return out
 
 
-def _carry_tuple(field, h_val, m_val, real_val, real, names):
+def _carry_tuple(field, h_val, m_val, real_val, real, names, head_moved=False):
     h_val, m_val, out = tuple(h_val), tuple(m_val), list(real_val)
     if len(h_val) == len(m_val):
         for h_rec, m_rec in zip(h_val, m_val, strict=True):
             if h_rec != m_rec:
                 out = _carry_record(field, h_rec, m_rec, out, real, names)
+            elif head_moved:
+                _left_stale(field, (h_rec,), real_val, real, names)
         return tuple(out)
     removed = [r for r in h_val if r not in m_val]
     added = [r for r in m_val if r not in h_val]
     for h_rec in removed:
-        key = _record_key(field, h_rec, fx.HEAD)
+        _no_by_hand_criterion(field, h_rec, real)
+        key = _real_key(field, h_rec, names)
         keep = [r for r in out if not _matches(field, key, r, real)]
         if len(keep) == len(out):
-            raise NotReplayable(f"no real {field[:-1]} matches the removed one ({key})")
+            raise NoCounterpart(f"no real {field[:-1]} matches the removed one ({key})")
         out = keep
     for m_rec in added:
+        _no_by_hand_criterion(field, m_rec, real)
         if field == "sources" and m_rec.text is not None:
             raise NotReplayable("it adds made-up test file text")
         out.append(_swap(m_rec, names))
     return tuple(out)
+
+
+def _follow_new_head(field, h_val, carried, real_val, real, names, new_head):
+    """When a case moves the head, real records the made-up run has no
+    counterpart for (a limit, a second test file, a link for another criterion)
+    move with it, as the made-up run's own records would have: the case means
+    only what it changed to be stale."""
+    h_keys = [_real_key(field, r, names) for r in h_val]
+    old_head = real.candidate.head_commit
+    out = []
+    for rec in carried:
+        unpaired = rec in real_val and not any(_matches(field, k, rec, real) for k in h_keys)
+        out.append(_swap(rec, [(old_head, new_head)]) if unpaired else rec)
+    return tuple(out)
+
+
+def _left_stale(field, h_val, real_val, real, names) -> None:
+    """A case that moves the head and leaves ``field`` at the old commit means
+    to show those records stale; that needs real records for it to reach."""
+    for h_rec in h_val:
+        _no_by_hand_criterion(field, h_rec, real)
+    keys = [_real_key(field, r, names) for r in h_val]
+    if not any(_matches(field, k, r, real) for k in keys for r in real_val):
+        raise NoCounterpart(f"no real {field[:-1]} to leave at the old commit ({keys[0]})")
 
 
 def carry_over(made: fx.Scenario, real: fx.Scenario) -> fx.Scenario:
@@ -349,9 +444,20 @@ def carry_over(made: fx.Scenario, real: fx.Scenario) -> fx.Scenario:
                 }
                 changes["control_change"] = replace(rv, **new)
         elif isinstance(hv, tuple):
-            changes[f.name] = _carry_tuple(f.name, hv, mv, rv, real, names)
+            moved = made.candidate.head_commit != h.candidate.head_commit
+            changes[f.name] = _carry_tuple(f.name, hv, mv, rv, real, names, moved)
         else:
             changes[f.name] = mv
+    new_head = made.candidate.head_commit
+    if new_head != h.candidate.head_commit:
+        new_head = str(_swap(new_head, names))
+        for f in dataclasses.fields(fx.Scenario):
+            hv, mv, rv = getattr(h, f.name), getattr(made, f.name), getattr(real, f.name)
+            if isinstance(hv, tuple) and hv and hv == mv:
+                _left_stale(f.name, hv, rv, real, names)
+            if isinstance(hv, tuple) and f.name != "clearances":
+                carried = changes.get(f.name, rv)
+                changes[f.name] = _follow_new_head(f.name, hv, carried, rv, real, names, new_head)
     out = real.but(**changes)
     if changes.get("approved", 0) is None:
         out = out.but(approved=contracts.digest(out.contract))
@@ -366,34 +472,47 @@ def replayable(case: rc.Case) -> bool:
 
 
 def _expect(case: rc.Case, real: fx.Scenario) -> tuple[str, ...]:
-    """The case's expected reasons, with made-up names swapped for real ones."""
-    commits = {
-        fx.HEAD: real.candidate.head_commit,
-        fx.MAIN: real.candidate.base_commit,
-        fx.BASE: real.candidate.merge_base,
+    """The case's expected reasons, with made-up names swapped for real ones, in
+    one pass so a real value put in is never matched again."""
+    lookup = {re.escape(a): re.escape(b) for a, b in _names(real)}
+    alternatives = [re.escape(a) for a in sorted(lookup, key=len, reverse=True)]
+    # A shortened made-up commit ("aaaa") stands for the real one's start.
+    runs = {
+        made_up[0]: actual
+        for made_up, actual in (
+            (fx.HEAD, real.candidate.head_commit),
+            (fx.MAIN, real.candidate.base_commit),
+            (fx.BASE, real.candidate.merge_base),
+        )
+        if len(set(made_up)) == 1
     }
+    alternatives += [f"{ch}{{4,40}}" for ch in runs]
+    pattern = re.compile("|".join(alternatives))
+
+    def put(m: re.Match) -> str:
+        if m[0] in lookup:
+            return lookup[m[0]]
+        return runs[m[0][0]][: len(m[0])]
+
     budget = (fx.CONTRACT["attempt_budget"], real.contract["attempt_budget"])
     out = []
     for rx in case.check.expect:
-        for made_up, actual in _names(real):
-            esc = re.escape(made_up)
-            if esc in rx:
-                rx = rx.replace(esc, re.escape(actual))
-        # A shortened made-up commit ("aaaa") stands for the real one's start.
-        for made_up, actual in commits.items():
-            if len(set(made_up)) == 1:
-                rx = re.sub(f"{made_up[0]}{{4,40}}", lambda m, a=actual: a[: len(m[0])], rx)
+        rx = pattern.sub(put, rx)
         rx = rx.replace(f"budget of {budget[0]}", f"budget of {budget[1]}")
         out.append(rx)
     return tuple(out)
 
 
-def replay_case(case: rc.Case, real: fx.Scenario, offline: rc.Result) -> ReplayResult:
+def replay_case(
+    case: rc.Case, real: fx.Scenario, offline: rc.Result, baseline_text: str = ""
+) -> ReplayResult:
     if not replayable(case):
         return ReplayResult(case, Replayed.NOT_REPLAYABLE, "not a change to records", offline)
     try:
         scenario = carry_over(case.check.make(), real)
         out = fx.evaluate(scenario)
+    except NoCounterpart as e:
+        return ReplayResult(case, Replayed.NO_COUNTERPART, str(e), offline)
     except NotReplayable as e:
         return ReplayResult(case, Replayed.NOT_REPLAYABLE, str(e), offline)
     except Exception as e:  # a crash is never a pass
@@ -401,6 +520,11 @@ def replay_case(case: rc.Case, real: fx.Scenario, offline: rc.Result) -> ReplayR
     if out.ready:
         return ReplayResult(case, Replayed.GOT_THROUGH, "the pipeline said ready", offline)
     expect = _expect(case, real)
+    already = [rx for rx in expect if re.search(rx, baseline_text)]
+    if already:
+        return ReplayResult(
+            case, Replayed.UNCLEAR, f"the honest real run already matches {already!r}", offline
+        )
     missing = [rx for rx in expect if not re.search(rx, out.text)]
     if missing:
         first = out.blockers[0] if out.blockers else "(no blocker)"
@@ -422,20 +546,40 @@ def replay_all(real: fx.Scenario, cases: Sequence[rc.Case] = rc.CASES) -> tuple[
             + "; ".join(baseline.blockers)
         )
     offline = {r.case.id: r.result for r in rc.run_all(tuple(cases))}
-    return tuple(replay_case(c, real, offline[c.id]) for c in cases)
+    return tuple(replay_case(c, real, offline[c.id], baseline.text) for c in cases)
 
 
-def summary(results: Sequence[ReplayResult], label: str) -> str:
+def stand_ins(real: fx.Scenario) -> list[str]:
+    """Every stand-in decision in ``real``, for the summary."""
+    out = [f"observation of {o.criterion}" for o in real.observations if STAND_IN in o.seen]
+    out += [f"look at flag {c.flag}" for c in real.clearances if STAND_IN in c.note]
+    return out
+
+
+def summary(results: Sequence[ReplayResult], label: str, real: fx.Scenario | None = None) -> str:
     counts: dict[Replayed, int] = {}
     for r in results:
         counts[r.result] = counts.get(r.result, 0) + 1
     lines = [f"Offline cases re-run on {label}:"]
     lines += [f"  {k.value}: {counts.get(k, 0)}" for k in Replayed]
+    reasons: dict[str, int] = {}
+    for r in results:
+        if r.result is Replayed.NOT_REPLAYABLE:
+            reasons[r.detail] = reasons.get(r.detail, 0) + 1
+    if reasons:
+        lines.append("  why some are offline only:")
+        lines += [f"    {n} x {why}" for why, n in sorted(reasons.items(), key=lambda p: -p[1])]
+    if real is not None:
+        made = stand_ins(real)
+        lines.append("  stand-ins for Rolando's own records: " + (", ".join(made) or "none"))
     differ = [r for r in results if not r.same_as_offline]
     lines.append(f"  differ from the offline run: {len(differ)}")
     for r in differ:
         lines.append(f"    {r.case.id}: {r.result.value} (offline: {r.offline.value}): {r.detail}")
     return "\n".join(lines)
+
+
+NO_BASE = "GitHub does not say which base"
 
 
 def collect_real(contract_path: str, pr_number: int, api=None) -> tuple[fx.Scenario, str]:
@@ -448,20 +592,24 @@ def collect_real(contract_path: str, pr_number: int, api=None) -> tuple[fx.Scena
         contract = contracts.loads(f.read())
     approved = contracts.digest(contract)
     api = api or k.GhApi()
-    attempt = AttemptId(TaskId(str(contract["task_id"])), 1)
+    task = TaskId(str(contract["task_id"]))
+    head_ref = (api.json(f"repos/{k.PILOT_REPO}/pulls/{pr_number}").get("head") or {}).get("ref")
+    attempt = AttemptId.from_branch(head_ref) if isinstance(head_ref, str) else None
+    if attempt is None or attempt.task != task:
+        attempt = AttemptId(task, 1)  # the collector then names the wrong branch
     collected = k.collect(api, contract, approved, attempt, pr_number)
+    problems = list(collected.problems)
     if collected.ci is not None and collected.ci.base_sha is None and collected.candidate:
         # A merged PR's run no longer lists the PR, so GitHub stops saying which
         # base it ran on. Use the PR's recorded base; the collector still checks
         # it against the commits the run's own control-change report names.
         ci = replace(collected.ci, base_sha=collected.candidate.base_commit)
-        results, control, problems = k._ci_evidence(
+        results, control, again = k._ci_evidence(
             api, k.PILOT_REPO, ci, collected.candidate.head_commit, approved
         )
         collected = replace(collected, ci=ci, results=results, control_change=control)
-        if problems:
-            raise ValueError("; ".join(problems))
-    unusable = [p for p in collected.problems if not p.endswith("is closed.")]
+        problems = [p for p in problems if not p.startswith(NO_BASE)] + again
+    unusable = [p for p in problems if not p.endswith("is closed.")]
     if unusable or collected.pending:
         raise ValueError("; ".join(unusable) or "CI has not finished for this PR")
     review = read_review(collected.comments, approved.value, collected.candidate)
@@ -469,19 +617,19 @@ def collect_real(contract_path: str, pr_number: int, api=None) -> tuple[fx.Scena
     return stand_in_decisions(real), collected.pr_url
 
 
-def main(argv: Sequence[str], out: Callable[[str], None] = print) -> int:
+def main(argv: Sequence[str], out: Callable[[str], None] = print, api=None) -> int:
     if len(argv) != 2 or not argv[1].isdigit():
         out("usage: python3 -m redteam.replay <contract.json> <pr-number>")
         return 2
     from controller.loop.collect import GitHubUnreadable
 
     try:
-        real, url = collect_real(argv[0], int(argv[1]))
+        real, url = collect_real(argv[0], int(argv[1]), api=api)
         results = replay_all(real)
     except (GitHubUnreadable, ValueError, OSError) as e:
         out(f"Could not replay: {e}")
         return 1
-    out(summary(results, url))
+    out(summary(results, url, real))
     return 0 if all(r.same_as_offline for r in results) else 1
 
 
