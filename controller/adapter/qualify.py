@@ -42,13 +42,13 @@ from datetime import UTC, datetime
 from controller import contract as contract_format
 from controller.adapter import routine
 from controller.approval import ApprovalRefused, Approvals
-from controller.attempts import AttemptGate, DispatchRefused
+from controller.attempts import AttemptGate
 from controller.attempts.events import ClearingBasis
 from controller.attempts.policy import LedgerView
+from controller.dispatch import Launcher, Refused, prompt_revision
 from controller.interfaces import (
     AttemptId,
     ContractDigest,
-    LaunchOutcome,
     LaunchRequest,
     LaunchResult,
     LedgerStore,
@@ -182,6 +182,7 @@ class Qualifier:
         ),
         key: Callable[[str, str], str] = start_key,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        backup: Callable[[datetime], object] | None = None,
     ) -> None:
         self._store = store
         self._approvals = approvals
@@ -190,6 +191,15 @@ class Qualifier:
         self._adapter = adapter
         self._key = key
         self._now = now
+        self._launcher = Launcher(
+            store,
+            approvals,
+            recovery,
+            gate,
+            model_config_version=f"qualification; prompt sha256 {prompt_revision()}",
+            now=now,
+            backup=backup,
+        )
 
     def snapshot(self, session_pct: float, weekly_pct: float, credits_spent: float) -> None:
         now = self._now()
@@ -216,63 +226,27 @@ class Qualifier:
         return self.fire(trig_id, step, refire_of=prior)
 
     def fire(self, trig_id: str, step: str, refire_of: RunId | None = None) -> LaunchResult:
-        """One fire, in dispatch order: recover, check, prepare, reserve, send, record."""
-        now = self._now()
-        self._recovery.recover(now)
+        """One fire through the same path as a real dispatch (controller.dispatch):
+        recover, check, prepare, reserve (checks again under the lock), send, record."""
         contract = step_contract(step)
-        digest = contract_format.digest(contract)
-        task = TaskId(STEPS[step].task_id)
-        blocks = list(self._recovery.blocks(now))
-        verdict = self._approvals.check(contract, now, refire_of=refire_of)
-        blocks += verdict.blocks
-        if blocks or verdict.run is None:
-            raise QualifyRefused("; ".join(f"{b.code}: {b.detail}" for b in blocks))
-        # Everything that can fail without sending is done before the reserve,
-        # so a missing Keychain item doesn't use up a fire.
-        text = fire_text(step, contract, digest)
-        key = self._key(step, trig_id)
-        adapter = self._adapter(trig_id, lambda _t: key)
-        try:
-            run = self._gate.reserve(task, digest, now, refire_of=refire_of)
-        except DispatchRefused as e:
-            raise QualifyRefused(
-                "; ".join(f"{b.code}: {b.detail}" for b in e.decision.blocks)
-            ) from None
-        if run != verdict.run:
-            # Recorded as never sent, so the lane and the count stay honest.
-            self._gate.record_launch(
-                run,
-                LaunchResult(LaunchOutcome.NOT_LAUNCHED, detail="not sent: run mismatch"),
-                self._now(),
-            )
-            raise QualifyRefused(f"the gate reserved {run}, approvals expected {verdict.run}")
-        try:
-            if STEPS[step].malformed:
-                result = adapter._post(text)
-            else:
-                result = adapter.launch(LaunchRequest(run, digest, text))
-        except routine.LaunchInterrupted as e:
-            self._record(run, e.result)
-            raise
-        except BaseException as e:
-            self._record(
-                run,
-                LaunchResult(
-                    LaunchOutcome.OUTCOME_UNKNOWN,
-                    detail=routine._scrub(f"stopped during the fire: {type(e).__name__}: {e}", key),
-                ),
-            )
-            raise
-        self._record(run, result)
-        return result
 
-    def _record(self, run: RunId, result: LaunchResult) -> None:
-        now = self._now()
+        def prepare(run: RunId, digest: ContractDigest):
+            if run.attempt != _attempt(STEPS[step].task_id):
+                raise QualifyRefused(f"{step} is set up for attempt 1 only, not {run.attempt}")
+            # Everything that can fail without sending is done before the
+            # reserve, so a missing Keychain item doesn't use up a fire.
+            text = fire_text(step, contract, digest)
+            key = self._key(step, trig_id)
+            adapter = self._adapter(trig_id, lambda _t: key)
+            if STEPS[step].malformed:
+                return lambda: adapter._post(text)
+            request = LaunchRequest(run, digest, text)
+            return lambda: adapter.launch(request)
+
         try:
-            self._gate.record_launch(run, result, now)
-        except ValueError:
-            # Recovery already marked it unknown; keep the late answer beside it.
-            self._recovery.record_late_result(run, result, now)
+            return self._launcher.fire(contract, prepare, refire_of=refire_of).result
+        except Refused as e:
+            raise QualifyRefused(str(e)) from None
 
     def reconcile(self, step: str):
         return self._recovery.reconcile(_attempt(STEPS[step].task_id), self._now())
@@ -303,13 +277,23 @@ class Qualifier:
 def _real() -> Qualifier:
     from controller.approval import KeychainKey
     from controller.ledger import SqliteLedgerStore
+    from controller.ledger.store import DEFAULT_HOME
     from controller.recovery import GhCliReader
+
+    def store_home():
+        return DEFAULT_HOME.expanduser()
 
     store = SqliteLedgerStore()  # ~/.software-factory, created 0700
     gate = AttemptGate(store)
     approvals = Approvals(store, KeychainKey())
     recovery = Recovery(store, approvals, GhCliReader(), gate=gate)
-    return Qualifier(store, approvals, recovery, gate)
+    return Qualifier(
+        store,
+        approvals,
+        recovery,
+        gate,
+        backup=lambda now: store.backup(store_home() / "backups", now),
+    )
 
 
 USAGE = __doc__
