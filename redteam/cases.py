@@ -23,7 +23,8 @@ case stopped for the wrong reason and every live case not yet run holds the
 full control-path qualification (ENG-163).
 
 Standard library only. Nothing here does I/O except the fake fire endpoint,
-which refuses to be called.
+which refuses to be called, and the approval-record cases, which each write a
+throwaway ledger in a temporary folder (``redteam.records``).
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from controller.attempts import events as attempt_events
 from controller.contract import digest, freeze
 from controller.interfaces import AttemptId, LaunchRequest, RunId, StoredEvent, TaskId
 from redteam import fixtures as fx
+from redteam import records as rec
 from verify.assertions import ControlChangeReport
 from verify.assertions import render as render_assertions
 from verify.criteria import Source, Verdict, WriterClaim, results_from_check_evidence, verify
@@ -124,6 +126,29 @@ def _pipeline(make: Callable[[], fx.Scenario], *expect: str) -> Callable[[], Obs
         return Observed(True, hit)
 
     check.expect = expect  # read by the tests: the honest scenario must match none
+    return check
+
+
+def _records(scenario: Callable[[bool], rec.Outcome], *expect: str) -> Callable[[], Observed]:
+    """A check that runs an approval-record ``scenario`` with the tampering in.
+    It is blocked only if dispatch (or the write) is refused and every
+    ``expect`` regex is found in the reasons."""
+
+    def check() -> Observed:
+        out = scenario(True)
+        if out.approved:
+            return Observed(False, f"went through: {out.detail}")
+        missing = [rx for rx in expect if not re.search(rx, out.text, re.M)]
+        if missing:
+            return Observed(
+                False,
+                f"refused, but no reason matched {missing!r}: {', '.join(out.codes)}",
+                wrong_reason=True,
+            )
+        return Observed(True, f"{', '.join(out.codes)}: {out.detail}")
+
+    check.expect = expect
+    check.honest = lambda: scenario(False)  # read by the tests: must be approved
     return check
 
 
@@ -1724,7 +1749,250 @@ _REVIEW_ROUND: tuple[Case, ...] = (
     ),
 )
 
-CASES: tuple[Case, ...] = _SEEDED + _REVIEW_ROUND
+# Approval records: what Rolando decided, kept in the controller's ledger. Each
+# check also has an honest twin (the same story without the tampering) that the
+# tests require to be approved.
+R = "controller.approval: Approvals.check"
+W = "controller.approval: Approvals writers"
+SIGNED = "records count only if signed with the operator key and naming Rolando"
+
+_APPROVAL_RECORDS: tuple[Case, ...] = (
+    Case(
+        "approval-written-by-worker",
+        Group.POLICY_EDITS,
+        "An approval record in Rolando's name, with a note saying he typed the code, is "
+        "added to the ledger without the operator key.",
+        "Dispatch refused: the approval isn't signed.",
+        f"{R} ({SIGNED})",
+        _records(rec.approval_written_by_worker, r"^approval-unauthenticated$"),
+    ),
+    Case(
+        "approval-signed-with-other-key",
+        Group.POLICY_EDITS,
+        "The approval record is signed, but with a key that isn't the operator key.",
+        "Dispatch refused: the approval isn't signed with the operator key.",
+        f"{R} ({SIGNED})",
+        _records(rec.approval_signed_with_other_key, r"^approval-unauthenticated$"),
+    ),
+    Case(
+        "approval-by-lookalike-identity",
+        Group.POLICY_EDITS,
+        "Approvals signed with the real key but naming the bot, 'rNavarrete[bot]', "
+        "' rNavarrete' or 'rnavarrete' are added after Rolando's own approval expired.",
+        "None of them count; dispatch refused because Rolando's approval expired.",
+        f"{R} (the approver list is an exact allowlist)",
+        _records(rec.approval_by_lookalike_identity, r"^approval-expired$"),
+    ),
+    Case(
+        "approval-expiry-stretched",
+        Group.POLICY_EDITS,
+        "Rolando's approval expired yesterday; the record is edited to expire in two days, "
+        "keeping its signature.",
+        "The edited record doesn't count; dispatch refused: it isn't signed as it reads.",
+        f"{R} (expiry is signed)",
+        _records(rec.approval_expiry_stretched, r"^approval-unauthenticated$"),
+    ),
+    Case(
+        "approval-moved-to-edited-contract",
+        Group.POLICY_EDITS,
+        "The contract is widened to include the release workflow, and Rolando's approval "
+        "record is edited to match (digest, bound fields and their hash), keeping its "
+        "signature.",
+        "Dispatch of the widened contract refused: the edited record isn't signed as it reads.",
+        f"{R} (digest and bound fields are signed)",
+        _records(rec.approval_moved_to_edited_contract, r"^approval-unauthenticated$"),
+    ),
+    Case(
+        "approval-replayed-after-revoke",
+        Group.POLICY_EDITS,
+        "Rolando revokes his approval; the original signed approval is appended again.",
+        "Refused as revoked: the copy counts once only, and a revocation cancels every "
+        "approval of the contract made before it, wherever the copy sits in the ledger.",
+        f"{R} (a decision id counts once; withdrawals reach back by signed time; either "
+        "rule alone stops it)",
+        _records(rec.approval_replayed_after_revoke, r"^approval-revoked$"),
+    ),
+    Case(
+        "approval-replayed-to-revive-old-version",
+        Group.POLICY_EDITS,
+        "Rolando approved version 1, then version 2; his version 1 approval is appended "
+        "again so it is the newest record, and version 1 is dispatched.",
+        "The copy counts once only; dispatch refused: Rolando's newest approval is version 2.",
+        f"{R} (a decision id counts once)",
+        _records(rec.approval_replayed_to_revive_old_version, r"^approval-for-different-contract$"),
+    ),
+    Case(
+        "approval-replayed-after-reject",
+        Group.POLICY_EDITS,
+        "Rolando rejects the contract; someone holding the key re-signs his earlier "
+        "approval with its original time and appends it.",
+        "Still refused: a rejection cancels every approval of that contract dated before it.",
+        f"{R} (withdrawals reach back by signed time)",
+        _records(rec.approval_replayed_after_reject, r"^approval-rejected$"),
+    ),
+    Case(
+        "old-version-after-new-approval",
+        Group.POLICY_EDITS,
+        "Rolando approved version 1, then version 2; version 1 is dispatched.",
+        "Refused: only the newest approved version can run.",
+        f"{R} (newest approval retires older versions)",
+        _records(rec.old_version_after_new_approval, r"^approval-for-different-contract$"),
+    ),
+    Case(
+        "approval-used-after-expiry",
+        Group.POLICY_EDITS,
+        "A one-day approval is used two days later.",
+        "Refused as expired.",
+        f"{R} (expiry)",
+        _records(rec.approval_used_after_expiry, r"^approval-expired$"),
+    ),
+    Case(
+        "approval-used-before-it-was-made",
+        Group.POLICY_EDITS,
+        "Dispatch runs with its clock set back to before Rolando approved.",
+        "Refused: the approval isn't valid yet.",
+        f"{R} (decided time)",
+        _records(rec.approval_used_before_it_was_made, r"^approval-not-yet-valid$"),
+    ),
+    Case(
+        "approval-signed-for-a-year",
+        Group.POLICY_EDITS,
+        "Someone holding the key signs an approval that lasts a year.",
+        "It doesn't count: no approval may last more than 14 days.",
+        f"{R} (maximum approval length)",
+        _records(rec.approval_signed_for_a_year, r"^approval-unauthenticated$"),
+    ),
+    Case(
+        "approval-with-retired-key",
+        Group.POLICY_EDITS,
+        "After a key change, the old key signs a new approval.",
+        "It doesn't count: an old key's records count only up to when it was retired.",
+        f"{R} (retired keys)",
+        _records(rec.approval_with_retired_key, r"^approval-unauthenticated$"),
+    ),
+    Case(
+        "repair-written-by-worker",
+        Group.POLICY_EDITS,
+        "Attempt 1 failed; the worker writes its own go-ahead for attempt 2.",
+        "Attempt 2 refused: it needs Rolando's signed repair go-ahead.",
+        f"{R} ({SIGNED})",
+        _records(rec.repair_written_by_worker, r"^repair-not-authorized$"),
+    ),
+    Case(
+        "repair-unsigned-in-rolandos-name",
+        Group.POLICY_EDITS,
+        "The same go-ahead, naming Rolando but not signed.",
+        "Attempt 2 refused.",
+        f"{R} ({SIGNED})",
+        _records(rec.repair_unsigned_in_rolandos_name, r"^repair-not-authorized$"),
+    ),
+    Case(
+        "repair-for-other-contract",
+        Group.POLICY_EDITS,
+        "Rolando's repair go-ahead was for version 1; attempt 2 runs a widened version he "
+        "also approved.",
+        "Attempt 2 refused: the go-ahead is for a different contract.",
+        f"{R} (repair is bound to the digest)",
+        _records(rec.repair_for_other_contract, r"^repair-not-authorized$"),
+    ),
+    Case(
+        "repair-signed-in-advance",
+        Group.POLICY_EDITS,
+        "A signed go-ahead for attempt 2 is written before attempt 1 starts.",
+        "Attempt 2 refused: a go-ahead counts only after the attempt it repairs started.",
+        f"{R} (repair made after the prior attempt)",
+        _records(rec.repair_signed_in_advance, r"^repair-not-authorized$"),
+    ),
+    Case(
+        "repair-past-the-budget",
+        Group.POLICY_EDITS,
+        "A contract approved for 2 attempts runs both; a signed go-ahead for a 3rd is added.",
+        "Attempt 3 refused: it is over the approved budget.",
+        f"{R} (contract budget)",
+        _records(rec.repair_past_the_budget, r"^over-budget$"),
+    ),
+    Case(
+        "refire-after-a-real-launch",
+        Group.POLICY_EDITS,
+        "Attempt 1 really launched; a signed re-fire record asks to fire it again.",
+        "Refused: only a fire that definitely didn't launch can be fired again.",
+        "controller.attempts re-fire rule (only a not-launched fire), applied by Approvals.check",
+        _records(rec.refire_after_a_real_launch, r"^refire-not-allowed$"),
+    ),
+    Case(
+        "refire-written-by-worker",
+        Group.POLICY_EDITS,
+        "Attempt 1 didn't launch; the worker writes the go-ahead to fire it again.",
+        "Refused: re-firing needs Rolando's signed decision.",
+        f"{R} ({SIGNED})",
+        _records(rec.refire_written_by_worker, r"^refire-not-authorized$"),
+    ),
+    Case(
+        "clearing-written-by-worker",
+        Group.POLICY_EDITS,
+        "Attempt 1 may have left a session running; the worker writes the record saying it "
+        "finished, so attempt 2 can start.",
+        "Attempt 2 refused: attempt 1 is still unresolved.",
+        f"{R} ({SIGNED})",
+        _records(rec.clearing_written_by_worker, r"^unresolved-attempt$"),
+    ),
+    Case(
+        "clearing-names-an-older-fire",
+        Group.POLICY_EDITS,
+        "Attempt 1 was fired twice; a signed clearing names the first fire, not the one "
+        "that may still be running.",
+        "Attempt 2 refused: the clearing must name the latest fire.",
+        f"{R} (clearing names the latest fire)",
+        _records(rec.clearing_names_an_older_fire, r"^unresolved-attempt$"),
+    ),
+    Case(
+        "approve-without-the-code",
+        Group.POLICY_EDITS,
+        "An approval is written with nobody typing the code at Rolando's terminal.",
+        "Refused and nothing written.",
+        f"{W} (code typed at a terminal)",
+        _records(rec.approve_without_the_code, r"not confirmed at the terminal", r"\(0 records"),
+    ),
+    Case(
+        "approve-as-the-worker",
+        Group.POLICY_EDITS,
+        "The approval writer is set up with the worker's login.",
+        "Refused and nothing written.",
+        f"{W} (approver list)",
+        _records(rec.approve_as_the_worker, r"is not an approver", r"\(0 records"),
+    ),
+    Case(
+        "approve-for-a-year",
+        Group.POLICY_EDITS,
+        "Rolando's writer is asked for an approval lasting a year.",
+        "Refused and nothing written.",
+        f"{W} (maximum approval length)",
+        _records(rec.approve_for_a_year, r"at most 14 days", r"\(0 records"),
+    ),
+    Case(
+        "approve-a-contract-needing-clarification",
+        Group.POLICY_EDITS,
+        "A contract with an open question on one criterion is put up for approval.",
+        "Refused and nothing written.",
+        f"{W} (contract must be ready)",
+        _records(
+            rec.approve_a_contract_needing_clarification, r"needs clarification", r"\(0 records"
+        ),
+    ),
+    Case(
+        "repair-written-past-the-budget",
+        Group.POLICY_EDITS,
+        "A contract approved for 2 attempts runs both; Rolando's writer is asked for a "
+        "go-ahead for a 3rd.",
+        "Refused and nothing written.",
+        f"{W} (contract budget)",
+        _records(
+            rec.repair_written_past_the_budget, r"over this contract's budget", r"\(0 records"
+        ),
+    ),
+)
+
+CASES: tuple[Case, ...] = _SEEDED + _REVIEW_ROUND + _APPROVAL_RECORDS
 
 LIVE_CASES: tuple[Case, ...] = (
     Case(

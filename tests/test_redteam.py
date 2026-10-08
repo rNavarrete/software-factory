@@ -12,13 +12,17 @@ AC7: the cases are built now; results from the real delivery loop are still owed
 
 import ast
 import re
+import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import redteam
+from controller.approval import approval as approval_module
 from redteam import CASES, LIVE_CASES, Group, Result, holds_qualification, render, run_all
 from redteam import cases as rc
 from redteam import fixtures as fx
+from redteam import records as rec
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = {r.case.id: r for r in run_all()}
@@ -248,6 +252,94 @@ class PolicyEditsTest(GroupTestMixin, unittest.TestCase):
         for case_id in ("attempt-over-budget", "fourth-attempt-launch"):
             with self.subTest(case=case_id):
                 self.assertIs(result(case_id).result, Result.BLOCKED)
+
+
+class ApprovalRecordsTest(unittest.TestCase):
+    """AC3, for Rolando's approval records: a forged, edited, replayed, stale or
+    misdirected record never lets dispatch go ahead."""
+
+    APPROVAL_CASES = [c for c in CASES if c.check and hasattr(c.check, "honest")]
+
+    def test_every_approval_record_case_is_blocked(self):
+        self.assertGreaterEqual(len(self.APPROVAL_CASES), 27)
+        for c in self.APPROVAL_CASES:
+            with self.subTest(case=c.id):
+                self.assertIs(c.group, Group.POLICY_EDITS)
+                self.assertIs(result(c.id).result, Result.BLOCKED, result(c.id).observed)
+
+    def test_every_honest_twin_goes_ahead(self):
+        """The same story without the tampering is approved, so each case is
+        stopped by the tampering and not by its setup."""
+        for c in self.APPROVAL_CASES:
+            with self.subTest(case=c.id):
+                honest = c.check.honest()
+                self.assertTrue(honest.approved, honest.text)
+                self.assertEqual(honest.codes, ())
+
+    def test_signed_records_name_rolando_and_unsigned_ones_never_count(self):
+        for case_id in (
+            "approval-written-by-worker",
+            "approval-signed-with-other-key",
+            "approval-by-lookalike-identity",
+            "repair-written-by-worker",
+            "repair-unsigned-in-rolandos-name",
+            "refire-written-by-worker",
+            "clearing-written-by-worker",
+        ):
+            with self.subTest(case=case_id):
+                self.assertIs(result(case_id).result, Result.BLOCKED)
+
+    def test_edited_and_replayed_records_never_count(self):
+        for case_id in (
+            "approval-expiry-stretched",
+            "approval-moved-to-edited-contract",
+            "approval-replayed-after-revoke",
+            "approval-replayed-to-revive-old-version",
+            "approval-replayed-after-reject",
+            "approval-signed-for-a-year",
+            "approval-with-retired-key",
+        ):
+            with self.subTest(case=case_id):
+                self.assertIs(result(case_id).result, Result.BLOCKED)
+
+    def test_writers_refuse_and_write_nothing(self):
+        for case_id in (
+            "approve-without-the-code",
+            "approve-as-the-worker",
+            "approve-for-a-year",
+            "approve-a-contract-needing-clarification",
+            "repair-written-past-the-budget",
+        ):
+            with self.subTest(case=case_id):
+                self.assertIs(result(case_id).result, Result.BLOCKED)
+                self.assertIn("(0 records written)", result(case_id).observed)
+
+    def test_never_uses_the_keychain_or_a_terminal(self):
+        source = (ROOT / "redteam" / "records.py").read_text()
+        for name in ("KeychainKey", "tty_confirm", "getpass"):
+            self.assertNotIn(name, source)
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("an approval-record case reached the Keychain or a terminal")
+
+        init = rec.Approvals.__init__
+        with (
+            mock.patch.dict(init.__kwdefaults__, {"confirm": refuse}),
+            mock.patch.object(approval_module.KeychainKey, "_load", refuse),
+            mock.patch.object(subprocess, "run", refuse),
+            mock.patch.object(subprocess, "Popen", refuse),
+        ):
+            for c in self.APPROVAL_CASES:
+                with self.subTest(case=c.id):
+                    self.assertIs(rc.run_case(c).result, Result.BLOCKED)
+                    self.assertTrue(c.check.honest().approved)
+
+    def test_each_ledger_is_thrown_away(self):
+        with rec.Ledger() as led:
+            path = Path(led.store.path)
+            self.assertTrue(path.exists())
+        self.assertFalse(path.exists())
+        self.assertFalse(path.parent.exists())
 
 
 class PlantedTextTest(GroupTestMixin, unittest.TestCase):
