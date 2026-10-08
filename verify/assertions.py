@@ -65,9 +65,9 @@ Rolando to review". Standard library only.
 from __future__ import annotations
 
 import bisect
-import difflib
 import posixpath
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -474,6 +474,7 @@ class _Scanner:
         self.code = bytearray(len(text))
         self.strings: dict[int, tuple[int, str | None]] = {}
         """quote position -> (closing quote position, value or None if interpolated)."""
+        self.comments: list[tuple[int, int]] = []
         self._code(0, in_interp=False)
 
     def _code(self, i: int, *, in_interp: bool) -> int:
@@ -487,12 +488,14 @@ class _Scanner:
                 continue
             if t.startswith("//", i):
                 j = t.find("\n", i)
+                self.comments.append((i, n if j < 0 else j))
                 i = n if j < 0 else j
                 continue
             if t.startswith("/*", i):
                 j = t.find("*/", i + 2)
                 if j < 0:
                     raise ParseError("unterminated comment")
+                self.comments.append((i, j + 2))
                 i = j + 2
                 continue
             if c in "'\"":
@@ -722,6 +725,7 @@ class _File:
     """Local names of ``import * as name`` imports."""
     import_spans: tuple[tuple[int, int], ...]
     """(start, end) of every ``import ... from '...'`` statement."""
+    comments: tuple[tuple[int, int], ...]
     mocks: tuple[str, ...]
     """Module specifiers mocked with vi.mock/vi.doMock; "?" if not a plain string."""
     spies: tuple[str, ...]
@@ -827,6 +831,7 @@ def _parse(text: str) -> _File:
         imports=(),
         namespaces=(),
         import_spans=(),
+        comments=(),
         mocks=(),
         spies=(),
         newlines=newlines,
@@ -913,6 +918,7 @@ def _parse(text: str) -> _File:
         imports=tuple(imports),
         namespaces=tuple(namespaces),
         import_spans=tuple(import_spans),
+        comments=tuple(scan.comments),
         mocks=tuple(_mocks(masked, scan)),
         spies=tuple(_spies(masked)),
         newlines=newlines,
@@ -1760,41 +1766,50 @@ def _control_flags(candidate, report, policy, ignored):
 # Comments that switch a check off for a line or a whole file.
 _SUPPRESSION_RE = re.compile(
     r"@ts-nocheck|@ts-ignore|@ts-expect-error|eslint-disable(?:-next-line|-line)?|"
-    r"(?:istanbul|c8|v8)\s+ignore|biome-ignore|prettier-ignore|oxlint-disable"
+    r"(?:istanbul|c8|v8)\s+ignore|biome-ignore|prettier-ignore|oxlint-disable|"
+    r"tslint:disable|deno-lint-ignore"
 )
 
 
 def _suppression_flags(candidate, head, base):
-    """Check suppressions added in any changed file whose text was supplied. A file
-    with no text at the merge base (new, or not supplied) has every one counted."""
+    """Check suppressions added or moved in any changed file whose text was
+    supplied. Each one is compared together with the line after it (what it
+    switches off), so moving one onto new code counts. A file with no text at
+    the merge base (new, or not supplied) has every one counted."""
     for path in candidate.changed_paths:
         after = head.get(path)
         if after is None or after.text is None:
             continue
         before = base.get(path)
-        old = _suppressions(before.text if before is not None and before.text else "")
-        new = _suppressions(after.text)
-        added = [
-            f"{word} from {len(old.get(word, ()))} to {len(lines)} "
-            f"(now on line {', '.join(map(str, lines))})"
-            for word, lines in new.items()
-            if len(lines) > len(old.get(word, ()))
-        ]
+        left = Counter(k for k, _ in _suppressions(before.text if before and before.text else ""))
+        added = []
+        for key, line in _suppressions(after.text):
+            if left[key] > 0:
+                left[key] -= 1
+            else:
+                added.append(f"line {line}: {key}")
         if added:
             yield Flag(
                 FlagKind.SUPPRESSION,
                 path,
-                "adds comments that switch checks off, so passing typecheck, lint or "
-                "coverage may no longer mean what it did: " + ", ".join(added),
+                "adds or moves comments that switch checks off, so passing typecheck, lint "
+                "or coverage may no longer mean what it did: " + " | ".join(added[:_DIFF_LINES]),
             )
 
 
-def _suppressions(text: str) -> dict[str, list[int]]:
-    """Each suppression comment found, with the lines it is on."""
-    out: dict[str, list[int]] = {}
-    for m in _SUPPRESSION_RE.finditer(text):
-        word = re.sub(r"\s+", " ", m.group(0))
-        out.setdefault(word, []).append(text.count("\n", 0, m.start()) + 1)
+def _suppressions(text: str) -> list[tuple[str, int]]:
+    """(the suppression's line and the next non-blank line, line number) for
+    each line holding a suppression comment."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    out = []
+    for i, x in enumerate(lines):
+        if not _SUPPRESSION_RE.search(x):
+            continue
+        j = i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        nxt = lines[j] if j < len(lines) else ""
+        out.append((_normalize(x) + " / " + _normalize(nxt), i + 1))
     return out
 
 
@@ -1889,8 +1904,22 @@ def _compare_tests(path, old: _File, new: _File):
                 "removing an assertion",
             )
     known = _suite_paths(old)
-    old_imports, old_setup = _outside_tests(old, known)
-    new_imports, new_setup = _outside_tests(new, known)
+    product = {name for name, spec in new.imports if _is_product(path, spec)}
+    old_imports, old_setup = _outside_tests(old, known, product)
+    new_imports, new_setup = _outside_tests(new, known, product)
+    reaching = [
+        f"+{t.name}: {line}"
+        for t in new.tests
+        if t.name not in olds
+        for line in _matching_lines(_PATCH_RE, new, t.block.start, t.block.end)
+    ]
+    if reaching:
+        yield Flag(
+            FlagKind.CHANGED_SETUP,
+            path,
+            "a new test patches globals, prototypes or modules, which can change what the "
+            "other tests in the file check: " + " | ".join(reaching[:_DIFF_LINES]),
+        )
     if old_imports != new_imports:
         yield Flag(
             FlagKind.CHANGED_TEST,
@@ -1928,72 +1957,155 @@ def _suite_path(f: _File, i: int) -> tuple[str | None, ...]:
     return tuple(reversed(out))
 
 
-# Code in a new suite's body runs while tests are collected, and hooks or patches
-# there can reach tests outside it, so those lines still count as setup.
-_REACHING_RE = re.compile(
-    r"(?<![\w$])(?:vi|vitest|beforeEach|beforeAll|afterEach|afterAll|onTestFailed|"
-    r"onTestFinished|globalThis|global|window|self|document|process|prototype|__proto__|"
-    r"Object|Reflect|Proxy|eval|Function|require|import)(?![\w$])"
+# A new test or suite body that patches globals, prototypes or modules can change
+# what other tests in the file check.
+_PATCH_RE = re.compile(
+    r"(?<![\w$])(?:prototype|__proto__|globalThis|window|global|self|process|eval|Function)"
+    r"(?![\w$])"
+    r"|(?<![\w$.])(?:vi|vitest)\s*\.\s*(?:spyOn|stubGlobal|stubEnv|mock|doMock|"
+    r"useFakeTimers|setSystemTime)(?![\w$])"
+    r"|(?<![\w$.])(?:Object|Reflect)\s*\.\s*(?:defineProperty|defineProperties|assign|"
+    r"setPrototypeOf|set|deleteProperty)(?![\w$])"
+    r"|(?<![\w$.])[A-Z][\w$]*\s*\.\s*[\w$]+\s*(?:[-+*/]?=(?![=>]))"
 )
+_FIXTURE_RE = re.compile(r"\s*(?:const|let|var)\s+[\w$]+\s*(?::[^=]*)?=(?![=>])")
+_WRITE_RE = re.compile(r"(?<![=!<>])=(?![=>])|\+\+|--|(?<![\w$])delete(?![\w$])")
 
 
-def _outside_tests(f: _File, known: set[tuple[str | None, ...]]) -> tuple[list[str], list[str]]:
-    """The file's import lines and its other lines, with every test's own call
-    removed. A suite that is not in ``known`` (the base's suites) is new: its
-    plain fixtures only reach the new tests in it, so of its lines only those
-    that can reach further (hooks, vi, globals, prototypes) are kept. Suite
-    headers and everything else outside tests are kept."""
+def _line_end(text: str, i: int) -> int:
+    j = text.find("\n", i)
+    return len(text) if j < 0 else j
+
+
+def _matching_lines(rx: re.Pattern[str], f: _File, a: int, e: int) -> list[str]:
+    """Each line of ``f`` holding a match of ``rx`` in [a, e), once."""
+    out: dict[int, str] = {}
+    for m in rx.finditer(f.masked, a, e):
+        start = f.text.rfind("\n", 0, m.start()) + 1
+        if start not in out:
+            out[start] = _normalize(f.text[start : _line_end(f.text, m.end())])
+    return list(out.values())
+
+
+def _plain_fixture(chunk: str, product: set[str]) -> bool:
+    """A ``const``/``let`` whose value writes nothing and calls only product code."""
+    m = _FIXTURE_RE.match(chunk)
+    if not m:
+        return False
+    rhs = chunk[m.end() :]
+    if _WRITE_RE.search(rhs):
+        return False
+    for k, c in enumerate(rhs):
+        if c != "(":
+            continue
+        j = k - 1
+        while j >= 0 and rhs[j] in _WS:
+            j -= 1
+        if j < 0 or not (rhs[j].isalnum() or rhs[j] in "_$)]"):
+            continue  # grouping or an arrow function's parameters
+        word, _ = _word_before(rhs, j, 0)
+        if word not in product:
+            return False
+    return True
+
+
+def _outside_tests(
+    f: _File, known: set[tuple[str | None, ...]], product: set[str]
+) -> tuple[list[str], list[str]]:
+    """The file's import lines and its other lines, without comments and with
+    every test's own call removed. A suite that is not in ``known`` (the base's
+    suites) is new: of its body, only plain fixtures (see ``_plain_fixture``) are
+    left out, because they only reach the new tests in it; every other statement
+    there runs while tests are collected and is kept."""
     n = len(f.text)
-    state = [0] * n  # 0 kept, 1 removed, 2 in a new suite
+    drop = bytearray(n)
+    for a, e in f.comments:
+        drop[a:e] = b"\x01" * (e - a)
+    fresh = []
     for i, b in enumerate(f.blocks):
         if b.is_suite and (b.title is None or _suite_path(f, i) in known):
             continue
-        mark = 1 if not b.is_suite else 2
-        for k in range(b.start, b.end + 1):
-            if state[k] != 1:
-                state[k] = mark
-    in_import = [False] * n
+        drop[b.start : b.end + 1] = b"\x01" * (b.end + 1 - b.start)
+        if b.is_suite:
+            fresh.append(i)
+    in_import = bytearray(n)
     for a, e in f.import_spans:
         k = _skip_ws(f.masked, e)
         if k < len(f.masked) and f.masked[k] == ";" and "\n" not in f.text[e:k]:
             e = k + 1
-        in_import[a:e] = [True] * (e - a)
-    imports, other, fresh = [], [], []
+        in_import[a:e] = b"\x01" * (e - a)
+    imports, other = [], []
     for i, c in enumerate(f.text):
         if c == "\n":
             imports.append(c)
             other.append(c)
-            fresh.append(c)
-        elif state[i] == 2:
-            fresh.append(c)
-            other.append(" ")
-        elif state[i] == 0:
+        elif not drop[i]:
             (imports if in_import[i] else other).append(c)
 
-    def kept(chars: list[str]) -> list[str]:
-        return "".join(chars).split("\n")
+    def lines(chars: list[str]) -> list[str]:
+        return [_normalize(x) for x in "".join(chars).split("\n") if x.strip(" \t\r;")]
 
-    out_imports = [_normalize(x) for x in kept(imports) if x.strip(" \t;")]
-    out_other = []
-    for x, y in zip(kept(other), kept(fresh), strict=True):
-        line = x if x.strip(" \t;") else ""
-        if _REACHING_RE.search(y):
-            line = f"{line} {y}" if line else y
-        if line.strip(" \t;"):
-            out_other.append(_normalize(line))
-    return out_imports, out_other
+    setup = lines(other)
+    for i in fresh:
+        setup += _suite_setup(f, i, product)
+    return lines(imports), setup
+
+
+def _suite_setup(f: _File, i: int, product: set[str]) -> list[str]:
+    """The statements of new suite ``i``'s own body that are not plain fixtures."""
+    b = f.blocks[i]
+    if b.body is None:
+        return [_normalize(f.text[b.start : b.end + 1])]
+    a, e = b.body
+    skip = bytearray(e - a)
+    for c in f.blocks:
+        if c.parent == i or (not c.is_suite and c.start >= a and c.end < e):
+            skip[c.start - a : c.end + 1 - a] = b"\x01" * (c.end + 1 - c.start)
+    for x, y in f.comments:
+        lo, hi = max(x, a), min(y, e)
+        if lo < hi:
+            skip[lo - a : hi - a] = b"\x01" * (hi - lo)
+    out, masked, text = [], [], []
+    depth = 0
+
+    def flush() -> None:
+        m, t = "".join(masked), _normalize("".join(text))
+        if t.strip(";") and not _plain_fixture(m, product):
+            out.append(t)
+        masked.clear()
+        text.clear()
+
+    for k in range(a, e):
+        if skip[k - a]:
+            continue
+        c = f.masked[k]
+        if c in _OPEN:
+            depth += 1
+        elif c in _CLOSE:
+            depth -= 1
+        if depth <= 0 and c in ";\n":
+            flush()
+            continue
+        masked.append(c)
+        text.append(f.text[k])
+    flush()
+    return out
 
 
 _DIFF_LINES = 40
 
 
 def _line_diff(before: list[str], after: list[str]) -> str:
-    """Every removed (-) and added (+) line, in order, up to a limit."""
+    """Every removed (-) and added (+) line, in order, up to a limit. Lines are
+    compared as a multiset, so a line that only moved is not listed."""
+    gone, came = Counter(before), Counter(after)
+    gone, came = gone - Counter(after), came - Counter(before)
     out = []
-    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
-    for op, a, b, c, d in matcher.get_opcodes():
-        if op != "equal":
-            out += [f"-{x}" for x in before[a:b]] + [f"+{x}" for x in after[c:d]]
+    for sign, lines, extra in (("-", before, gone), ("+", after, came)):
+        for x in lines:
+            if extra[x] > 0:
+                extra[x] -= 1
+                out.append(f"{sign}{x}")
     more = len(out) - _DIFF_LINES
     shown = " | ".join(out[:_DIFF_LINES])
     return shown + (f" | ... and {more} more changed line(s)" if more > 0 else "")

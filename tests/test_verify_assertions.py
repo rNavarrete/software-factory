@@ -2051,7 +2051,8 @@ class SecondReviewTest(ProbeCase):
                     self.assertEqual(weak, [])
 
     def test_html_in_supplied_text_cannot_hide_the_report(self):
-        head = HEAD_TEST.replace("const NOW", "// <!-- hide\nconst NOW", 1)
+        # A string, not a comment: comments are left out of the setup diff.
+        head = HEAD_TEST.replace("const NOW", "const NOTE = '<!-- hide';\nconst NOW", 1)
         out = render(run(head, clearances=[]))
         self.assertNotIn("<!--", out)
         self.assertIn("&lt;\\!-- hide", out)
@@ -2207,7 +2208,7 @@ class BypassFollowUpTest(ProbeCase):
                 )
                 report = run(head)
                 self.assertIn(SETUP_FLAG, open_keys(report))
-                first = setup.strip().splitlines()[0]
+                first = setup.strip().splitlines()[0].rstrip(";")
                 detail = next(f for f in report.open_flags if f.key == SETUP_FLAG).detail
                 self.assertIn(first, detail)
 
@@ -2246,7 +2247,7 @@ class BypassFollowUpTest(ProbeCase):
         key = "check-suppression:src/main.ts"
         self.assertIn(key, open_keys(report))
         self.assertIn(
-            "@ts-nocheck from 0 to 1", next(f for f in report.flags if f.key == key).detail
+            "line 1: // @ts-nocheck", next(f for f in report.flags if f.key == key).detail
         )
         self.assertFalse(report.ready)
 
@@ -2308,6 +2309,86 @@ class BypassFollowUpTest(ProbeCase):
         report = run()
         self.assertNotIn(FlagKind.MIRRORS_CODE, open_kinds(report))
         self.assertNotIn(FlagKind.WEAK_ASSERTION, open_kinds(report))
+
+    # Second review round.
+
+    def test_patches_in_a_new_suite_body_are_setup(self):
+        for setup in (
+            "  const A = Array;\n  A['proto' + 'type'].filter = function () { return this; };\n",
+            "  Date.now = () => 0;\n",
+            "  structuredClone = ((x) => x) as typeof structuredClone;\n",
+            "  books.push({ id: 'x' } as Book);\n",
+            "  const n = books.push({ id: 'x' } as Book);\n",
+            "  const xs = [1].map((x) => x);\n",
+        ):
+            with self.subTest(setup=setup):
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + setup + "  it('returns only"
+                )
+                report = run(head)
+                self.assertIn(SETUP_FLAG, open_keys(report), report.blockers)
+
+    def test_plain_fixtures_and_product_calls_in_a_new_suite_are_not_setup(self):
+        for setup in (
+            "  const shelf2: Book[] = [{ id: '9', title: 'X', author: 'Y', status: 'done', "
+            "addedAt: 9 }];\n",
+            "  const empty = filterByStatus([], 'done');\n",
+            "  const pick = (b: Book) => b.id;\n",
+            "  // a comment\n",
+        ):
+            with self.subTest(setup=setup):
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + setup + "  it('returns only"
+                )
+                self.assertTrue(run(head).ready, run(head).blockers)
+
+    def test_new_test_that_patches_globals_is_setup(self):
+        for patch in (
+            "Array.prototype.filter = function () { return this; };",
+            "vi.spyOn(Array.prototype, 'filter').mockImplementation(function () { return this; });",
+            "Date.now = () => 0;",
+            "Object.defineProperty(globalThis, 'x', { value: 1 });",
+        ):
+            with self.subTest(patch=patch):
+                warm = f"  it('warms up', () => {{\n    {patch}\n  }});\n"
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + warm + "\n  it('returns only"
+                )
+                report = run(head)
+                self.assertIn(SETUP_FLAG, open_keys(report), report.blockers)
+                detail = next(f for f in report.open_flags if f.key == SETUP_FLAG).detail
+                self.assertIn("filterByStatus > warms up", detail)
+
+    def test_added_comment_outside_tests_is_not_setup(self):
+        report = run(HEAD_TEST.replace("const NOW", "// fixed clock\nconst NOW", 1))
+        self.assertTrue(report.ready, report.blockers)
+
+    def test_moved_suppression_is_flagged(self):
+        base = "// @ts-ignore\nexport const a = 1;\n"
+        head = "export const a = 1;\n// @ts-ignore\nexport const b: number = 'x';\n"
+        report = self.suppressed("src/books.ts", head, base)
+        self.assertIn("check-suppression:src/books.ts", open_keys(report))
+
+    def test_other_linters_suppressions_are_flagged(self):
+        for comment in ("// tslint:disable", "// deno-lint-ignore-file", "// biome-ignore x"):
+            with self.subTest(comment=comment):
+                report = self.suppressed("src/books.ts", f"{comment}\nexport const x = 1;\n", "")
+                self.assertIn("check-suppression:src/books.ts", open_keys(report))
+
+    def test_large_files_with_repeated_lines_stay_fast(self):
+        import time
+
+        lines = "".join(f"const v{i % 7} = [\n  {i % 3},\n];\n" for i in range(3000))
+        base = BASE_TEST + lines
+        head = HEAD_TEST + lines.replace("1,", "2,")
+        started = time.monotonic()
+        report = run(head, base_text=base)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn(SETUP_FLAG, open_keys(report))
+        many = "".join(f"// @ts-ignore\nexport const x{i} = {i};\n" for i in range(5000))
+        started = time.monotonic()
+        self.suppressed("src/books.ts", many, "")
+        self.assertLess(time.monotonic() - started, 5)
 
 
 if __name__ == "__main__":
