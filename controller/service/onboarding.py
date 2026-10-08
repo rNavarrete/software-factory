@@ -14,6 +14,18 @@ in force at the time.
 
 v1 has one worker routine bound to one repository, so every entry must name
 exactly the repository and routine the dispatcher is built for.
+
+Todo intake (ENG-174) reads three more things from it:
+
+- ``approver_linear_user_id`` (top level): Rolando's Linear user id. Only a
+  move into Todo recorded by Linear as his counts.
+- ``intake_since`` (top level, ISO time): moves before it are never read, so
+  onboarding a project doesn't start everything already in Todo.
+- per project, ``issues`` (only these ticket keys may start) and
+  ``skip_labels`` (a ticket with one of these labels never starts). This is
+  how baseline tasks that share a Linear project with factory tasks stay out
+  of the factory: list the factory tasks in ``issues``, and label the
+  baseline tickets too as a second guard.
 """
 
 from __future__ import annotations
@@ -23,6 +35,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from controller import contract as contracts
@@ -41,7 +54,10 @@ _KEYS = {
     "checks",
     "max_attempts",
     "status_issue_id",
+    "issues",
+    "skip_labels",
 }
+_ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-[1-9][0-9]*$")
 
 
 class OnboardingError(ValueError):
@@ -61,6 +77,10 @@ class Project:
     max_attempts: int
     status_issue_id: str | None
     """Where factory-wide notices for this project go (outages, pause)."""
+    issues: frozenset[str] | None = None
+    """If set, only these ticket keys may start (ENG-174)."""
+    skip_labels: frozenset[str] = frozenset()
+    """Tickets with any of these labels never start (ENG-174)."""
 
     def as_mapping(self) -> Mapping[str, object]:
         return {
@@ -106,6 +126,8 @@ class Onboarding:
     intake_enabled: bool
     """False until the full path is qualified (ENG-163): Todo moves are then
     recorded as refused, and only already-queued work is processed."""
+    approver_linear_user_id: str | None = None
+    intake_since: datetime | None = None
 
     def project(self, linear_project_id: str) -> Project | None:
         return self.projects.get(linear_project_id)
@@ -129,12 +151,29 @@ def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
         raise OnboardingError(f"not JSON: {e}") from None
     if not isinstance(doc, dict) or doc.get("format") != FORMAT:
         raise OnboardingError(f"format must be {FORMAT!r}")
-    unknown = set(doc) - {"format", "intake_enabled", "projects"}
+    unknown = set(doc) - {
+        "format",
+        "intake_enabled",
+        "projects",
+        "approver_linear_user_id",
+        "intake_since",
+    }
     if unknown:
         raise OnboardingError(f"unknown keys: {sorted(unknown)}")
     enabled = doc.get("intake_enabled", False)
     if not isinstance(enabled, bool):
         raise OnboardingError("intake_enabled must be true or false")
+    approver = doc.get("approver_linear_user_id")
+    if approver is not None and (not isinstance(approver, str) or not approver.strip()):
+        raise OnboardingError("approver_linear_user_id must be text")
+    since = doc.get("intake_since")
+    if since is not None:
+        try:
+            since = datetime.fromisoformat(since) if isinstance(since, str) else None
+        except ValueError:
+            since = None
+        if since is None or since.tzinfo is None:
+            raise OnboardingError("intake_since must be an ISO time with a time zone")
     entries = doc.get("projects")
     if not isinstance(entries, list):
         raise OnboardingError("projects must be a list")
@@ -183,8 +222,27 @@ def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
         status = e.get("status_issue_id")
         if status is not None and (not isinstance(status, str) or not status.strip()):
             raise OnboardingError(f"{where}: status_issue_id must be text")
-        projects[pid] = Project(pid, name, repo, branch, trig, actions, checks, budget, status)
-    return Onboarding(projects, hashlib.sha256(raw).hexdigest(), enabled)
+        issues = None
+        if "issues" in e:
+            issues = _strings(e["issues"], f"{where}.issues")
+            bad = sorted(k for k in issues if not _ISSUE_KEY_RE.fullmatch(k))
+            if bad:
+                raise OnboardingError(f"{where}: not ticket keys: {bad}")
+        skip = _strings(e["skip_labels"], f"{where}.skip_labels") if "skip_labels" in e else None
+        projects[pid] = Project(
+            pid,
+            name,
+            repo,
+            branch,
+            trig,
+            actions,
+            checks,
+            budget,
+            status,
+            issues,
+            skip or frozenset(),
+        )
+    return Onboarding(projects, hashlib.sha256(raw).hexdigest(), enabled, approver, since)
 
 
 def load(path: Path, *, repository: str, routine_id: str) -> Onboarding:

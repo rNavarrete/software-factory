@@ -141,6 +141,26 @@ class IntakeBatch:
     produced, so a crash re-reads the batch instead of losing it."""
 
 
+@dataclass(frozen=True)
+class Standing:
+    """Whether an accepted Todo move still stands, read from Linear now."""
+
+    withdrawn: str | None = None
+    """The ticket left Todo (and isn't in progress), was deleted, or moved to
+    a project the factory doesn't work on. Before launch the item closes;
+    after launch nothing more starts for it and the attempt is reconciled."""
+    changed: str | None = None
+    """What defines the work changed after the move. Before launch the item
+    closes (Rolando moves it to Todo again to approve the new text); after
+    launch the worker keeps its contract and Rolando is told."""
+    waiting_on: Sequence[str] = ()
+    """Tickets that block this one and aren't done: it waits for them."""
+
+    @property
+    def reason(self) -> str | None:
+        return self.withdrawn or self.changed
+
+
 @runtime_checkable
 class AuthorizationSource(Protocol):
     """ENG-174. Must be safe to call again with the same cursor: the service
@@ -155,6 +175,12 @@ class AuthorizationSource(Protocol):
         """Checked again right before the first fire: None if the move still
         stands (ticket still in Todo or started by the factory, same revision,
         same project), else the reason in plain words."""
+        ...
+
+    def standing(self, authorization: Authorization) -> Standing:
+        """The same check in detail (ENG-174): withdrawn, changed, or waiting
+        on blocking tickets. The service uses it before every dispatch try and
+        while the worker runs."""
         ...
 
 
@@ -245,6 +271,7 @@ __all__ = [
     "Question",
     "Refusal",
     "RepairAdvisor",
+    "Standing",
     "ReportFailed",
     "Reporter",
     "ReviewStarter",
