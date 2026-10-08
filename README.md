@@ -1,62 +1,122 @@
-# software-factory
+# Software Factory
 
-The controller for Rolando's personal software factory. It hands one approved task at a time to a cloud worker, keeps a record of every launch, and checks the result on GitHub. It never approves, merges or releases anything; Rolando does.
+**Turn product intent into reviewed code.**
 
-The controller is a small Python 3.11+ command-line program that uses only the standard library. Rolando runs it by hand on his Mac. It makes no AI model calls. Its record is a SQLite file at `~/.software-factory/`, outside every git checkout, and the worker's start key lives in macOS Keychain. The design is in [docs/adr/0002-runtime-controller-identity.md](docs/adr/0002-runtime-controller-identity.md).
+Software Factory connects **Linear, Claude cloud workers, GitHub and Codex review** into a continuous delivery workflow for a product team of one. Write the ticket, define what success looks like, and move it to Todo. The factory coordinates implementation, checks the result, manages bounded repairs, and brings the change back for your review.
 
-The worker runs against a separate pilot repo, [rNavarrete/factory-pilot-demo](https://github.com/rNavarrete/factory-pilot-demo). Workers never get access to this repo.
+The ambition is simple: **spend your time shaping the product while the factory handles the engineering handoffs.**
 
-## Develop
+> **Current stage:** The Linear intake, task preparation, cloud dispatch, independent Codex review, bounded repair and Linear reporting components are implemented and connected. The project is qualifying the full hosted workflow before its measured pilot. The initial configuration uses one pilot repository and one implementation lane; intake ships disabled until qualification.
 
-```sh
-python3 -m unittest discover -s tests -t .   # tests
-pip install ruff==0.15.12                    # lint tool, dev only
-ruff check . && ruff format --check .        # lint
+## The delivery loop
+
+```mermaid
+flowchart LR
+    A["You: product brief in Linear"] --> B["Your Todo move"]
+    B --> C["Factory: prepare and validate task"]
+    C --> D["Claude cloud worker"]
+    D --> E["GitHub pull request"]
+    E --> F["Trusted CI + independent Codex review"]
+    F -->|"Passed"| G["You: review and merge"]
+    F -->|"Fixable within allowance"| H["Bounded repair"]
+    H --> D
+    C -->|"Product question"| I["Back to you in Linear"]
+    F -->|"Judgment needed"| I
+    G --> J["Separate release approval"]
 ```
 
-CI (`.github/workflows/ci.yml`) runs both on every pull request, on Python 3.11 and 3.13. The required check is `checks`.
+**Linear is the front door. GitHub is the review surface. The factory keeps the work moving between them.**
 
-## Layout and who owns what
+1. **Describe the outcome.** Write a Linear ticket with acceptance criteria. Project policy supplies the repository, allowed scope and execution limits.
+2. **Move it to Todo.** The factory verifies who made the transition and which version of the ticket they authorized. That decision becomes a signed record for the exact task.
+3. **Prepare the work.** The controller turns the ticket into a precise implementation contract, chooses a checked base commit and validates scope, criteria and budget before dispatch.
+4. **Build in the cloud.** A Claude worker implements the change in the pilot repository and opens a traceable pull request.
+5. **Check independently.** Trusted CI checks the candidate. Codex reviews the implementation through a protected GitHub Actions workflow, with evidence tied to the exact contract and code revision.
+6. **Repair within bounds.** Eligible failures can receive another implementation attempt within the task's signed allowance, after the previous writer is cleared. Product decisions and exceptions come back to you.
+7. **Make the final call.** Linear carries progress, questions and the review handoff. You review and merge on GitHub; release approval remains a separate decision.
 
-Each directory belongs to one ticket so parallel work never edits the same files. Edit only the paths your ticket owns.
+## What makes it a factory
 
-| Path | Owner | What goes there |
-|---|---|---|
-| `controller/interfaces.py` | ENG-185 | Shared types: `TaskId`, `AttemptId`, `RunId`, `ContractDigest`, `LedgerStore`, `RuntimeAdapter` and launch results |
-| `controller/contract/`, `schema/` | ENG-144 | Contract format, canonical bytes and digest. Exposes `validate(contract, digest) -> list[str]` and the canonical digest function, which the routine adapter calls before every launch |
-| `controller/ledger/` | ENG-147 | SQLite `LedgerStore`, event kinds, backups |
-| `controller/approval/` | ENG-151 | Approval records |
-| `controller/attempts/` | ENG-146 | Attempt and fire caps, holds |
-| `controller/recovery/` | ENG-153 | Reconciling interrupted and unknown launches |
-| `controller/adapter/fake.py` | ENG-185 | Scripted test adapter (success, rate rejection, lost response) |
-| `controller/adapter/routine.py` | ENG-182 | The real cloud Routine adapter |
-| `controller/dispatch/` | ENG-176 | The dispatch path |
-| `controller/cli.py`, `controller/__main__.py`, `[project.scripts]` in `pyproject.toml` | ENG-176 | The `factory` command. Other tickets expose plain functions; ENG-176 wires them to subcommands (`dispatch`, `status`, `reconcile`, `hold`, `resume`, `snapshot`) |
-| `verify/` | ENG-156, ENG-157 | Criterion verifier and assertion mapper |
-| `controller/loop/collect.py`, `verify/review.py` | ENG-145 | Reading a worker PR's evidence from GitHub, and the independent mapper's review comment |
-| `controller/loop/` | ENG-145 | `python3 -m controller.loop run <contract.json>`: one task from contract to a PR ready for Rolando's review |
-| `controller/service/`, `deploy/`, `docs/service.md` | ENG-194 | The background service on Fly.io (`python3 -m controller.service`) and the seams the Linear tickets plug into (`controller/service/seams.py`) |
-| `tasks/samples/` | ENG-145 | The sample task contracts for the first full runs |
-| `redteam/` | ENG-158 | Red-team checks |
-| `controller/audit/`, `docs/control-audit*.md` | ENG-163 | The full control check: `python3 -m controller.audit` checks every governance-map control against its evidence |
-| `docs/adr/0001-operating-model.md` | ENG-134 | Operating model and human authority |
-| `docs/adr/0002-runtime-controller-identity.md` | ENG-136 (ENG-183 owns section 11) | Runtime and controller |
-| `docs/adr/0003-pilot-and-value-thresholds.md` | ENG-137 | Pilot and value thresholds |
-| `docs/governance-map.md` | ENG-135 | Controls and how each is tested |
-| `docs/limits.md` | ENG-138 | Attempt limits and usage budgets |
-| `tests/` | each ticket adds its own `test_<area>.py` | |
-| `.github/`, `pyproject.toml`, `README.md`, `controller/__init__.py`, `controller/adapter/__init__.py` | ENG-185 | CI, lint config, this file, package markers |
+Running agents is only part of delivering software. Someone still has to decide what they may change, connect their work to the original request, handle interruptions, check the result and know when it is ready. Software Factory makes those responsibilities part of the system.
 
-The signed documents under `docs/` are copied from the project's planning folder. They are unchanged except for one email address removed from ADR 0002 (noted at its end). Each sign-off record holds a hash of the signed text, so any other edit needs a new sign-off from Rolando.
+### Product intent survives the handoffs
 
-## Changing the shared interfaces
+A task carries its requested outcome, acceptance criteria, permitted changes, starting commit and attempt budget. The controller binds that contract to an authenticated decision and follows it through dispatch, the worker's PR and review. Editing the requirements cannot silently rewrite an active task.
 
-`controller/interfaces.py` is what every other package builds on. Don't change it as a side effect of another ticket. If you need a change, open a separate PR that touches only `interfaces.py` and its tests, title it `interfaces: <what>`, and say which tickets it affects. Adding a new optional field or method is fine; renaming or removing one needs every caller fixed in the same PR.
+### Reviews have evidence behind them
 
-Fixed conventions the types encode:
+A green build is one part of the picture. The verification code maps acceptance criteria to assertions or explicit human observations, checks for weakened tests and protected-control changes, and rejects stale or untrusted evidence. Independent review follows the actual candidate revision, so a new push or changed base requires a fresh assessment.
 
-- Marker branch: `claude/<task>-a<n>`. PR title prefix: `[<task> a<n> <digest12>]`. These are how the controller finds a run's work on GitHub.
-- PR body line `Contract-Digest: <64 hex>` (`ContractDigest.pr_body_line`), which the pilot's CI reads and the controller checks against the title marker.
-- A launch has exactly three outcomes: `launched`, `not-launched` (only HTTP 400, 401, 403, 404, 429) and `launch-outcome-unknown` (everything else). Adapters never retry and never raise for network failures.
-- The ledger is append-only. `append` writes one or more events in one transaction, only while the single-writer lock is held. That lock just stops two controller processes writing at once; whether a new dispatch is allowed is decided from ledger events.
-- Shared parsers for the markers live here too (`AttemptId.from_branch`, `AttemptId.from_pr_title`, `ContractDigest.from_pr_body`) so no ticket writes its own regex.
+Claude implements; Codex supplies a separate review perspective. The controller checks review provenance and revision binding before using the result.
+
+### Failure is part of the workflow
+
+Restarts, lost responses, rate limits and failed checks have explicit handling. The factory records launch intent before contacting a worker and keeps uncertain launches on hold. An unanswered request never becomes permission to start a duplicate writer. Repairs consume the existing task budget, and unresolved decisions are reported in Linear.
+
+### Progress lives where the work was defined
+
+The originating ticket receives the task summary, progress, product questions and PR links. Durable message delivery survives interruptions without relaunching the work. Readiness names the reviewed commit, and a merge without applicable passing evidence is recorded as an exception.
+
+### Human authority is built into the boundaries
+
+The background controller and separate signer own execution and authorization records. Workers receive bounded tasks; they do not hold the controller's approval or release credentials. A Todo move authorizes its recorded scope and allowance. You retain product decisions, exceptions, merge review and release approval.
+
+## A small core with substantial engineering behind it
+
+The controller uses **Python 3.11+ and the standard library**, with **SQLite** for its durable event record. Cloud workers do the implementation; a separate Codex workflow supplies model-based review. The always-on service is packaged for **Fly.io**, so the intended product workflow does not depend on a laptop staying awake.
+
+The repository includes more than **2,000 automated tests**, synthetic integration fixtures and seeded bypass attempts. They exercise authorization, recovery, duplicate prevention, budgets, review provenance and reporting. CI runs on Linux with Python 3.11 and 3.13. Hosted qualification adds the live evidence that local fixtures cannot establish.
+
+| Layer | Responsibility |
+|---|---|
+| Linear intake and task preparation | Read authorized work, preserve requirements and produce a bounded task |
+| Signer, dispatcher and attempt controls | Authenticate decisions, reserve execution and enforce limits |
+| Claude cloud runtime | Implement the task and propose the change |
+| GitHub CI, Codex review and verification | Check the candidate against its requirements and retained evidence |
+| Recovery, SQLite ledger and Linear reporting | Preserve state, reconcile interruptions and explain progress |
+| Human review and release | Decide what ships |
+
+## Built today, growing deliberately
+
+The current code brings together:
+
+- Authenticated Linear Todo intake and deterministic preparation for bounded tickets.
+- The existing Anthropic-hosted Claude Routine implementation path.
+- Independent Codex review through a protected GitHub Actions workflow.
+- Signed repair allowances, persistent attempt limits and unknown-writer holds.
+- Linear progress, product questions, candidate observations and merge records.
+- An always-on service, durable queue, recovery and ledger backups.
+
+Two expansions are on the roadmap:
+
+- **Richer product context:** captured Notion pages, project guidance and design screenshots shared with the worker and reviewer. Source capture and synthetic fixtures exist; end-to-end image consumption and semantic preparation remain in progress. Tickets requiring unsupported linked context are held explicitly.
+- **A qualified worker pool:** Claude Code, Codex CLI, Cursor and Antigravity adapters, followed by bounded parallel work and checks of the combined changes. Provider qualification and parallel scheduling are planned capabilities, separate from the current Claude cloud lane.
+
+The next milestone is the full **Linear-to-reviewed-change qualification**, followed by a measured pilot. The measure of success is practical: less active human coordination per accepted change, with product quality and human control intact.
+
+## Explore the system
+
+| Start here | What you will learn |
+|---|---|
+| [Linear intake](docs/intake.md) | How a Todo move becomes authenticated task authorization |
+| [Task preparation](docs/prepare.md) | How ticket requirements become an implementation contract |
+| [Independent review](docs/review.md) | How Codex review and verification produce a candidate verdict |
+| [Bounded repairs](docs/repair.md) | When another attempt is allowed and when the factory stops |
+| [Linear reporting](docs/reporting.md) | Progress, questions, observations and review handoffs |
+| [Background service](docs/service.md) | Hosting, configuration, operation and recovery |
+| [Failure qualification](docs/linear-failure-qualification.md) | Tested failure cases and remaining live evidence |
+| [Captured context](docs/captured-context.md) | The foundation for richer briefs and visual inputs |
+| [Contribution guide](CONTRIBUTING.md) | Development commands, code ownership and shared interfaces |
+
+The [pilot application](https://github.com/rNavarrete/factory-pilot-demo) is separate from this controller repository. Architecture decisions and accepted historical sign-offs live under [docs/adr](docs/adr/); current component guides and qualification records describe the evolving Linear-first workflow.
+
+## Develop locally
+
+```sh
+python3 -m unittest discover -s tests -t .
+python3 -m pip install ruff==0.15.12
+python3 -m ruff check .
+python3 -m ruff format --check .
+```
+
+These tests use synthetic inputs and fake worker transports. Linux runs the complete signer/socket suite; unsupported platform cases are skipped on macOS. See the [service guide](docs/service.md) for one-time hosted setup and qualification before enabling live intake.

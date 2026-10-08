@@ -417,7 +417,7 @@ def finding(category, route, summary, criterion=None):
     )
 
 
-class ReviewServiceTests(LinearServiceCase):
+class ReviewServiceCase(LinearServiceCase):
     def setUp(self) -> None:
         super().setUp()
         self.reviewer = ScriptedReviewer()  # type: ignore[assignment]
@@ -440,6 +440,8 @@ class ReviewServiceTests(LinearServiceCase):
     def stages(self):
         return [HEADER_RE.match(b.split("\n", 1)[0])["stage"] for b in self.bodies()]
 
+
+class ReviewServiceTests(ReviewServiceCase):
     def test_a_pass_on_the_merged_commit_is_verified_work(self) -> None:
         self.open_pr()
         self.reviewer.status = status(ReviewState.PASSED)
@@ -510,9 +512,8 @@ class ReviewServiceTests(LinearServiceCase):
 
 
 class ReviewMessageTests(unittest.TestCase):
-    def test_waiting_and_running_say_nothing(self) -> None:
-        for state in (ReviewState.WAITING_CI, ReviewState.RUNNING):
-            self.assertEqual(review_messages(status(state)), [])
+    def test_running_without_a_started_pass_says_nothing(self) -> None:
+        self.assertEqual(review_messages(status(ReviewState.RUNNING)), [])
 
     def test_a_new_revision_gets_new_keys(self) -> None:
         a = review_messages(status(ReviewState.PASSED))

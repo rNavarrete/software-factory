@@ -20,7 +20,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from controller.interfaces import LedgerEvent, StoredEvent, TaskId
+from controller.interfaces import AttemptId, LedgerEvent, StoredEvent, TaskId
 from controller.service.seams import Authorization, Control, Refusal
 
 SERVICE_STARTED = "service-started"
@@ -37,6 +37,8 @@ starts for the item (no repairs); its attempt is still reconciled."""
 OUTBOX_QUEUED = "outbox-queued"
 OUTBOX_SENT = "outbox-sent"
 OUTBOX_FAILED = "outbox-failed"
+OUTBOX_DISCARDED = "outbox-discarded"
+REVIEW_STATUS_SEEN = "review-status-seen"
 REVIEW_REQUESTED = "review-requested"
 REVIEW_STARTED = "review-started"
 
@@ -54,6 +56,8 @@ KINDS = frozenset(
         OUTBOX_QUEUED,
         OUTBOX_SENT,
         OUTBOX_FAILED,
+        OUTBOX_DISCARDED,
+        REVIEW_STATUS_SEEN,
         REVIEW_REQUESTED,
         REVIEW_STARTED,
     }
@@ -96,6 +100,9 @@ class Message:
     seq: int
     failures: int = 0
     last_failed_at: datetime | None = None
+    review_attempt: AttemptId | None = None
+    review_key: str = ""
+    review_generation: int = 0
 
 
 @dataclass
@@ -114,6 +121,9 @@ class ServiceView:
     called, so a restart repeats the same request instead of a new one."""
     reviews: set[str] = field(default_factory=set)
     """Attempts whose review the reviewer confirmed started."""
+    review_statuses: dict[AttemptId, tuple[str, str, int]] = field(default_factory=dict)
+    """Last reported (state, revision key, generation). A return to a previous
+    verdict is a new transition, even when the commit is unchanged."""
 
     @classmethod
     def build(cls, stored: Iterable[StoredEvent]) -> ServiceView:
@@ -157,8 +167,16 @@ class ServiceView:
                 key = str(d["key"])
                 if key not in v.queued_keys:
                     v.queued_keys.add(key)
-                    v.outbox[key] = Message(key, str(d["issue_id"]), str(d["text"]), s.seq)
-            elif e.kind == OUTBOX_SENT:
+                    v.outbox[key] = Message(
+                        key,
+                        str(d["issue_id"]),
+                        str(d["text"]),
+                        s.seq,
+                        review_attempt=e.attempt,
+                        review_key=str(d.get("review_key", "")),
+                        review_generation=int(d.get("review_generation", 0)),
+                    )
+            elif e.kind in (OUTBOX_SENT, OUTBOX_DISCARDED):
                 v.outbox.pop(str(d["key"]), None)
             elif e.kind == OUTBOX_FAILED:
                 m = v.outbox.get(str(d["key"]))
@@ -169,6 +187,12 @@ class ServiceView:
                 v.review_requests.setdefault(str(e.attempt), (int(d["pr"]), str(d["key"])))
             elif e.kind == REVIEW_STARTED and e.attempt is not None:
                 v.reviews.add(str(e.attempt))
+            elif e.kind == REVIEW_STATUS_SEEN and e.attempt is not None:
+                v.review_statuses[e.attempt] = (
+                    str(d["state"]),
+                    str(d["review_key"]),
+                    int(d["generation"]),
+                )
         return v
 
     def open_items(self) -> list[Item]:
@@ -249,8 +273,40 @@ def item_withdrawn(item: Item, reason: str, now: datetime) -> LedgerEvent:
     )
 
 
-def message(key: str, issue_id: str, text: str, now: datetime) -> LedgerEvent:
-    return LedgerEvent(OUTBOX_QUEUED, now, data={"key": key, "issue_id": issue_id, "text": text})
+def message(
+    key: str,
+    issue_id: str,
+    text: str,
+    now: datetime,
+    *,
+    review_attempt: AttemptId | None = None,
+    review_key: str = "",
+    review_generation: int = 0,
+) -> LedgerEvent:
+    data = {"key": key, "issue_id": issue_id, "text": text}
+    if review_attempt is not None:
+        data.update(review_key=review_key, review_generation=review_generation)
+    return LedgerEvent(
+        OUTBOX_QUEUED,
+        now,
+        task=review_attempt.task if review_attempt else None,
+        attempt=review_attempt,
+        data=data,
+    )
+
+
+def review_status(attempt: AttemptId, state: str, key: str, generation: int, now: datetime):
+    return LedgerEvent(
+        REVIEW_STATUS_SEEN,
+        now,
+        attempt.task,
+        attempt,
+        data={"state": state, "review_key": key, "generation": generation},
+    )
+
+
+def discarded(key: str, reason: str, now: datetime) -> LedgerEvent:
+    return LedgerEvent(OUTBOX_DISCARDED, now, data={"key": key, "reason": reason})
 
 
 def sent(key: str, now: datetime) -> LedgerEvent:

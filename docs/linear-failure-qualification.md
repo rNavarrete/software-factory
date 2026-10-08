@@ -32,6 +32,16 @@ need their own incremental qualification, not extra prerequisites for this pilot
 
 ## Failure checklist
 
+ENG-163 reporting follow-up on base `461f8492818da5174c13af139427c566a93722be`:
+`tests/test_review_freshness.py` now exercises delayed readiness delivery with the
+real service, SQLite and Linear reporter. It covers a new push, changed base,
+unreadable checks, restart, restored pass, a newer attempt, merge and legacy
+queued messages. Obsolete queued readiness is discarded; unreadable checks hold
+delivery; current passes are reported once per persisted review transition.
+These use a scripted reviewer; the real reviewer's evidence invalidation remains
+covered by the reviewer suites below. This is offline evidence, not a deployment
+or live go/no-go decision.
+
 Each row names existing executable evidence, not another testing framework.
 Run the full suite below; these tests cover different boundaries and should not
 be presented as one complete live end-to-end run.
@@ -43,7 +53,7 @@ be presented as one complete live end-to-end run.
 | Attempt/repair/weekly caps reset after restart or ticket toggles | `test_attempts.py`; `test_ledger_attempts.py`; `test_repair_allowance.py`; `test_repair.py`; `test_intake_service.py` | Signed allowance, persisted counters and state toggles tested. Paid service usage requires its own live reading. |
 | Missing/failed/stale/spoofed CI or independent review counts as success | `test_collect.py`; `test_review_workflow.py`; `test_review_auto.py`; `test_redteam.py` | Workflow actor, source, revision, artifact and request binding are tested with synthetic API answers. Actual protected workflow configuration remains a live boundary. |
 | Weakened assertions, protected changes or untrusted text bypass human authority | `test_verify_assertions.py`; `test_verify_criteria.py`; `test_prepare_hostile.py`; `test_report_replies.py`; `test_todo_move_approval.py`; `test_repair.py` | Evidence parsing, signatures and protected-change routing are code checks; worker credentials and release permission are platform checks. |
-| New push/base/destination/state leaves stale review or observation usable | `test_review_auto.py` (`StaleCommitTests`, `SupersededEvidenceTests`); `test_review_workflow.py` (`RevisionAndRestartTests`); `test_report_replies.py`; `test_merge_qualification.py` | Checks evidence validity. Historical Linear comments remain historical reports; this does not certify delivery-time freshness of queued comments. |
+| New push/base/destination/state leaves stale review or observation usable | `test_review_auto.py` (`StaleCommitTests`, `SupersededEvidenceTests`); `test_review_workflow.py` (`RevisionAndRestartTests`); `test_report_replies.py`; `test_merge_qualification.py` | Checks evidence validity. The ENG-163 follow-up covers queued readiness against the current service-round check; posted comments remain history and deployed behavior still needs observation. |
 | Human merges without a still-applicable passing review | `test_report_service.py` (`ReviewServiceTests`); `test_merge_qualification.py` | Report an exception, never prevent Rolando merging. Unreadable fresh evidence conservatively counts as an exception. |
 | Outage/restart loses or duplicates progress reports; service acts as Rolando | `test_report_service.py` (`OutboxTests`); `test_service_live.py`; `test_report_reporter.py` | Local HTTP/Linear fixtures exercise transport and identity checks; deployed restart is still needed. |
 
@@ -71,8 +81,8 @@ increase a test count.
    evidence of the current configuration.
 4. **Current failure reporting:** use the connected sample to observe stale-review
    explanations, a changed candidate and merge-before-ready handling. Include a
-   delayed Linear delivery after a new push; the offline suites above do not
-   establish that a queued ready comment is withdrawn before delivery.
+   delayed Linear delivery after a new push. The reporting follow-up covers this
+   offline; observe it on the deployed configuration as part of the same sample.
 
 For each live observation record expected vs observed behavior, exact revisions
 and configuration, links to evidence, launch totals and actual manual steps.
