@@ -178,8 +178,10 @@ class ForgedEvidenceTest(GroupTestMixin, unittest.TestCase):
             with self.subTest(case=case_id):
                 self.assertIs(result(case_id).result, Result.BLOCKED)
 
-    def test_known_gaps_still_get_through(self):
-        """If this fails, the gap was fixed: remove its known_gap so it must stay blocked."""
+    def test_known_gaps_get_through_or_are_fixed(self):
+        """A known gap either still gets through or, once its owner's fix lands, is blocked
+        for the right reason. Fixes land in other PRs in any order, so either is accepted
+        here; the report then says to drop the marker so the case must stay blocked."""
         self.assertEqual(
             KNOWN_GAPS,
             {
@@ -199,7 +201,12 @@ class ForgedEvidenceTest(GroupTestMixin, unittest.TestCase):
         )
         for case_id in KNOWN_GAPS:
             with self.subTest(case=case_id):
-                self.assertIs(result(case_id).result, Result.GOT_THROUGH)
+                self.assertIn(result(case_id).result, (Result.GOT_THROUGH, Result.BLOCKED))
+
+    def test_a_fixed_gap_is_reported_so_its_marker_gets_dropped(self):
+        case = next(c for c in CASES if c.id == "worker-reruns-as-bot")
+        md = render((rc.CaseResult(case, Result.BLOCKED, "stopped"),))
+        self.assertIn("known gap now fixed: drop its known_gap marker", md)
 
     def test_worker_spellings_assertions_already_handles(self):
         """The assertion map normalizes the worker's login; only the criterion check doesn't."""

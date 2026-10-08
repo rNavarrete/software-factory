@@ -1840,7 +1840,9 @@ def render(results: tuple[CaseResult, ...]) -> str:
             c = r.case
             observed = r.observed or c.live
             result = r.result.value
-            if c.known_gap and r.result is not Result.BLOCKED:
+            if c.known_gap and r.result is Result.BLOCKED:
+                result += " (known gap now fixed: drop its known_gap marker)"
+            elif c.known_gap:
                 result += f" (known gap: {c.known_gap})"
             lines.append(
                 "| "
