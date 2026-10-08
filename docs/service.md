@@ -110,7 +110,7 @@ The service posts this on the ticket: "It is unclear whether worker … started"
 
 | Protocol | Ticket | Contract |
 |---|---|---|
-| `AuthorizationSource.poll(cursor)` / `.standing(authorization)` | ENG-174 (`controller/intake`, docs/intake.md) | Returns only Todo moves it has proved were made by Rolando on an exact ticket revision. Each has a stable `event_id`, so a replay is ignored. Also returns the moves it refused, and pause/resume controls. `revalidate` is checked again right before the first fire. |
+| `AuthorizationSource.poll(cursor)` / `.standing(authorization)` | ENG-174 (`controller/intake`, docs/intake.md) | Returns only Todo moves it has proved were made by Rolando on an exact ticket revision. Each has a stable `event_id`, so a replay is ignored. Also returns the moves it refused, and pause/resume controls. `standing` is checked again before every dispatch try and every five minutes while the worker runs. |
 | `ContractPreparer.prepare(authorization, project)` | ENG-175 | Returns a contract, or a product question. A question closes the item, and moving the ticket to Todo again starts a new one. |
 | `Reporter.post(issue_id, key, text)` | ENG-178 | Posts on Linear. Must be idempotent per `key`, because the service retries when it can't tell a failure from a lost answer. |
 | `ReviewStarter.start(pr)` | ENG-156 | Called once per attempt, when its PR first appears. Runs under the reviewer's own identity. |

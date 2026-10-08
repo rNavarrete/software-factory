@@ -235,3 +235,21 @@ class DropPrivilegesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostScriptTests(unittest.TestCase):
+    """Root's Python on the host must never load code from $HOME, which the
+    service's user owns (it could plant usercustomize.py there)."""
+
+    def test_root_python_ignores_the_user_site(self):
+        from pathlib import Path
+
+        deploy = Path(__file__).parents[1] / "deploy" / "fly"
+        self.assertIn("PYTHONNOUSERSITE=1", (deploy / "Dockerfile").read_text())
+        for name in ("entrypoint.sh", "factory"):
+            text = (deploy / name).read_text()
+            calls = [line for line in text.splitlines() if "python3 " in line]
+            self.assertTrue(calls, name)
+            for line in calls:
+                with self.subTest(script=name, line=line):
+                    self.assertIn("python3 -s ", line)

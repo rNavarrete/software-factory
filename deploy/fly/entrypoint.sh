@@ -7,15 +7,15 @@ set -eu
 umask 077
 mkdir -p "$HOME/.software-factory"
 # Root's copy, for Rolando's commands over `fly ssh console` and the signer.
-python3 -m controller.service install-secrets "$FACTORY_SECRETS_DIR"
+python3 -s -m controller.service install-secrets "$FACTORY_SECRETS_DIR"
 # The service's copy: never the approval key.
-python3 -m controller.service install-secrets /run/factory-service-secrets \
+python3 -s -m controller.service install-secrets /run/factory-service-secrets \
     --only routine-token,github-token,linear-key --owner factory
 for name in APPROVAL_KEY ROUTINE_TOKEN GITHUB_TOKEN LINEAR_KEY; do
     unset "FACTORY_$name"
 done
 chown -R factory:factory "$HOME"
-python3 -m controller.service signer --socket /run/factory-signer/signer.sock &
+python3 -s -m controller.service signer --socket /run/factory-signer/signer.sock &
 signer=$!
 i=0
 until [ -S /run/factory-signer/signer.sock ]; do
@@ -30,7 +30,7 @@ done
 # fixture with the fake worker: it never starts a real worker.
 env FACTORY_SECRETS_DIR=/run/factory-service-secrets \
     FACTORY_SIGNER_SOCKET=/run/factory-signer/signer.sock \
-    python3 -m controller.service run --user factory \
+    python3 -s -m controller.service run --user factory \
     --fixtures /app/deploy/qualification \
     --onboarding /app/deploy/qualification/onboarding.json &
 service=$!

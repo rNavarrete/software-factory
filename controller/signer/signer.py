@@ -224,7 +224,9 @@ class SignerKey:
 
     def verify(self, payload: bytes, mac: str) -> bool:
         # Records never change once written, so an answer can be kept.
-        cache_key = hashlib.sha256(payload + b"\0" + mac.encode()).hexdigest()
+        cache_key = hashlib.sha256(
+            len(payload).to_bytes(8, "big") + payload + mac.encode()
+        ).hexdigest()
         if cache_key in self._cache:
             return self._cache[cache_key]
         req = {"op": "verify", "payload": base64.b64encode(payload).decode(), "mac": mac}

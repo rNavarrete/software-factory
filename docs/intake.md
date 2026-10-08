@@ -15,9 +15,9 @@ The factory does not trust a ticket just because it is in Todo. Every 60 seconds
 
 The exact ticket text is pinned as a `revision`: the sha256 of the title, description, labels, project, team and parent. The move's history entry id is its `event_id`.
 
-Anything else is refused once, with the reason posted on the ticket. That covers a move by another person, a bot or an automation, an import, and an edit after the move. A ticket created straight into Todo, or imported there, is also refused once, and the comment says to move it to Backlog and back.
+Anything else is refused once, with the reason. The reason is posted on the ticket once ENG-178's Linear reporter is in place; until then it goes to the service log. That covers a move by another person, a bot or an automation, an import, and an edit after the move. A ticket created straight into Todo, or imported there, is also refused once, and the comment says to move it to Backlog and back.
 
-Before reading anything, intake checks whose key it is using. If the factory's Linear key acts as Rolando, intake reads nothing and says so every round, because the factory's own changes would then be recorded as his. The factory therefore needs its own Linear identity (an app, or a separate member) before intake is switched on.
+Before reading anything, intake checks whose key it is using. If the factory's Linear key acts as Rolando, intake reads nothing and logs why every round, because the factory's own changes would then be recorded as his. The factory therefore needs its own Linear identity (an app, or a separate member) before intake is switched on.
 
 ## Why polling and not webhooks
 
@@ -28,7 +28,7 @@ Linear's webhooks would need a public address on the machine, and their payloads
 | What happens | Before the worker starts | After the worker starts |
 |---|---|---|
 | A replayed or overlapping poll | Ignored: same `event_id` | Ignored |
-| Moved out of Todo | The queued item closes with a note | Nothing more starts for it, repairs included. The factory says it can't stop a running worker, explains how to stop it from the routine's run page, and keeps checking GitHub |
+| Moved out of Todo (to any other state, In Progress included) | The queued item closes with a note | Nothing more starts for it, repairs included, even if it comes back to Todo quickly. The factory says it can't stop a running worker, explains how to stop it from the routine's run page, and keeps checking GitHub |
 | Text edited after the move | The item closes. Moving the ticket out of Todo and back approves the new text | The worker keeps its contract and nothing new starts. One note on the ticket says what changed |
 | Moved out and back into Todo | The newer move replaces the queued one | No second worker. One ticket gets one attempt budget |
 | Blocked by an open ticket | It waits and says what it is waiting for | — |
@@ -48,7 +48,9 @@ The approval key is HMAC, so whoever can check a signature with it can also make
 - The service runs as `factory`. It can't read the key file or the signer's memory. It holds a `SignerKey`, which can ask "is this signature good?" and gets yes or no. It can never make a signature. The kernel tells the signer which user is asking, and only the service and root get an answer.
 - Rolando's own commands over `fly ssh console` run as root and sign with the key file directly, exactly as before.
 
-So nothing that reads ticket text, model output or GitHub data can forge Rolando's approval, a repair go-ahead or a clearing.
+So nothing that reads ticket text, model output or GitHub data can forge Rolando's approval, a repair go-ahead or a clearing. Root's Python on the machine never loads code from the home folder the service's user owns (`PYTHONNOUSERSITE`, `python3 -s`), so the service can't plant code for the signer or Rolando's commands to run at the next start.
+
+What the service's user can still do is damage the files it owns, the ledger included, or leave links in that folder for Rolando's commands to write through. That can break or confuse the record, but it can't read the key or sign anything. The daily volume snapshots are the recovery.
 
 ## Not built yet: a Todo move as the approval itself
 
@@ -72,12 +74,12 @@ Until then, a ticket accepted from Linear waits with "Waiting before starting: n
    ```
 
    It reads the history of a ticket a Claude session has changed through the Linear connector, and should show those changes carrying a bot, so they never count as Rolando's. It writes nothing.
-3. Set `intake_since` to the time of switching on, and set `intake_enabled: true`.
+3. Set `intake_since` to the time of switching on, set `intake_enabled: true`, and start the service with `--source linear` and the pilot's onboarding file (`deploy/fly/entrypoint.sh`). A cursor left by the fixture run is ignored, and reading starts from `intake_since`.
 
 These belong to the qualification run in ENG-163.
 
 ## Known limits
 
 - **Linear's own record is the proof.** If Linear ever recorded an integration's change as Rolando's own with no bot attached, intake would count it. The probe in step 2 checks this for the connectors in use. Intake fails closed whenever Linear doesn't say who acted.
-- **Edits Linear writes to the history late.** The two-minute wait and the check before every dispatch catch an edit that shows up in the history later. An edit that never shows up in the history at all is still caught before launch, because the text no longer matches its `revision`.
+- **Edits Linear writes to the history late.** The two-minute wait and the check before every dispatch catch an edit that shows up in the history later. An edit made after the factory accepted the move is caught even if it never shows up in the history, because the text no longer matches its `revision`. An edit made in the two minutes before acceptance that never shows up in the history at all would be taken as the approved text.
 - **A running worker can't be stopped from here.** Moving a ticket out of Todo stops everything that comes after. The session itself has to be stopped on the routine's run page.

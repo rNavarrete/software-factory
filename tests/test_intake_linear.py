@@ -384,6 +384,18 @@ class JudgeTests(LinearCase):
         self.world.move("ENG-187", other_todo, self.now - timedelta(minutes=5))
         self.assertNotIsInstance(self.judge(), Authorization)
 
+    def test_excluded_ticket_created_in_todo_says_nothing(self):
+        self.policy = policy(issues=frozenset({"ENG-188"}))
+        self.world.add("ENG-187", state=TODO)
+        self.assertIsNone(self.judge())
+
+    def test_edit_at_the_same_moment_as_the_move_is_refused(self):
+        at = self.now - timedelta(minutes=5)
+        self.world.add("ENG-187")
+        self.world.move("ENG-187", TODO, at)
+        self.world.edit("ENG-187", at, actor=MARIA, description="something else")
+        self.assertIsInstance(self.judge(), Refusal)
+
     def test_imported_into_todo_is_refused(self):
         self.world.add("ENG-187", state=TODO)
         self.world.record(

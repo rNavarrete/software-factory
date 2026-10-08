@@ -503,7 +503,19 @@ class Service:
             )
             r.closed.append(item.issue_key)
             return False
+        if item.withdrawn is not None:
+            self._close(
+                item,
+                "withdrawn",
+                now,
+                "The factory won't start anything more for this ticket: you moved it out of"
+                " Todo after its worker started. For new work, write a new ticket.",
+            )
+            r.closed.append(item.issue_key)
+            return False
         standing = self._standing(item)
+        if standing.reason is None and not standing.in_todo:
+            standing = Standing(withdrawn="the ticket left Todo before the factory started it")
         if standing.reason is not None:
             again = (
                 " To start from the new text, move it out of Todo and back."

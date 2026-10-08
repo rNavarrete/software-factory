@@ -263,7 +263,43 @@ class IntakeServiceTests(IntakeServiceCase):
         self.assertNotIn(second, self.view().items)
         self.assertIn(second, self.view().seen)
         self.assertIsNone(self.item(first).closed)
+        # Leaving Todo, even briefly, still counts once the worker has started.
+        self.assertIsNotNone(self.item(first).withdrawn)
         self.assertTrue(any("already queued or in progress" in t for t in self.texts()))
+
+    def test_moved_to_in_progress_before_launch_cancels(self):
+        eid = self.rolando_moves()
+        self.tick()  # queued, waiting for approval
+        self.linear.move("ENG-187", IN_PROGRESS, self.now + timedelta(minutes=1))
+        self.rolando_approves("ENG-187")
+        self.tick(minutes=6)
+        self.assertEqual(self.item(eid).closed, "authorization-withdrawn")
+        self.assertTrue(any("left Todo" in t for t in self.texts()))
+        self.assertEqual(self.launched(), 0)
+
+    def test_withdrawn_item_never_fires_again_even_back_in_todo(self):
+        first = self.rolando_moves()
+        self.tick()
+        item = self.item(first)
+        from controller.service import queue as q
+
+        with self.store.writer_lock():
+            self.store.append(q.item_withdrawn(item, "moved to Backlog", self.now))
+        self.rolando_approves("ENG-187")
+        self.tick(minutes=6)
+        self.assertEqual(self.item(first).closed, "withdrawn")
+        self.assertEqual(self.launched(), 0)
+
+    def test_switching_from_fixtures_keeps_working_with_an_old_cursor(self):
+        from controller.service import queue as q
+
+        with self.store.writer_lock():
+            self.store.append(q.cursor("3", self.now))
+        self.rolando_moves()
+        self.rolando_approves("ENG-187")
+        r = self.tick()
+        self.assertEqual(r.errors, [])
+        self.assertEqual(r.accepted, ["ENG-187"])
 
     # --- the single lane ---
 

@@ -202,11 +202,28 @@ def attribution_problem(c: Change, approver_id: str) -> str | None:
 
 
 def changed_after(t: Ticket, at: datetime) -> list[str]:
+    """What defines the work changed at or after ``at`` (the move's own entry
+    included: Linear may fold a quick edit into it)."""
     parts: list[str] = []
     for c in t.changes:
-        if c.at > at:
+        if c.at >= at:
             parts += [p for p in c.content if p not in parts]
     return parts
+
+
+def left_after(t: Ticket, at: datetime, policy: IntakePolicy) -> str | None:
+    """A state the ticket passed through after ``at`` in which the move no
+    longer stands, even if it came back since (e.g. out of Todo and back)."""
+    for c in t.changes:
+        if c.at > at and c.to_state is not None and not _stands_in(c.to_state, policy):
+            return c.to_state.name
+    return None
+
+
+def _stands_in(state: State, policy: IntakePolicy) -> bool:
+    if state.type == "unstarted":
+        return state.name == policy.todo
+    return state.type == "started"
 
 
 def judge(t: Ticket, policy: IntakePolicy, now: datetime) -> Authorization | Refusal | None:
@@ -215,8 +232,13 @@ def judge(t: Ticket, policy: IntakePolicy, now: datetime) -> Authorization | Ref
     rule = policy.projects.get(t.project_id or "")
     if rule is None or t.id in policy.status_issues() or t.gone:
         return None
+    excluded = (rule.issues is not None and t.key not in rule.issues) or bool(
+        set(t.labels) & rule.skip_labels
+    )
     moves = [c for c in t.changes if _is_move_into(c, policy.todo) and c.at >= policy.since]
     if not moves:
+        if excluded:
+            return None
         entered = [c for c in t.changes if c.to_state is not None]
         if (
             t.state.name == policy.todo
@@ -289,17 +311,18 @@ def standing(t: Ticket | None, a: Authorization, policy: IntakePolicy) -> Standi
         return Standing(withdrawn="the ticket was deleted or archived")
     if t.project_id != a.project_id or t.project_id not in policy.projects:
         return Standing(withdrawn="the ticket moved to a project the factory doesn't work on")
-    if t.state.type not in _STANDING_TYPES or (
-        t.state.type == "unstarted" and t.state.name != policy.todo
-    ):
+    if not _stands_in(t.state, policy):
         return Standing(withdrawn=f"the ticket was moved to {t.state.name}")
+    left = left_after(t, a.moved_at, policy)
+    if left is not None:
+        return Standing(withdrawn=f"the ticket was moved to {left} after the move")
     changed = None
     edited = changed_after(t, a.moved_at)
     if edited or revision(t) != a.revision:
         what = ", ".join(edited) if edited else "its text"
         changed = f"the ticket changed after it was moved to Todo ({what})"
     waiting = tuple(sorted(k for k, kind in t.blockers if kind not in _DONE_TYPES))
-    return Standing(changed=changed, waiting_on=waiting)
+    return Standing(changed=changed, waiting_on=waiting, in_todo=t.state.name == policy.todo)
 
 
 def controls(t: Ticket, policy: IntakePolicy) -> list[Control]:
@@ -339,14 +362,14 @@ _ISSUE_FIELDS = f"""
   id identifier title description createdAt updatedAt trashed archivedAt
   project {{ id }} team {{ id }} parent {{ id }}
   state {{ id name type }}
-  labels(first: 50) {{ nodes {{ name }} }}
-  inverseRelations(first: 50) {{ nodes {{ type issue {{ identifier state {{ type }} }} }} }}
-  history(first: 50) {{ nodes {{ {_HISTORY_FIELDS} }} pageInfo {{ hasNextPage endCursor }} }}
+  labels(first: 20) {{ nodes {{ name }} }}
+  inverseRelations(first: 20) {{ nodes {{ type issue {{ identifier state {{ type }} }} }} }}
+  history(first: 25) {{ nodes {{ {_HISTORY_FIELDS} }} pageInfo {{ hasNextPage endCursor }} }}
 """
 
 ISSUES_QUERY = f"""
 query FactoryIntake($projects: [ID!], $since: DateTimeOrDuration, $after: String) {{
-  issues(first: 25, after: $after, includeArchived: true,
+  issues(first: 10, after: $after, includeArchived: true,
          filter: {{ project: {{ id: {{ in: $projects }} }}, updatedAt: {{ gte: $since }} }}) {{
     nodes {{ {_ISSUE_FIELDS} }}
     pageInfo {{ hasNextPage endCursor }}
@@ -573,7 +596,8 @@ class LinearSource:
         self.check_identity()
         policy = self.policy()
         now = self.now()
-        since = policy.since if cursor is None else max(policy.since, _when(cursor) - OVERLAP)
+        last = _cursor_time(cursor)
+        since = policy.since if last is None else max(policy.since, last - OVERLAP)
         tickets: list[Ticket] = []
         after = None
         while True:
@@ -594,7 +618,7 @@ class LinearSource:
             after = page["endCursor"]
         authorizations: list[Authorization] = []
         refusals: list[Refusal] = []
-        high = since if cursor is None else _when(cursor)
+        high = since if last is None else last
         hold: datetime | None = None
         for t in tickets:
             high = max(high, t.updated_at)
@@ -625,6 +649,15 @@ class LinearSource:
 
     def revalidate(self, authorization: Authorization) -> str | None:
         return self.standing(authorization).reason
+
+
+def _cursor_time(cursor: str | None) -> datetime | None:
+    """A cursor this source wrote, or None for any other (a fixture's count,
+    say): reading again from ``intake_since`` is safe, replays are ignored."""
+    try:
+        return None if cursor is None else _when(cursor)
+    except ValueError:
+        return None
 
 
 def _settling(t: Ticket, policy: IntakePolicy, now: datetime) -> bool:
