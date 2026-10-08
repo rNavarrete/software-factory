@@ -672,5 +672,82 @@ class ReviewFindingsTest(unittest.TestCase):
             candidate(changed_paths=".github/workflows/ci.yml")
 
 
+class ReviewerLoginTest(unittest.TestCase):
+    """Only well-formed logins on the reviewer list count; the worker never does.
+
+    Found by the bypass tests: a deny-list let '[bot]' suffixes, spaces, look-alike
+    characters and malformed names through as independent reviewers.
+    """
+
+    BAD = (
+        f"{WORKER}[bot]",
+        f"{WORKER.upper()}[BOT]",
+        f"{WORKER} ",
+        f" {WORKER}",
+        "rnavarrete\u2011factory\u2011bot",  # non-breaking hyphens
+        "rnavarrete\u2010factory\u2010bot",  # unicode hyphens
+        "\tnot a login!",
+        "",
+        "-rNavarrete",
+        "rNavarrete-",
+        "rNavarrete--x",
+        "rNavarrete\n",
+        "r\u0430Navarrete",  # Cyrillic a
+        f"{REVIEWER}[bot]",  # an app using Rolando's name
+        f"{REVIEWER} ",
+        "someone-else",  # well formed, but not a listed reviewer
+        "x" * 40,
+    )
+
+    def test_bad_rerunner_logins_are_not_evidence(self):
+        for login in self.BAD:
+            with self.subTest(login=login):
+                report = run(results=all_green(source=Source.RERUN, by=login))
+                self.assertEqual(verdicts(report)["ac1"], Verdict.UNKNOWN)
+                self.assertFalse(report.ready)
+                self.assertTrue(
+                    any("was not re-run by an independent reviewer" in i for i in report.ignored)
+                )
+
+    def test_bad_observer_logins_are_not_evidence(self):
+        for login in self.BAD:
+            with self.subTest(login=login):
+                report = run(observations=[seen(observer=login)])
+                self.assertEqual(verdicts(report)["ac3"], Verdict.UNKNOWN)
+                self.assertFalse(report.ready)
+                self.assertTrue(any(i.startswith("untrusted: observation") for i in report.ignored))
+
+    def test_worker_spellings_are_named_as_the_worker(self):
+        for login in (WORKER, WORKER.upper(), f"{WORKER}[bot]"):
+            with self.subTest(login=login):
+                report = run(observations=[seen(observer=login)])
+                self.assertIn("the worker's own observation", " ".join(report.ignored))
+
+    def test_listed_reviewer_counts_in_any_case(self):
+        for login in (REVIEWER, REVIEWER.lower(), REVIEWER.upper()):
+            with self.subTest(login=login):
+                report = run(
+                    results=all_green(source=Source.RERUN, by=login),
+                    observations=[seen(observer=login)],
+                )
+                self.assertTrue(report.ready, report.blockers)
+
+    def test_reviewer_list_is_the_policy(self):
+        policy = TrustPolicy(reviewers=frozenset({"helper"}))
+        report = run(observations=[seen(observer="helper")], policy=policy)
+        self.assertEqual(verdicts(report)["ac3"], Verdict.PASS)
+        self.assertEqual(verdicts(run(policy=policy))["ac3"], Verdict.UNKNOWN)
+
+    def test_worker_on_the_reviewer_list_still_does_not_count(self):
+        policy = TrustPolicy(reviewers=frozenset({REVIEWER, WORKER}))
+        report = run(observations=[seen(observer=WORKER)], policy=policy)
+        self.assertEqual(verdicts(report)["ac3"], Verdict.UNKNOWN)
+
+    def test_malformed_worker_list_entry_still_blocks_its_spelling(self):
+        policy = TrustPolicy(worker_logins=frozenset({"odd name"}), reviewers=frozenset({"x"}))
+        self.assertTrue(policy.is_worker("odd name"))
+        self.assertFalse(policy.is_reviewer("odd name"))
+
+
 if __name__ == "__main__":
     unittest.main()

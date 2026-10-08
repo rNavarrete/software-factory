@@ -49,6 +49,21 @@ from controller.contract import validate
 from controller.interfaces import AttemptId, ContractDigest
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+# A GitHub login, optionally an app's ``[bot]`` account. ASCII only, so look-alike
+# characters (a non-breaking hyphen, a Cyrillic letter) never match.
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}(?:\[bot\])?$", re.ASCII)
+
+
+def _login_key(login: object) -> str | None:
+    """A login compared ignoring case and a ``[bot]`` suffix; None if malformed.
+
+    No trimming: a login with spaces or tabs around it is malformed, not cleaned.
+    """
+    if not isinstance(login, str) or not _LOGIN_RE.fullmatch(login):
+        return None
+    return login.lower().removesuffix("[bot]")
+
+
 _MAX_EXCERPT = 2000
 
 
@@ -98,11 +113,28 @@ class TrustPolicy:
     """Regexes on a file's base name that make it a control file even inside
     ``content_paths``."""
     worker_logins: frozenset[str] = frozenset({"rnavarrete-factory-bot"})
-    """Accounts the worker acts as (compared ignoring case). Nothing they report
-    or observe is evidence."""
+    """Accounts the worker acts as. Nothing they report or observe is evidence,
+    in any spelling: case and a ``[bot]`` suffix are ignored."""
+    reviewers: frozenset[str] = frozenset({"rNavarrete"})
+    """The only people whose reruns and observations count (compared ignoring
+    case). Anyone else, a bot, or a name that isn't a real GitHub login is not
+    evidence, so a new spelling can never slip through a list of who to refuse."""
 
     def is_worker(self, login: str) -> bool:
-        return login.lower() in {w.lower() for w in self.worker_logins}
+        """True for the worker in any spelling, and for any malformed login,
+        since a name that can't be checked can't be shown not to be the worker."""
+        key = _login_key(login)
+        return key is None or key in {_login_key(w) or w.lower() for w in self.worker_logins}
+
+    def is_reviewer(self, login: str) -> bool:
+        """A well-formed human login on the reviewer list that is not the worker's."""
+        key = _login_key(login)
+        return (
+            key is not None
+            and not login.lower().endswith("[bot]")
+            and not self.is_worker(login)
+            and key in {r.lower() for r in self.reviewers}
+        )
 
 
 @dataclass(frozen=True)
@@ -501,8 +533,11 @@ def _trusted_results(results, candidate, policy, ignored) -> tuple[CheckResult, 
                 ignored.append(f"untrusted: {label}: " + "; ".join(why))
                 continue
         else:
-            if not r.by or policy.is_worker(r.by):
-                ignored.append(f"untrusted: {label} was not re-run by an independent reviewer")
+            if not policy.is_reviewer(r.by):
+                ignored.append(
+                    f"untrusted: {label} was not re-run by an independent reviewer"
+                    f" ({r.by!r} is not one of {', '.join(sorted(policy.reviewers))})"
+                )
                 continue
         keep.append(r)
     return tuple(keep)
@@ -511,9 +546,14 @@ def _trusted_results(results, candidate, policy, ignored) -> tuple[CheckResult, 
 def _usable_observations(observations, candidate, policy, ignored) -> tuple[Observation, ...]:
     keep = []
     for o in observations:
-        label = f"observation of {o.criterion} by {o.observer or 'nobody'}"
-        if not o.observer or policy.is_worker(o.observer):
+        label = f"observation of {o.criterion} by {o.observer!r}"
+        if policy.is_worker(o.observer) and _login_key(o.observer) is not None:
             ignored.append(f"untrusted: {label}: the worker's own observation is not evidence")
+        elif not policy.is_reviewer(o.observer):
+            ignored.append(
+                f"untrusted: {label}: not a known reviewer's login"
+                f" (only {', '.join(sorted(policy.reviewers))})"
+            )
         elif o.commit != candidate.head_commit or o.base_commit != candidate.base_commit:
             ignored.append(f"stale: {label} was made on {o.commit[:12]}/{o.base_commit[:12]}")
         else:
