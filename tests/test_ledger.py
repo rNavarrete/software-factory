@@ -381,6 +381,45 @@ class RedactionTest(LedgerCase):
         for text, expected in cases.items():
             self.assertEqual(redact(text), expected, text)
 
+    def test_labelled_values_are_dropped_whole(self):
+        # Quoted values go to the closing quote, spaces included; single or double
+        # quotes; any length. Unquoted ones go to the end of the line or a separator.
+        cases = {
+            "password: 'correct horse battery'": f"password: '{REDACTED}'",
+            'password: "correct horse battery"': f'password: "{REDACTED}"',
+            "{'password': 'a b', 'user': 'r'}": f"{{'password': '{REDACTED}', 'user': 'r'}}",
+            '{"password": "x y", "user": "r"}': f'{{"password": "{REDACTED}", "user": "r"}}',
+            "db_password='hunter 2'": f"db_password='{REDACTED}'",
+            "client_secret: 'abc'": f"client_secret: '{REDACTED}'",
+            "secret = 'it\\'s a b'": f"secret = '{REDACTED}'",
+            "password: 'never closed\nnext line": f"password: '{REDACTED}'\nnext line",
+            "password=correct horse battery\nnext": f"password={REDACTED}\nnext",
+            "PASSWORD:pw;other=1": f"PASSWORD:{REDACTED};other=1",
+            "passphrase = two words, then more": f"passphrase = {REDACTED}, then more",
+            "token=abc": f"token={REDACTED}",
+            "x-api-key: k k": f"x-api-key: {REDACTED}",
+            "Authorization: Bearer two parts": f"Authorization: Bearer {REDACTED}",
+            "Authorization: Basic dXNlcjpwYXNzd29yZA==": f"Authorization: Basic {REDACTED}",
+            "curl -H 'Authorization: Bearer abc def'": f"curl -H 'Authorization: Bearer {REDACTED}",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(redact(text), expected, text)
+            self.assertEqual(redact(expected), expected, f"redacting twice: {text}")
+
+    def test_quoted_secrets_never_reach_disk(self):
+        body = (
+            "error: auth failed for password: 'correct horse battery staple'\n"
+            '{"password": "tr0ub4dor & 3", "pwd": "short"}\n'
+            "config: secret='it is a secret'"
+        )
+        self.write(records.failure("fire", body, NOW, TASK))
+        self.store.close()
+        for f in self.home.iterdir():
+            raw = f.read_bytes()
+            for secret in [b"correct horse", b"tr0ub4dor", b"it is a secret"]:
+                self.assertNotIn(secret, raw, f.name)
+        self.store = SqliteLedgerStore(self.path)
+
     def test_secret_named_keys_and_basic_auth(self):
         (s,) = self.write(
             LedgerEvent(
@@ -388,6 +427,7 @@ class RedactionTest(LedgerCase):
                 NOW,
                 data={
                     "password": "hunter2",
+                    "passphrase": "two words",
                     "client_secret": "abc",
                     "token": {"nested": "x"},
                     "header": "Authorization: Basic dXNlcjpwYXNzd29yZA==",
