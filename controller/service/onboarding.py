@@ -127,20 +127,19 @@ class Project:
     def source_problems(self, contract: Mapping[str, object], task: str) -> list[str]:
         """``contract_problems``, plus what a Todo move alone can't approve:
         a permitted path that could reach a protected one."""
-        problems = self.contract_problems(contract, task)
-        if problems:
-            return problems
+        return self.contract_problems(contract, task) or self.protected_problems(contract)
+
+    def protected_problems(self, contract: Mapping[str, object]) -> list[str]:
+        """Permitted paths that could reach a protected one."""
         paths = contract.get("permitted_paths") or ()
         touched = sorted(
             str(p)
             for p in paths  # type: ignore[union-attr]
             if any(_may_overlap(str(p), q) for q in self.protected_paths)
         )
-        if touched:
-            problems.append(
-                f"paths that may reach protected files need Rolando's typed approval: {touched}"
-            )
-        return problems
+        if not touched:
+            return []
+        return [f"paths that may reach protected files need Rolando's typed approval: {touched}"]
 
 
 def _may_overlap(path: str, protected: str) -> bool:

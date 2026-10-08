@@ -59,7 +59,7 @@ from controller.signer.authorize import (
 from controller.signer.signer import SignerAuthorizer, authorize_handler
 from tests.test_approval import yes
 from tests.test_attempts import MemoryLedger, launched
-from tests.test_intake_linear import BACKLOG, CLAUDE_BOT, MARIA, TODO, FakeLinear
+from tests.test_intake_linear import BACKLOG, CLAUDE_BOT, IN_PROGRESS, MARIA, TODO, FakeLinear
 from tests.test_intake_service import (
     APPROVER as LINEAR_APPROVER,
 )
@@ -955,6 +955,80 @@ class TodoMoveServiceTests(TodoMoveServiceCase):
             self.tick(minutes=6)
         self.assertIn(eid, self.view().items)
         self.assertEqual(self.launched(), 0)
+
+
+class ChangedWhileQueuedTests(TodoMoveServiceCase):
+    """Rolando's review of 2d6ad80: what changes while an approved ticket
+    waits for the lane must still stop it before launch."""
+
+    def queued(self, typed=False):
+        self.gate.hold("manual", "hold for the test", self.now)
+        eid = self.rolando_moves()
+        if typed:
+            self.rolando_approves("ENG-187")
+        self.tick()
+        self.assertEqual(self.launched(), 0)
+        return eid
+
+    def resume(self):
+        self.gate.resume("go", self.now, reason="manual")
+        for _ in range(3):
+            self.tick(minutes=6)
+
+    def out_and_back_by_a_bot(self, typed):
+        eid = self.queued(typed)
+        self.linear.move("ENG-187", IN_PROGRESS, self.now + timedelta(seconds=10))
+        self.linear.move("ENG-187", TODO, self.now + timedelta(seconds=20), botActor=CLAUDE_BOT)
+        self.resume()
+        self.assertEqual(self.launched(), 0)
+        self.assertEqual(self.item(eid).closed, "authorization-withdrawn")
+
+    def test_out_of_todo_and_back_by_a_bot_cancels_the_queued_task(self):
+        self.out_and_back_by_a_bot(typed=False)
+
+    def test_out_of_todo_and_back_by_a_bot_cancels_a_typed_approval_too(self):
+        self.out_and_back_by_a_bot(typed=True)
+
+    def test_out_of_todo_and_back_by_rolando_starts_the_new_move_only(self):
+        old = self.queued()
+        self.linear.move("ENG-187", IN_PROGRESS, self.now + timedelta(seconds=10))
+        self.linear.move("ENG-187", TODO, self.now + timedelta(seconds=20))
+        self.resume()
+        self.assertIsNotNone(self.item(old).closed)
+        self.assertEqual(self.launched(), 1)
+
+    def removed_from_the_allowed_list(self, typed):
+        eid = self.queued(typed)
+        self.config["projects"][0]["issues"] = ["ENG-188"]
+        self.resume()
+        self.assertEqual(self.launched(), 0)
+        self.assertEqual(self.item(eid).closed, "authorization-withdrawn")
+
+    def test_ticket_removed_from_the_allowed_list_does_not_start(self):
+        self.removed_from_the_allowed_list(typed=False)
+
+    def test_ticket_removed_from_the_allowed_list_does_not_start_when_typed(self):
+        self.removed_from_the_allowed_list(typed=True)
+
+    def test_baseline_label_added_while_waiting_does_not_start(self):
+        eid = self.queued(typed=True)
+        self.linear.label("ENG-187", self.now + timedelta(seconds=10), add=["baseline"])
+        self.resume()
+        self.assertEqual(self.launched(), 0)
+        self.assertEqual(self.item(eid).closed, "authorization-withdrawn")
+
+    def test_paths_protected_while_waiting_need_a_typed_approval(self):
+        eid = self.queued()
+        self.assertEqual(len(self.source_authorizations()), 1)
+        self.config["projects"][0]["protected_paths"] = ["src/"]
+        self.resume()
+        self.assertEqual(self.launched(), 0)
+        self.assertIsNone(self.item(eid).closed)
+        waits = [t for t in self.texts() if "typed approval" in t]
+        self.assertEqual(len(waits), 1)
+        self.rolando_approves("ENG-187")
+        self.tick(minutes=6)
+        self.assertEqual(self.launched(), 1)
 
 
 class RealDispatcherTests(TodoMoveServiceCase):

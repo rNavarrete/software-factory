@@ -28,10 +28,12 @@ Linear's webhooks would need a public address on the machine, and their payloads
 | What happens | Before the worker starts | After the worker starts |
 |---|---|---|
 | A replayed or overlapping poll | Ignored: same `event_id` | Ignored |
-| Moved out of Todo (to any other state, In Progress included) | The queued item closes with a note | Nothing more starts for it, repairs included, even if it comes back to Todo quickly. The factory says it can't stop a running worker, explains how to stop it from the routine's run page, and keeps checking GitHub |
+| Moved out of Todo (to any other state, In Progress included) | The queued item closes with a note, even if someone or something moves it back, and even with a typed approval in force | Nothing more starts for it, repairs included, even if it comes back to Todo quickly. The factory says it can't stop a running worker, explains how to stop it from the routine's run page, and keeps checking GitHub |
 | Text edited after the move | The item closes. Moving the ticket out of Todo and back approves the new text | The worker keeps its contract and nothing new starts. One note on the ticket says what changed |
 | Moved out and back into Todo | The newer move replaces the queued one | No second worker. One ticket gets one attempt budget |
 | Blocked by an open ticket | It waits and says what it is waiting for | — |
+| Removed from the project's `issues`, or given a `skip_labels` label | The item closes, even with an approval in force | Nothing more starts for it |
+| The project's `protected_paths` now cover the task | It waits for Rolando's typed approval; a Todo-move approval signed earlier no longer counts | — |
 | The service restarts or Linear is down | The poll is read again from the saved cursor. Nothing is lost or doubled | Reconcile continues; the Linear check waits |
 
 The service checks the move again right before every dispatch try, and again every five minutes while the worker runs.

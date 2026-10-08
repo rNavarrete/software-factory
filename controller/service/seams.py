@@ -156,9 +156,10 @@ class Standing:
     waiting_on: Sequence[str] = ()
     """Tickets that block this one and aren't done: it waits for them."""
     in_todo: bool = True
-    """False when the ticket is in a started state (In Progress). That still
-    stands while the worker runs, but before launch it means the ticket left
-    Todo, so the queued work is cancelled."""
+    """False when the ticket is in a started state (In Progress), or left
+    Todo at any point since the move, even if it came back (whoever moved it
+    back). That still stands while the worker runs, but before launch it
+    means the ticket left Todo, so the queued work is cancelled."""
 
     @property
     def reason(self) -> str | None:

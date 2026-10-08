@@ -560,6 +560,8 @@ class Service:
         contract = self._contract(item, project.as_mapping(), project, r)
         if contract is None:
             return False
+        if not self._protected_ok(item, project, contract, now):
+            return False
         if not self._authorized(item, contract, r, now):
             return False
         try:
@@ -583,6 +585,22 @@ class Service:
         r.fired.append(str(result.run))
         self._notice(item, f"fired:{result.run}", _fired_text(result), now)
         return True
+
+    def _protected_ok(self, item: q.Item, project, contract: Mapping[str, object], now) -> bool:
+        """A contract that may reach the project's protected paths (as the
+        onboarding file says now) starts only on Rolando's typed approval,
+        never on a Todo move alone, even one signed before the paths were
+        protected."""
+        problems = project.protected_problems(contract)
+        if not problems or self._dispatcher.approvals.typed_approval_in_force(contract, now):
+            return True
+        self._notice(
+            item,
+            "needs-typed-approval",
+            "Waiting before starting: " + "; ".join(problems) + ".",
+            now,
+        )
+        return False
 
     def _authorized(
         self, item: q.Item, contract: Mapping[str, object], r: TickReport, now: datetime

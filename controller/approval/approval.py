@@ -480,7 +480,7 @@ class Approvals:
         bound = contracts.binding(contract)
         digest = ContractDigest(str(bound["digest"]))
         task = TaskId(str(contract["task_id"]))
-        _, withdrawals, _ = self._decisions(self._store.events(), task)
+        _, withdrawals, _ = self._decisions(self._store.events(), task, sources=True)
         if any(at is not None and now < at for _, at, _ in withdrawals.get(digest.value, ())):
             raise ApprovalRefused("this contract was withdrawn at a later time than now")
         summary = _contract_summary("Approve dispatch of this contract", bound, expires)
@@ -628,6 +628,16 @@ class Approvals:
             )
         return Verdict(digest, run, tuple(blocks))
 
+    def typed_approval_in_force(self, contract: Mapping[str, object], now: datetime) -> bool:
+        """Whether Rolando's own typed approval of exactly this contract is in
+        force now, leaving Todo-move authorizations out."""
+        _aware(now)
+        if contracts.approval_errors(contract):
+            return False
+        digest = contracts.digest(contracts.freeze(contract))
+        task = TaskId(str(contract["task_id"]))
+        return self._approval_block(self._store.events(), task, digest, now, sources=False) is None
+
     def trusted_events(
         self, stored: Sequence[StoredEvent], digest: ContractDigest
     ) -> list[StoredEvent]:
@@ -692,7 +702,7 @@ class Approvals:
             yield item, signed
 
     def _decisions(
-        self, stored: Sequence[StoredEvent], task: TaskId
+        self, stored: Sequence[StoredEvent], task: TaskId, *, sources: bool
     ) -> tuple[list[tuple[int, str, datetime, datetime]], dict[str, list], set[str]]:
         """The task's signed approvals (seq, digest, decided, expires), its
         withdrawals by digest (seq, signed time or None, decision), and the
@@ -710,6 +720,8 @@ class Approvals:
                 continue
             max_ttl = MAX_TTL
             if e.kind == SOURCE_AUTHORIZATION:
+                if not sources:
+                    continue
                 if decision != APPROVED:
                     continue  # the signer only ever approves
                 if not signed or not self._source_ok(e):
@@ -751,9 +763,15 @@ class Approvals:
         return key.lower() == e.task.value and e.attempt is None and e.run is None
 
     def _approval_block(
-        self, stored: Sequence[StoredEvent], task: TaskId, digest: ContractDigest, now: datetime
+        self,
+        stored: Sequence[StoredEvent],
+        task: TaskId,
+        digest: ContractDigest,
+        now: datetime,
+        *,
+        sources: bool = True,
     ) -> Notice | None:
-        approvals, withdrawals, unsigned = self._decisions(stored, task)
+        approvals, withdrawals, unsigned = self._decisions(stored, task, sources=sources)
         sources = self._source_seqs(stored)
 
         def withdrawn(seq: int, digest: str, decided: datetime) -> bool:

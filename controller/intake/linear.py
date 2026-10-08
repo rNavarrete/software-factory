@@ -313,6 +313,9 @@ def standing(t: Ticket | None, a: Authorization, policy: IntakePolicy) -> Standi
         return Standing(withdrawn="the ticket moved to a project the factory doesn't work on")
     if not _stands_in(t.state, policy):
         return Standing(withdrawn=f"the ticket was moved to {t.state.name}")
+    rule = policy.projects[t.project_id]
+    if (rule.issues is not None and t.key not in rule.issues) or set(t.labels) & rule.skip_labels:
+        return Standing(withdrawn="the project's onboarding no longer lets the factory start it")
     left = left_after(t, a.moved_at, policy)
     if left is not None:
         return Standing(withdrawn=f"the ticket was moved to {left} after the move")
@@ -322,7 +325,11 @@ def standing(t: Ticket | None, a: Authorization, policy: IntakePolicy) -> Standi
         what = ", ".join(edited) if edited else "its text"
         changed = f"the ticket changed after it was moved to Todo ({what})"
     waiting = tuple(sorted(k for k, kind in t.blockers if kind not in _DONE_TYPES))
-    return Standing(changed=changed, waiting_on=waiting, in_todo=t.state.name == policy.todo)
+    stayed = t.state.name == policy.todo and not any(
+        c.at > a.moved_at and c.to_state is not None and c.to_state.name != policy.todo
+        for c in t.changes
+    )
+    return Standing(changed=changed, waiting_on=waiting, in_todo=stayed)
 
 
 def controls(t: Ticket, policy: IntakePolicy) -> list[Control]:
