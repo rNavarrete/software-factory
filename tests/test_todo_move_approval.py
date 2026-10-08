@@ -38,7 +38,7 @@ from controller.attempts import AttemptGate
 from controller.attempts import events as ev
 from controller.dispatch import Dispatcher
 from controller.intake import LinearSource, LinearUnavailable, judge, policy_from, revision
-from controller.intake.linear import parse_ticket
+from controller.intake.linear import IntakeBlocked, parse_ticket
 from controller.interfaces import AttemptId, LedgerEvent, TaskId
 from controller.recovery import Recovery
 from controller.service import onboarding
@@ -393,6 +393,17 @@ class AuthorizerTests(AuthorizerCase):
         self.world.viewer["id"] = LINEAR_APPROVER
         eid = self.move()
         self.assertFalse(self.refused(eid).final)
+
+    def test_a_blocked_key_is_a_passing_refusal(self):
+        eid = self.move()
+
+        def blocked():
+            raise IntakeBlocked("the factory's Linear key acts as Rolando")
+
+        self.authorizer.viewer = blocked
+        e = self.refused(eid)
+        self.assertFalse(e.final)
+        self.assertIn("acts as Rolando", e.reason)
 
     def test_text_changed_without_a_history_entry_is_not_signed(self):
         # An edit Linear never wrote to the history: the signer compares the
