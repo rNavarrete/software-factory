@@ -1,21 +1,37 @@
 """Rolando's approval, bound to one exact contract (ENG-151, ADR 0001 section 5).
 
 Every decision this module writes is a ledger event signed with an operator key
-that lives in the macOS Keychain of Rolando's login, and is written only after
-he types the contract's short digest at a real terminal. Nothing here reads PR
-text, comments, worker output or any network input, so none of those can make
-an approval.
+kept in the macOS Keychain of Rolando's login, and is written only after he
+types a code at a terminal. Nothing here reads PR text, comments, worker
+output or any network input, so none of those can make an approval.
 
-What gets signed: who decided, when, the OS user, the exact contract digest,
-the decision and its scope, the expiry, and which attempt or run it covers.
-Free text (the failure a repair names, clearing evidence, notes) is stored
-beside it but not signed, because the ledger redacts secret-looking text before
-writing and that must not break the signature.
+What gets signed: who decided, when, the OS user, the exact contract digest, a
+fresh decision id, the decision and its scope, the expiry, the bound fields
+(repository, base commit, paths, actions, budget, version), and which attempt
+or run it covers. Free text (the failure a repair names, clearing evidence,
+notes) is stored beside it but not signed, because the ledger redacts
+secret-looking text before writing and that must not break the signature.
 
-``Approvals.check`` is the dispatch-time question "has Rolando approved exactly
-this contract for exactly this attempt?". It re-reads the ledger every time. It
-does not replace the attempt gate: dispatch (ENG-176) calls ``check`` first and
-``AttemptGate.reserve`` right after, and both must pass.
+Rules ``Approvals.check`` applies at dispatch, reading the ledger afresh:
+
+- Only the newest signed approval of a task counts; approving a revised
+  contract retires the old version.
+- A rejection or revocation of a contract cancels every approval of it made
+  before it; a fresh approval afterwards is needed.
+- A signed record counts once: a copy appended later (same decision id) is
+  ignored, so an old approval can't be replayed past a revocation.
+- Attempt 1 needs the approval. Attempt n needs, besides, a signed repair
+  go-ahead for exactly attempt n on exactly this contract, made after attempt
+  n-1 started, and n within the contract's budget.
+- Repair, re-fire and clearing records count only if signed, bound to the
+  contract their attempt ran, and made after what they decide on (a clearing
+  names the exact fire it clears).
+
+Threat model: the ledger lives on Rolando's Mac and only the controller writes
+it. The signature stops anything that can append records without the operator
+key (a bug, a future callback, a copied record) from creating or stretching a
+decision. It does not protect the records the gate itself writes (fire results,
+reservations); something able to forge those already controls the controller.
 
 Approving a contract authorizes dispatch only. It never approves the PR, a
 merge or a release (ADR 0001 section 5 items 2 and 3); the release gate is the
@@ -31,9 +47,10 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import subprocess
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -71,13 +88,21 @@ MAX_TTL = timedelta(days=14)
 KEYCHAIN_SERVICE = "software-factory-approval"
 
 _MAC_DOMAIN = b"software-factory/approval-mac/v1\n"
-_COMMON = ("identity", "os_user", "decided_at", "digest", "key_id")
+_COMMON = ("identity", "os_user", "decided_at", "digest", "decision_id", "key_id")
 _SIGNED_FIELDS = {
-    HUMAN_DECISION: (*_COMMON, "scope", "decision", "digest_type", "expires_at"),
+    HUMAN_DECISION: (
+        *_COMMON,
+        "scope",
+        "decision",
+        "digest_type",
+        "expires_at",
+        "binding_sha256",
+    ),
     ev.REPAIR_AUTHORIZED: _COMMON,
     ev.REFIRE_AUTHORIZED: _COMMON,
     ev.ATTEMPT_CLEARED: (*_COMMON, "basis"),
 }
+_URL_BASES = (ev.ClearingBasis.COMPLETED, ev.ClearingBasis.TERMINATED)
 
 # Gate blocks that depend on Rolando's decisions; check() reports these, read
 # from the ledger with every unauthenticated decision left out.
@@ -135,7 +160,11 @@ class KeychainKey:
     Create it once, on the Mac, with::
 
         security add-generic-password -s software-factory-approval -a "$USER" \
-            -w "$(openssl rand -hex 32)"
+            -T "" -w "$(openssl rand -hex 32)"
+
+    ``-T ""`` trusts no program, so macOS asks Rolando to allow every read of the
+    key (once per controller run, since the key is then kept in memory).
+    Without it, any program running as his login could read the key silently.
     """
 
     def __init__(
@@ -194,7 +223,11 @@ Confirm = Callable[[str, str], bool]
 def tty_confirm(
     summary: str, code: str, *, stdin: TextIO | None = None, out: TextIO | None = None
 ) -> bool:
-    """Ask at the terminal. Refuses piped or scripted input outright."""
+    """Ask at the terminal. Refuses piped input outright.
+
+    This shows a person is at a terminal; it cannot tell a person from a script
+    driving a pseudo-terminal. The Keychain prompt is what proves it is Rolando.
+    """
     stdin = sys.stdin if stdin is None else stdin
     out = sys.stderr if out is None else out
     try:
@@ -209,6 +242,12 @@ def tty_confirm(
 
 
 # --- Signing ----------------------------------------------------------------------
+
+
+def _binding_sha256(binding: object) -> str | None:
+    if not isinstance(binding, Mapping):
+        return None
+    return hashlib.sha256(contracts.canonical_bytes(binding)).hexdigest()
 
 
 def _payload(
@@ -232,30 +271,52 @@ def _payload(
         "run": None if run is None else str(run),
         "fields": fields,
     }
-    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return _MAC_DOMAIN + text.encode("utf-8")
+    # ASCII escapes keep any string, even an unpaired surrogate, encodable.
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return _MAC_DOMAIN + text.encode("ascii")
 
 
 def _sign(event: LedgerEvent, key: ApprovalKey) -> LedgerEvent:
     data = {**event.data, "key_id": key.key_id}
+    data.setdefault("decision_id", secrets.token_hex(16))
+    if event.kind == HUMAN_DECISION:
+        data["binding_sha256"] = _binding_sha256(data.get("binding"))
     payload = _payload(event.kind, event.task, event.attempt, event.run, data)
-    assert payload is not None, "an unsigned field is missing"
+    assert payload is not None, "a signed field is missing"
     data["mac"] = key.sign(payload)
     return LedgerEvent(event.kind, event.at, event.task, event.attempt, event.run, data)
 
 
-def authentic(event: LedgerEvent, key: ApprovalKey, approvers: frozenset[str]) -> bool:
-    """True if ``event`` was signed with ``key`` and names one of ``approvers``."""
+def authentic(
+    event: LedgerEvent, keys: ApprovalKey | Sequence[ApprovalKey], approvers: frozenset[str]
+) -> bool:
+    """True if ``event`` was signed with one of ``keys`` and names one of
+    ``approvers``. Never raises: a malformed record is simply not authentic."""
+    keyring = {k.key_id: k for k in ((keys,) if hasattr(keys, "sign") else keys)}  # type: ignore[union-attr]
     d = event.data
-    mac = d.get("mac")
-    if not isinstance(mac, str) or d.get("key_id") != key.key_id:
+    try:
+        mac, key_id, identity = d.get("mac"), d.get("key_id"), d.get("identity")
+        if not (isinstance(mac, str) and isinstance(key_id, str) and isinstance(identity, str)):
+            return False
+        if key_id not in keyring or identity not in approvers:
+            return False
+        decision_id = d.get("decision_id")
+        if not isinstance(decision_id, str) or not decision_id:
+            return False
+        if _time(d.get("decided_at")) is None:
+            return False
+        if event.kind == HUMAN_DECISION:
+            binding = d.get("binding")
+            if d.get("binding_sha256") != _binding_sha256(binding):
+                return False
+            if isinstance(binding, Mapping) and binding.get("digest") != d.get("digest"):
+                return False
+        payload = _payload(event.kind, event.task, event.attempt, event.run, d)
+        if payload is None:
+            return False
+        return hmac.compare_digest(keyring[key_id].sign(payload), mac)
+    except (TypeError, ValueError, UnicodeError):
         return False
-    if d.get("identity") not in approvers:
-        return False
-    payload = _payload(event.kind, event.task, event.attempt, event.run, d)
-    if payload is None or _time(d.get("decided_at")) is None:
-        return False
-    return hmac.compare_digest(key.sign(payload), mac)
 
 
 def _time(value: object) -> datetime | None:
@@ -278,7 +339,11 @@ def _aware(now: datetime) -> None:
 
 @dataclass(frozen=True)
 class Verdict:
-    """Whether Rolando's decisions allow firing ``run`` for this exact contract."""
+    """Whether Rolando's decisions allow firing ``run`` for this exact contract.
+
+    This covers approvals only. Holds, usage, rate limits and caps are the
+    attempt gate's, so ``approved`` does not mean the fire will happen.
+    """
 
     digest: ContractDigest | None
     run: RunId | None
@@ -286,15 +351,16 @@ class Verdict:
     blocks: tuple[Notice, ...]
 
     @property
-    def allowed(self) -> bool:
+    def approved(self) -> bool:
         return not self.blocks and self.run is not None
 
 
 class Approvals:
     """Rolando's decisions about contracts: write them, and check them at dispatch.
 
-    ``store`` is the ledger. ``key`` signs and verifies (KeychainKey on the Mac).
-    ``confirm`` asks Rolando to type a code before anything is written.
+    ``store`` is the ledger. ``key`` signs and verifies (KeychainKey on the Mac);
+    ``retired_keys`` only verify, so records signed before a key change still
+    count. ``confirm`` asks Rolando to type a code before anything is written.
     ``contracts`` (optional) keeps each approved contract's exact bytes.
     """
 
@@ -307,12 +373,14 @@ class Approvals:
         identity: str = APPROVER,
         os_user: str | None = None,
         approvers: frozenset[str] = frozenset({APPROVER}),
+        retired_keys: Sequence[ApprovalKey] = (),
         contracts: ContractStore | None = None,
     ) -> None:
         if identity not in approvers:
             raise ValueError(f"{identity!r} is not an approver")
         self._store = store
         self._key = key
+        self._keys = (key, *retired_keys)
         self._confirm = confirm
         self._identity = identity
         self._os_user = os_user or getpass.getuser()
@@ -324,11 +392,13 @@ class Approvals:
     def approve(
         self, contract: Mapping[str, object], now: datetime, *, ttl: timedelta = DEFAULT_TTL
     ) -> StoredEvent:
-        """Approve dispatching exactly this contract until ``now + ttl``."""
+        """Approve dispatching exactly this contract until ``now + ttl``. Any
+        earlier approval of another version of the task stops counting."""
         _aware(now)
         errors = contracts.approval_errors(contract)
         if errors:
             raise ApprovalRefused("contract can't be approved: " + "; ".join(errors))
+        contract = contracts.freeze(contract)
         if not timedelta(0) < ttl <= MAX_TTL:
             raise ApprovalRefused(f"an approval lasts more than 0 and at most {MAX_TTL}")
         try:
@@ -340,8 +410,8 @@ class Approvals:
         task = TaskId(str(contract["task_id"]))
         summary = _contract_summary("Approve dispatch of this contract", bound, expires)
         self._ask(summary, digest.short)
-        if self._contracts is not None:
-            self._contracts.save(contract)
+        if self._contracts is not None and self._contracts.save(contract) != digest:
+            raise ApprovalRefused("the stored contract does not match the approved digest")
         data = self._common(digest, now) | {
             "scope": SCOPE,
             "decision": APPROVED,
@@ -356,7 +426,7 @@ class Approvals:
         _aware(now)
         bound = contracts.binding(contract)
         digest = ContractDigest(str(bound["digest"]))
-        return self._withdraw(TaskId(str(contract["task_id"])), digest, REJECTED, reason, now)
+        return self._withdraw(TaskId(str(bound["task_id"])), digest, REJECTED, reason, now)
 
     def revoke(
         self, task: TaskId, digest: ContractDigest, reason: str, now: datetime
@@ -374,7 +444,7 @@ class Approvals:
         _aware(now)
         bound = contracts.binding(contract)
         digest = ContractDigest(str(bound["digest"]))
-        attempt = AttemptId(TaskId(str(contract["task_id"])), number)
+        attempt = AttemptId(TaskId(str(bound["task_id"])), number)
         budget = bound["attempt_budget"]
         assert isinstance(budget, int)
         if number < 2:
@@ -419,36 +489,46 @@ class Approvals:
     def record_clearing(
         self, attempt: AttemptId, basis: ev.ClearingBasis, evidence: str, now: datetime
     ) -> StoredEvent:
-        """A clearing record (ADR 0002 section 6.1) for an attempt that may have
-        left a session running. ``evidence`` is what ``basis`` needs."""
+        """A clearing record (ADR 0002 section 6.1) for the latest fire of an
+        attempt that may have left a session running. ``evidence`` is what
+        ``basis`` needs: an https session URL for completed or terminated."""
         _aware(now)
         if not evidence.strip():
             raise ApprovalRefused("a clearing record needs its evidence")
+        if basis in _URL_BASES and not evidence.startswith("https://"):
+            raise ApprovalRefused(f"a {basis.value} clearing needs the session's https URL")
         view = LedgerView.build(self._store.events())
         state = view.attempts.get(attempt)
-        if state is None or not state.digest:
+        if state is None or not state.digest or state.last_fire is None:
             raise ApprovalRefused(f"{attempt} was never started")
         digest = ContractDigest(state.digest)
-        summary = f"Clear {attempt} ({basis.value}): {evidence}"
-        self._ask(summary, str(attempt))
+        run = state.last_fire.run
+        summary = f"Clear {run} of contract {digest.value} ({basis.value}): {evidence}"
+        self._ask(summary, digest.short)
         base = ev.attempt_cleared(attempt, basis, evidence, self._identity, now)
-        return self._append(_extend(base, self._common(digest, now)))
+        data = {**base.data, **self._common(digest, now)}
+        return self._append(LedgerEvent(base.kind, now, attempt.task, attempt, run, data))
 
     # --- checking at dispatch ---
 
     def check(
         self, contract: Mapping[str, object], now: datetime, *, refire_of: RunId | None = None
     ) -> Verdict:
-        """May dispatch fire this exact contract now? Reads the ledger afresh.
+        """May dispatch fire this exact contract now, as far as Rolando's
+        decisions go? Reads the ledger afresh.
 
         Without ``refire_of`` this is the task's next attempt; with it, firing
         that run's attempt again. Holds, usage and rate limits are left to
-        ``AttemptGate.reserve``, which dispatch must still call.
+        ``AttemptGate.reserve``, which dispatch must still call, with the same
+        digest and ``refire_of``, and whose returned run must equal
+        ``verdict.run``. The two calls are not one transaction: a decision
+        recorded between them is seen at the next dispatch, not this one.
         """
         _aware(now)
         errors = contracts.approval_errors(contract)
         if errors:
             return Verdict(None, None, (Notice("contract-invalid", "; ".join(errors)),))
+        contract = contracts.freeze(contract)
         digest = contracts.digest(contract)
         task = TaskId(str(contract["task_id"]))
         stored = self._store.events()
@@ -477,94 +557,128 @@ class Approvals:
         self, stored: Sequence[StoredEvent], digest: ContractDigest
     ) -> list[StoredEvent]:
         """The ledger with every repair, re-fire and clearing decision left out
-        unless it is signed, bound to the right contract, and made after what it
-        decides on. ``digest`` is the contract being dispatched: repairs only
-        count for it."""
-        reserved: dict[AttemptId, tuple[int, str]] = {}
-        results: dict[RunId, int] = {}
+        unless it is signed, counted once, bound to the right contract, and made
+        after what it decides on. ``digest`` is the contract being dispatched:
+        repairs only count for it."""
+        reserved: dict[AttemptId, str] = {}
+        latest_fire: dict[AttemptId, RunId] = {}
+        results: set[RunId] = set()
         out = []
-        for item in sorted(stored, key=lambda s: s.seq):
+        for item, signed in self._signed(stored):
             e = item.event
             d = e.data
             keep = True
             if e.kind == ev.ATTEMPT_RESERVED and e.attempt is not None:
-                reserved.setdefault(e.attempt, (item.seq, str(d.get("digest", ""))))
+                reserved.setdefault(e.attempt, str(d.get("digest", "")))
+            elif e.kind == ev.FIRE_INTENT and e.run is not None:
+                latest_fire[e.run.attempt] = e.run
             elif e.kind == ev.FIRE_RESULT and e.run is not None:
-                results.setdefault(e.run, item.seq)
+                results.add(e.run)
             elif e.kind == ev.REPAIR_AUTHORIZED:
                 prior = None
                 if e.attempt is not None and e.attempt.number >= 2:
-                    prior = reserved.get(AttemptId(e.attempt.task, e.attempt.number - 1))
-                keep = prior is not None and d.get("digest") == digest.value and self._authentic(e)
+                    prior = AttemptId(e.attempt.task, e.attempt.number - 1)
+                keep = signed and prior in reserved and d.get("digest") == digest.value
             elif e.kind == ev.REFIRE_AUTHORIZED:
-                at = reserved.get(e.attempt) if e.attempt is not None else None
                 keep = (
-                    e.run is not None
-                    and at is not None
+                    signed
+                    and e.attempt in reserved
                     and e.run in results
-                    and d.get("digest") == at[1]
-                    and self._authentic(e)
+                    and d.get("digest") == reserved[e.attempt]
                 )
             elif e.kind == ev.ATTEMPT_CLEARED:
-                at = reserved.get(e.attempt) if e.attempt is not None else None
-                keep = at is not None and d.get("digest") == at[1] and self._authentic(e)
+                keep = (
+                    signed
+                    and e.attempt in reserved
+                    and e.run is not None
+                    and latest_fire.get(e.attempt) == e.run
+                    and d.get("digest") == reserved[e.attempt]
+                )
             if keep:
                 out.append(item)
         return out
 
     # --- internals ---
 
-    def _authentic(self, event: LedgerEvent) -> bool:
-        return authentic(event, self._key, self._approvers)
+    def _signed(self, stored: Sequence[StoredEvent]) -> Iterator[tuple[StoredEvent, bool]]:
+        """Every event in seq order, with whether it is a signed decision seen
+        for the first time. A later copy of a signed decision is not signed."""
+        seen: set[str] = set()
+        for item in sorted(stored, key=lambda s: s.seq):
+            e = item.event
+            signed = e.kind in _SIGNED_FIELDS and authentic(e, self._keys, self._approvers)
+            if signed:
+                decision_id = str(e.data["decision_id"])
+                signed = decision_id not in seen
+                seen.add(decision_id)
+            yield item, signed
 
     def _approval_block(
         self, stored: Sequence[StoredEvent], task: TaskId, digest: ContractDigest, now: datetime
     ) -> Notice | None:
-        standing: list[tuple[datetime, datetime]] = []
-        withdrawn = None
-        unsigned = other_contract = False
-        for item in sorted(stored, key=lambda s: s.seq):
+        newest: str | None = None  # digest of the task's newest signed approval
+        approvals: list[tuple[int, datetime, datetime]] = []
+        withdrawals: list[tuple[int, datetime | None, str]] = []
+        unsigned = False
+        for item, signed in self._signed(stored):
             e = item.event
             d = e.data
             if e.kind != HUMAN_DECISION or e.task != task or d.get("scope") != SCOPE:
                 continue
-            if d.get("digest") != digest.value:
-                other_contract = other_contract or d.get("decision") == APPROVED
+            ours = d.get("digest") == digest.value
+            decision = d.get("decision")
+            if decision in (REJECTED, REVOKED):
+                if ours:
+                    # Counted even if unsigned: a withdrawal can only stop dispatch.
+                    # Only a signed one's own time counts, so an unsigned one can't
+                    # reach forward and cancel approvals made after it.
+                    at = _time(d.get("decided_at")) if signed else None
+                    withdrawals.append((item.seq, at, str(decision)))
                 continue
-            if d.get("decision") in (REJECTED, REVOKED):
-                # Counted even if unsigned: a withdrawal can only stop dispatch.
-                standing.clear()
-                withdrawn = d["decision"]
-            elif d.get("decision") == APPROVED:
-                decided = _time(d.get("decided_at"))
-                expires = _time(d.get("expires_at"))
-                if (
-                    not self._authentic(e)
-                    or decided is None
-                    or expires is None
-                    or not timedelta(0) < expires - decided <= MAX_TTL
-                ):
-                    unsigned = True
-                    continue
-                standing.append((decided, expires))
-        if any(decided <= now < expires for decided, expires in standing):
+            if decision != APPROVED:
+                continue
+            decided, expires = _time(d.get("decided_at")), _time(d.get("expires_at"))
+            if (
+                not signed
+                or decided is None
+                or expires is None
+                or not timedelta(0) < expires - decided <= MAX_TTL
+            ):
+                unsigned = unsigned or ours
+                continue
+            newest = str(d["digest"])
+            if ours:
+                approvals.append((item.seq, decided, expires))
+
+        def withdrawn(seq: int, decided: datetime) -> bool:
+            return any(
+                w_seq > seq or (w_at is not None and decided <= w_at)
+                for w_seq, w_at, _ in withdrawals
+            )
+
+        live = [
+            (decided, expires) for seq, decided, expires in approvals if not withdrawn(seq, decided)
+        ]
+        if newest is not None and newest != digest.value:
+            return Notice(
+                "approval-for-different-contract",
+                "Rolando's newest approval for this task is for a different version of the"
+                " contract. Any change (content, scope, base commit or budget) needs a fresh"
+                " approval.",
+            )
+        if any(decided <= now < expires for decided, expires in live):
             return None
-        if any(now < decided for decided, _ in standing):
+        if any(now < decided for decided, _ in live):
             return Notice("approval-not-yet-valid", "The approval is dated after now.")
-        if standing:
+        if live:
             return Notice("approval-expired", "The approval has expired; approve it again.")
-        if withdrawn is not None:
-            return Notice(f"approval-{withdrawn}", f"Rolando {withdrawn} this exact contract.")
+        if withdrawals:
+            last = withdrawals[-1][2]
+            return Notice(f"approval-{last}", f"Rolando {last} this exact contract.")
         if unsigned:
             return Notice(
                 "approval-unauthenticated",
                 "An approval record for this contract is not signed with the operator key.",
-            )
-        if other_contract:
-            return Notice(
-                "approval-for-different-contract",
-                "Rolando approved a different version of this task's contract. Any change"
-                " (content, scope, base commit or budget) needs a fresh approval.",
             )
         return Notice("approval-missing", f"No approval of contract {digest.value}.")
 
@@ -618,8 +732,10 @@ def _contract_summary(title: str, bound: Mapping[str, object], expires: datetime
     lines = [f"{title}:"]
     for k in ("task_id", "version", "repository", "base_commit", "attempt_budget", "digest"):
         lines.append(f"  {k}: {bound[k]}")
-    lines.append(f"  permitted_paths: {', '.join(map(str, bound['permitted_paths']))}")  # type: ignore[arg-type]
-    lines.append(f"  permitted_actions: {', '.join(map(str, bound['permitted_actions']))}")  # type: ignore[arg-type]
+    for k in ("permitted_paths", "permitted_actions"):
+        values = bound[k]
+        assert isinstance(values, tuple)
+        lines.append(f"  {k}: {', '.join(map(str, values))}")
     lines.append(f"  expires: {expires.isoformat()}")
     lines.append("This authorizes dispatch only, not the PR, a merge or a release.")
     return "\n".join(lines)
@@ -629,13 +745,13 @@ def _contract_summary(title: str, bound: Mapping[str, object], expires: datetime
 
 
 class ContractStore:
-    """Approved contracts kept by digest (ADR 0002 section 3): one read-only file
-    per contract holding its canonical bytes, outside every git checkout."""
+    """Approved contracts kept by digest (ADR 0002 section 3): one read-only
+    (0400) file per contract holding its canonical bytes, in a 0700 folder
+    outside every git checkout."""
 
     def __init__(self, root: Path | str | None = None) -> None:
-        self.root = (
-            Path(root) if root is not None else Path.home() / ".software-factory" / "contracts"
-        )
+        default = Path.home() / ".software-factory" / "contracts"
+        self.root = Path(root) if root is not None else default
         here = self.root.resolve()
         for parent in (here, *here.parents):
             if (parent / ".git").exists():
@@ -650,7 +766,7 @@ class ContractStore:
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = self.path(digest)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
         except FileExistsError:
             if path.read_bytes() != data:
                 raise ValueError(f"{path} does not hold the contract it is named for") from None

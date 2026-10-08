@@ -90,14 +90,14 @@ class ApprovalTests(unittest.TestCase):
         return [b.code for b in verdict.blocks]
 
     def assert_refused(self, verdict, code):
-        self.assertFalse(verdict.allowed)
+        self.assertFalse(verdict.approved)
         self.assertIn(code, self.codes(verdict))
 
     def dispatch(self, contract=None, result=None, refire_of=None, at=NOW):
         """What dispatch will do: check approval, then reserve, then record."""
         contract = contract or self.contract
         verdict = self.desk.check(contract, at, refire_of=refire_of)
-        self.assertTrue(verdict.allowed, verdict.blocks)
+        self.assertTrue(verdict.approved, verdict.blocks)
         run = self.gate.reserve(
             TaskId(contract["task_id"]), contracts.digest(contract), at, refire_of=refire_of
         )
@@ -110,7 +110,8 @@ class ApprovalTests(unittest.TestCase):
 
     def resign(self, event, key=KEY, **changes):
         """Re-sign an event with changes, as if someone held the key."""
-        fields = {k: v for k, v in event.data.items() if k not in ("mac", "key_id")}
+        signature = ("mac", "key_id", "decision_id", "binding_sha256")
+        fields = {k: v for k, v in event.data.items() if k not in signature}
         base = LedgerEvent(
             changes.pop("kind", event.kind),
             event.at,
@@ -166,7 +167,7 @@ class ApprovalTests(unittest.TestCase):
         self.desk.approve(self.contract, NOW)
         self.store = self.restart(self.store)
         desk = Approvals(self.store, KEY, confirm=yes)
-        self.assertTrue(desk.check(self.contract, NOW).allowed)
+        self.assertTrue(desk.check(self.contract, NOW).approved)
 
     def test_mutating_the_contract_after_approval_changes_nothing_stored(self):
         stored = self.desk.approve(self.contract, NOW)
@@ -192,7 +193,7 @@ class ApprovalTests(unittest.TestCase):
 
     def test_expired_approval_is_refused(self):
         self.desk.approve(self.contract, NOW, ttl=timedelta(hours=1))
-        self.assertTrue(self.desk.check(self.contract, NOW + timedelta(minutes=59)).allowed)
+        self.assertTrue(self.desk.check(self.contract, NOW + timedelta(minutes=59)).approved)
         self.assert_refused(
             self.desk.check(self.contract, NOW + timedelta(hours=1)), "approval-expired"
         )
@@ -206,7 +207,7 @@ class ApprovalTests(unittest.TestCase):
 
     def test_revocation_is_seen_by_a_check_that_was_already_set_up(self):
         self.assertTrue(self.desk.approve(self.contract, NOW))
-        self.assertTrue(self.desk.check(self.contract, NOW).allowed)
+        self.assertTrue(self.desk.check(self.contract, NOW).approved)
         other = Approvals(self.store, KEY, confirm=yes)
         other.revoke(self.task, self.digest, "stop", NOW)
         self.assert_refused(self.desk.check(self.contract, NOW), "approval-revoked")
@@ -233,7 +234,7 @@ class ApprovalTests(unittest.TestCase):
         self.desk.approve(self.contract, NOW)
         self.desk.revoke(self.task, self.digest, "wait", NOW)
         self.desk.approve(self.contract, NOW + timedelta(minutes=1))
-        self.assertTrue(self.desk.check(self.contract, NOW + timedelta(minutes=1)).allowed)
+        self.assertTrue(self.desk.check(self.contract, NOW + timedelta(minutes=1)).approved)
 
     def test_approval_dated_in_the_future_is_refused(self):
         self.desk.approve(self.contract, NOW + timedelta(hours=1))
@@ -245,7 +246,7 @@ class ApprovalTests(unittest.TestCase):
                 self.desk.approve(self.contract, NOW, ttl=ttl)
         self.desk.approve(self.contract, NOW, ttl=MAX_TTL)
         self.assertTrue(
-            self.desk.check(self.contract, NOW + MAX_TTL - timedelta(seconds=1)).allowed
+            self.desk.check(self.contract, NOW + MAX_TTL - timedelta(seconds=1)).approved
         )
 
     def test_expiry_past_the_calendar_end_is_refused_not_crashing(self):
@@ -303,14 +304,14 @@ class ApprovalTests(unittest.TestCase):
         self.desk.approve(self.contract, NOW)
         changed = example(base_commit="f" * 40)
         self.desk.approve(changed, NOW)
-        self.assertTrue(self.desk.check(changed, NOW).allowed)
+        self.assertTrue(self.desk.check(changed, NOW).approved)
 
     def test_key_order_and_layout_do_not_matter(self):
         self.desk.approve(self.contract, NOW)
         reordered = contracts.loads(
             json.dumps(dict(reversed(list(self.contract.items()))), indent=2)
         )
-        self.assertTrue(self.desk.check(reordered, NOW).allowed)
+        self.assertTrue(self.desk.check(reordered, NOW).approved)
 
     # --- AC4: nothing but Rolando's signed, confirmed action makes an approval ---
 
@@ -356,8 +357,11 @@ class ApprovalTests(unittest.TestCase):
         for name, bad in tampered.items():
             with self.subTest(name):
                 self.assertFalse(authentic(bad, KEY, frozenset({APPROVER})))
-        self.append(tampered["digest swapped"])
-        self.assert_refused(self.desk.check(self.contract, NOW), "approval-unauthenticated")
+        store = self.make_store()
+        with store.writer_lock():
+            store.append(tampered["digest swapped"])
+        desk = Approvals(store, KEY, confirm=yes)
+        self.assert_refused(desk.check(self.contract, NOW), "approval-unauthenticated")
 
     def test_approval_moved_to_another_task_is_refused(self):
         e = self.desk.approve(self.contract, NOW).event
@@ -470,7 +474,7 @@ class ApprovalTests(unittest.TestCase):
         self.desk.approve(changed, NOW)
         self.assert_refused(self.desk.check(changed, NOW), "repair-not-authorized")
         self.desk.authorize_repair(changed, 2, "CI red", NOW)
-        self.assertTrue(self.desk.check(changed, NOW).allowed)
+        self.assertTrue(self.desk.check(changed, NOW).approved)
 
     def test_repair_grant_made_before_the_attempt_it_repairs_does_not_count(self):
         self.desk.approve(self.contract, NOW)
@@ -493,13 +497,13 @@ class ApprovalTests(unittest.TestCase):
         with self.assertRaises(ApprovalRefused):
             self.desk.authorize_repair(self.contract, 1, "x", NOW)
 
-    def test_refire_grant_only_for_the_run_it_names(self):
+    def test_a_second_refire_of_the_same_attempt_is_refused(self):
         self.desk.approve(self.contract, NOW)
         r1 = self.dispatch(result=not_launched(429, retry_after=0))
         self.desk.authorize_refire(self.contract, r1, NOW)
         r2 = self.dispatch(refire_of=r1, result=not_launched(400))
         self.assertEqual(r2, RunId(r1.attempt, 2))
-        # The grant for f1 says nothing about f2, and the fire cap is spent anyway.
+        # The grant for f1 says nothing about f2; the fire cap is spent too.
         self.assert_refused(self.desk.check(self.contract, NOW, refire_of=r2), "refire-not-allowed")
 
     def test_refire_grant_made_before_the_result_does_not_count(self):
@@ -540,7 +544,7 @@ class ApprovalTests(unittest.TestCase):
         ).event
         self.assertEqual(cleared.data["digest"], self.digest.value)
         self.desk.authorize_repair(self.contract, 2, "CI red", NOW)
-        self.assertTrue(self.desk.check(self.contract, NOW).allowed)
+        self.assertTrue(self.desk.check(self.contract, NOW).approved)
         # A clearing re-signed for a different contract does not count.
         store = self.make_store()
         with store.writer_lock():
@@ -558,6 +562,126 @@ class ApprovalTests(unittest.TestCase):
         a1 = self.dispatch()
         with self.assertRaises(ApprovalRefused):
             self.desk.record_clearing(a1.attempt, ev.ClearingBasis.COMPLETED, "  ", NOW)
+
+    def test_an_old_approval_replayed_after_a_revocation_or_rejection_does_not_count(self):
+        withdrawals = {
+            "approval-revoked": lambda at: self.desk.revoke(self.task, self.digest, "stop", at),
+            "approval-rejected": lambda at: self.desk.reject(self.contract, "no", at),
+        }
+        for code, withdraw in withdrawals.items():
+            with self.subTest(code):
+                self.setUp()
+                stored = self.desk.approve(self.contract, NOW)
+                withdraw(NOW + timedelta(minutes=1))
+                self.append(stored.event)  # byte-identical copy, appended later
+                self.assert_refused(
+                    self.desk.check(self.contract, NOW + timedelta(minutes=2)), code
+                )
+
+    def test_a_withdrawal_cancels_approvals_decided_before_it_whatever_the_order(self):
+        e = self.desk.approve(self.contract, NOW).event
+        self.desk.revoke(self.task, self.digest, "stop", NOW + timedelta(minutes=5))
+        # A record signed with the key but dated before the revocation and
+        # written after it (say, a delayed or replayed write) is still cancelled.
+        self.append(self.resign(e))
+        self.assert_refused(
+            self.desk.check(self.contract, NOW + timedelta(minutes=6)), "approval-revoked"
+        )
+
+    def test_an_unsigned_withdrawal_cannot_cancel_later_approvals(self):
+        far = (NOW + timedelta(days=365)).isoformat()
+        self.append(
+            LedgerEvent(
+                HUMAN_DECISION,
+                NOW,
+                self.task,
+                data=self.desk._common(self.digest, NOW)
+                | {
+                    "scope": SCOPE,
+                    "decision": "revoked",
+                    "digest_type": "contract",
+                    "decided_at": far,
+                },
+            )
+        )
+        self.assert_refused(self.desk.check(self.contract, NOW), "approval-revoked")
+        self.desk.approve(self.contract, NOW + timedelta(minutes=1))
+        self.assertTrue(self.desk.check(self.contract, NOW + timedelta(minutes=1)).approved)
+
+    def test_approving_a_revised_contract_retires_the_old_version(self):
+        self.desk.approve(self.contract, NOW)
+        narrow = example(permitted_paths=["src/books.ts", "tests/books.test.ts"])
+        self.desk.approve(narrow, NOW + timedelta(minutes=1))
+        later = NOW + timedelta(minutes=2)
+        self.assertTrue(self.desk.check(narrow, later).approved)
+        self.assert_refused(
+            self.desk.check(self.contract, later), "approval-for-different-contract"
+        )
+
+    def test_an_old_clearing_cannot_clear_a_later_fire(self):
+        self.desk.approve(self.contract, NOW)
+        r1 = self.gate.reserve(self.task, self.digest, NOW)
+        # Cleared before the launch result came back.
+        early = self.desk.record_clearing(
+            r1.attempt, ev.ClearingBasis.TERMINATED, "https://claude.ai/s1", NOW
+        ).event
+        self.assertEqual(early.run, r1)
+        self.gate.record_launch(r1, not_launched(400), NOW)
+        self.desk.authorize_refire(self.contract, r1, NOW)
+        self.dispatch(refire_of=r1, result=LOST)
+        self.append(early)  # replayed
+        self.append(self.resign(early))  # even re-signed, it names f1, not f2
+        self.assert_refused(self.desk.check(self.contract, NOW), "unresolved-attempt")
+
+    def test_clearing_evidence_must_fit_its_basis(self):
+        self.desk.approve(self.contract, NOW)
+        a1 = self.dispatch()
+        with self.assertRaises(ApprovalRefused):
+            self.desk.record_clearing(a1.attempt, ev.ClearingBasis.COMPLETED, "it finished", NOW)
+
+    def test_the_bound_fields_in_an_approval_are_signed(self):
+        e = self.desk.approve(self.contract, NOW).event
+        binding = dict(e.data["binding"]) | {"base_commit": "f" * 40}
+        self.assertFalse(authentic(self.forge(e, data={"binding": binding}), KEY, {APPROVER}))
+        binding = dict(e.data["binding"]) | {"digest": "0" * 64}
+        resigned = self.resign(e, binding=binding)
+        self.assertFalse(authentic(resigned, KEY, frozenset({APPROVER})))
+
+    def test_malformed_records_are_refused_not_crashing(self):
+        e = self.desk.approve(self.contract, NOW).event
+        bad = [
+            self.forge(e, data={"os_user": "\ud800"}),
+            self.forge(e, data={"identity": {"x": "y"}}),
+            self.forge(e, data={"identity": ["rNavarrete"]}),
+            self.forge(e, data={"decided_at": 5}),
+            self.forge(e, data={"key_id": None}),
+            self.forge(e, data={"binding": "not a mapping"}),
+            self.forge(e, data={"decision_id": ""}),
+        ]
+        store = self.make_store()
+        with store.writer_lock():
+            for b in bad:
+                try:
+                    store.append(b)
+                except ValueError:
+                    pass  # the durable ledger refuses some of these outright
+        desk = Approvals(store, KEY, confirm=yes)
+        for b in bad:
+            self.assertFalse(authentic(b, KEY, frozenset({APPROVER})))
+        self.assert_refused(desk.check(self.contract, NOW), "approval-unauthenticated")
+
+    def test_records_signed_with_a_retired_key_still_verify(self):
+        self.desk.approve(self.contract, NOW)
+        a1 = self.dispatch()
+        self.finish(a1.attempt)
+        new = Approvals(self.store, OTHER_KEY, confirm=yes, retired_keys=(KEY,))
+        new.authorize_repair(self.contract, 2, "CI red", NOW)
+        self.assertTrue(new.check(self.contract, NOW).approved)
+        # Without the retired key the old approval and clearing no longer count.
+        only_new = Approvals(self.store, OTHER_KEY, confirm=yes)
+        verdict = only_new.check(self.contract, NOW)
+        self.assert_refused(verdict, "approval-unauthenticated")
+        self.assert_refused(verdict, "unresolved-attempt")
 
     # --- AC6: repair attempts need a new go-ahead within the total cap ---
 
@@ -677,7 +801,7 @@ class ContractStoreTests(unittest.TestCase):
         self.assertEqual(digest, contracts.digest(contract))
         self.assertEqual(store.save(contract), digest)  # idempotent
         self.assertEqual(contracts.digest(store.load(digest)), digest)
-        self.assertEqual(os.stat(store.path(digest)).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(store.path(digest)).st_mode & 0o777, 0o400)
         self.assertEqual(os.stat(self.root).st_mode & 0o777, 0o700)
 
     def test_tampered_file_is_refused(self):
