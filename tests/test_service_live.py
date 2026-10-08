@@ -3,18 +3,24 @@ Linear (``--live``), as the start script runs it with ``FACTORY_MODE=live``.
 
 Linear and GitHub are fakes behind the real HTTP clients (``linear_opener``
 and ``github_opener``), so every request goes through the same code as on
-the host and nothing touches the network. There is no signer here, so no
-contract can be approved and no worker can start.
+the host and nothing touches the network. A real signer answers on a
+socket, but it has no Linear key, so no Todo move can be approved and no
+worker can start.
 """
 
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
+from controller.approval import StaticKey
 from controller.attempts import events as ev
 from controller.dispatch.dispatch import FACTORY_ROUTINE
 from controller.intake.linear import LinearUnavailable
@@ -27,6 +33,7 @@ from controller.service import onboarding
 from controller.service import queue as q
 from controller.service.github_http import HttpGhRunner, as_bytes
 from controller.service.secrets import env_name
+from controller.signer import SignerServer
 from tests import linear_world
 from tests.linear_world import Resp, http_error
 from tests.test_intake_linear import _QUERY_NAMES, APPROVER, FACTORY_USER, PROJECT, TODO
@@ -44,11 +51,13 @@ DESCRIPTION = (
 
 
 class Later(datetime):
-    """The service's clock ten minutes on."""
+    """The service's clock ``ahead`` on."""
+
+    ahead = timedelta(minutes=10)
 
     @classmethod
     def now(cls, tz=None):
-        return datetime.now(tz) + timedelta(minutes=10)
+        return datetime.now(tz) + cls.ahead
 
 
 class LinearRouter:
@@ -73,7 +82,10 @@ class LinearRouter:
                 data = self.tickets(query, variables)
             elif "PrepareIssue" in query:
                 node = self.tickets.find(variables["id"])
-                data = {"issue": json.loads(json.dumps(node)) if node else None}
+                node = json.loads(json.dumps(node)) if node else None
+                if node is not None:
+                    node["attachments"] = {"nodes": [], "pageInfo": {"hasNextPage": False}}
+                data = {"issue": node}
             else:
                 data = self.comments(query, variables)
         except LinearDown:
@@ -113,7 +125,7 @@ class LiveCase(unittest.TestCase):
         env = {
             "HOME": str(self.home),
             "FACTORY_SECRETS_DIR": str(self.secrets),
-            "FACTORY_SIGNER_SOCKET": str(self.dir / "no-signer.sock"),
+            "FACTORY_SIGNER_SOCKET": str(self.dir / "signer.sock"),
         }
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
@@ -126,6 +138,7 @@ class LiveCase(unittest.TestCase):
                 env_name("routine-token"): "sk-ant-oat01-" + "LiveRoutineKey00" * 3,
             }
         )
+        self.start_signer()
         self.linear = LinearRouter()
         self.gh = GitHubOpener()
         for name, opener in (("linear_opener", self.linear), ("github_opener", self.gh)):
@@ -138,6 +151,23 @@ class LiveCase(unittest.TestCase):
         doc["projects"][0]["linear_project_id"] = PROJECT
         self.drafting = self.dir / "drafting.json"
         self.drafting.write_text(json.dumps(doc))
+
+    def start_signer(self):
+        """The signer as the start script runs it, without Todo-move approval."""
+        server = SignerServer(
+            StaticKey(b"k" * 32), self.dir / "signer.sock", allowed_uids={os.getuid()}
+        )
+        server.listen()
+        stop = threading.Event()
+        thread = threading.Thread(target=server.serve_forever, args=(stop.is_set,), daemon=True)
+        thread.start()
+
+        def shutdown():
+            stop.set()
+            thread.join(5)
+            server.close()
+
+        self.addCleanup(shutdown)
 
     def install(self, values):
         for f in self.secrets.glob("*") if self.secrets.exists() else ():
@@ -229,6 +259,43 @@ class LiveIntakeOffTests(LiveCase):
         self.assertEqual(list(self.view().items), [])
         self.assertTrue(all("FactoryViewer" in r for r in self.linear.requests))
 
+    def test_approver_changed_while_running_stops_posting_as_that_user(self):
+        """The onboarding file is read every round. If it comes to name the
+        factory's own Linear user as approver, intake stops and queued
+        messages are not posted with that user's key either."""
+        self.rolando_moves()
+        self.linear.comments.down = LinearDown("Linear answered HTTP 503")
+
+        def two_rounds(tick, interval, stop):
+            tick()  # the refusal is queued; Linear is down for comments
+            self.write_onboarding(approver_linear_user_id=FACTORY_USER)
+            self.linear.comments.down = None
+            Later.ahead = timedelta(minutes=30)  # past the retry wait
+            try:
+                tick()
+            finally:
+                Later.ahead = timedelta(minutes=10)
+            return 2
+
+        with (
+            mock.patch.object(service_main, "run_forever", two_rounds),
+            mock.patch("controller.service.service.datetime", Later),
+        ):
+            service_main.main(
+                [
+                    "run",
+                    "--live",
+                    "--onboarding",
+                    str(self.onboarding),
+                    "--drafting",
+                    str(self.drafting),
+                    "--approver-linear-id",
+                    APPROVER,
+                ]
+            )
+        self.assertEqual(self.linear.bodies(), [])
+        self.assertEqual(len(self.view().outbox), 1)
+
     def test_linear_down_records_nothing_and_catches_up(self):
         self.rolando_moves()
         self.linear.down = True
@@ -291,6 +358,22 @@ class NotStartedTests(LiveCase):
         with mock.patch.dict(os.environ, {"FACTORY_SIGNER_SOCKET": ""}):
             self.assertNotStarted()
 
+    def test_signer_socket_set_but_nothing_answers(self):
+        with mock.patch.dict(os.environ, {"FACTORY_SIGNER_SOCKET": str(self.dir / "gone.sock")}):
+            self.assertNotStarted()
+
+    def test_onboarding_without_intake_since(self):
+        doc = json.loads(self.onboarding.read_text())
+        del doc["intake_since"]
+        self.onboarding.write_text(json.dumps(doc))
+        self.assertNotStarted()
+
+    def test_onboarding_without_an_approver(self):
+        doc = json.loads(self.onboarding.read_text())
+        del doc["approver_linear_user_id"]
+        self.onboarding.write_text(json.dumps(doc))
+        self.assertNotStarted()
+
     def test_drafting_policy_without_the_onboarded_project(self):
         doc = json.loads(self.drafting.read_text())
         doc["projects"][0]["linear_project_id"] = "another-project"
@@ -322,6 +405,50 @@ class NotStartedTests(LiveCase):
         self.install({})
         self.once()
         self.assertFalse((self.home / ".software-factory" / "ledger.db").exists())
+
+
+class PackagedImageTests(unittest.TestCase):
+    """The service from the files the Dockerfile copies, and nothing else."""
+
+    def test_every_module_imports_from_the_image_layout(self):
+        with tempfile.TemporaryDirectory() as d:
+            app = Path(d) / "app"
+            app.mkdir()
+            for line in (ROOT / "deploy" / "fly" / "Dockerfile").read_text().splitlines():
+                parts = line.split()
+                if not parts or parts[0] != "COPY":
+                    continue
+                src, dest = [x for x in parts[1:] if not x.startswith("--")]
+                target = Path(d) / dest.lstrip("/")
+                if (ROOT / src).is_dir():
+                    shutil.copytree(
+                        ROOT / src, target, ignore=shutil.ignore_patterns("__pycache__")
+                    )
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(ROOT / src, target)
+            script = (
+                "import importlib, pkgutil\n"
+                "n = 0\n"
+                "for top in ('controller', 'verify'):\n"
+                "    pkg = importlib.import_module(top)\n"
+                "    for m in pkgutil.walk_packages(pkg.__path__, top + '.'):\n"
+                "        if not m.name.endswith('__main__'):\n"
+                "            importlib.import_module(m.name)\n"
+                "        n += 1\n"
+                "from controller.service import main\n"
+                "assert main.DRAFTING_POLICY.is_file(), main.DRAFTING_POLICY\n"
+                "print(n)\n"
+            )
+            out = subprocess.run(
+                [sys.executable, "-s", "-E", "-c", script],
+                cwd=app,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        self.assertGreater(int(out.stdout.strip()), 50)
 
 
 class ShippedFilesTests(unittest.TestCase):

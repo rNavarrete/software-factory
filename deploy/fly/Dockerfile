@@ -20,6 +20,7 @@ RUN useradd --system --no-create-home --shell /usr/sbin/nologin factory \
 
 WORKDIR /app
 COPY controller /app/controller
+COPY verify /app/verify
 COPY deploy/qualification /app/deploy/qualification
 COPY deploy/pilot /app/deploy/pilot
 COPY deploy/fly/entrypoint.sh /app/entrypoint.sh

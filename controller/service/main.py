@@ -44,9 +44,10 @@ fixtures. A real worker is fired only with ``--real-runtime``.
 
 Before its first round, a service that uses Linear checks what it needs and
 does not start without it: the ``linear-key`` and ``github-token`` secrets,
-the signer (it reads ticket text, so it must never hold the approval key),
-a drafting policy for every onboarded project, and the same approver as the
-onboarding file. Nothing is sent to Linear or GitHub by these checks.
+a signer that answers (the service reads ticket text, so it must never hold
+the approval key), an onboarding file that names the same approver and an
+``intake_since``, and a drafting policy for every onboarded project. Nothing
+is sent to Linear or GitHub by these checks.
 """
 
 from __future__ import annotations
@@ -236,17 +237,14 @@ def build(args: argparse.Namespace):
         start_key=start_key,
         backup=backup,
     )
+    forbidden = approvers(args, config_path)
     linear = None
     if "linear" in (args.source, args.preparer):
         from controller.intake.linear import HttpTransport
 
         # Reads only: Todo moves and ticket text. The reporter has its own.
-        # Each key value is checked before its first use: never Rolando's
-        # (ready_check made sure the onboarding file names the same user).
         linear = HttpTransport(
-            lambda: secrets.get("linear-key"),
-            linear_opener(),
-            forbidden_user=lambda: args.approver_linear_id,
+            lambda: secrets.get("linear-key"), linear_opener(), forbidden_user=forbidden
         )
     if args.source == "linear":
         from controller.intake import LinearSource, policy_from
@@ -283,7 +281,7 @@ def build(args: argparse.Namespace):
     integrations = Integrations(
         source=source,
         preparer=preparer,
-        reporter=_reporter(args, secrets),
+        reporter=_reporter(args, secrets, forbidden),
         reviewer=fixtures.RecordingReviewer(),
         repair=fixtures.NoRepair(),
         authorizer=_authorizer(socket_path) if args.source == "linear" else None,
@@ -303,6 +301,31 @@ def build(args: argparse.Namespace):
     return service, store
 
 
+def approvers(args: argparse.Namespace, config_path: Path) -> Callable[[], frozenset[str]]:
+    """The Linear users the factory's key must never act as, asked again
+    before every request: ``--approver-linear-id`` (Rolando), and whoever the
+    onboarding file names as approver now or named earlier in this run. So
+    a changed approver applies to keys already checked, and a file that
+    can't be read never lifts a restriction."""
+    from controller.dispatch.dispatch import FACTORY_ROUTINE
+    from controller.recovery import PILOT_REPO
+    from controller.service import onboarding
+
+    seen = {args.approver_linear_id}
+
+    def current() -> frozenset[str]:
+        try:
+            config = onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
+        except (OSError, onboarding.OnboardingError):
+            pass
+        else:
+            if config.approver_linear_user_id:
+                seen.add(config.approver_linear_user_id)
+        return frozenset(seen)
+
+    return current
+
+
 def ready_check(args: argparse.Namespace, secrets, socket_path: str | None, config_path: Path):
     """Refuse to start a service that would fail every round. Reads only
     local files: nothing is sent to Linear or GitHub."""
@@ -318,21 +341,42 @@ def ready_check(args: argparse.Namespace, secrets, socket_path: str | None, conf
     secrets.get("linear-key")  # raises SecretMissing, which says which file
     if args.preparer == "linear":
         secrets.get("github-token")
-    if "linear" in (args.source, args.preparer) and not socket_path:
-        raise NotReady(
-            f"reading Linear tickets needs the signer ({SIGNER_SOCKET_ENV}): the process that"
-            " reads ticket text must never hold the approval key"
-        )
+    if "linear" in (args.source, args.preparer):
+        if not socket_path:
+            raise NotReady(
+                f"reading Linear tickets needs the signer ({SIGNER_SOCKET_ENV}): the process"
+                " that reads ticket text must never hold the approval key"
+            )
+        from controller.signer import SignerKey, SignerUnavailable
+
+        try:
+            _ = SignerKey(socket_path).key_id  # answers only if the signer is up
+        except SignerUnavailable as e:
+            raise NotReady(f"the signer at {socket_path} is not working: {e}") from None
     try:
         config = onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
     except (OSError, onboarding.OnboardingError) as e:
         raise NotReady(f"the onboarding file {config_path} is unusable: {e}") from None
     named = config.approver_linear_user_id
-    if named and named != args.approver_linear_id:
+    if not named:
+        raise NotReady(
+            f"the onboarding file {config_path} names no approver_linear_user_id, so the"
+            " factory can't tell whose moves count or whose identity it must never use"
+        )
+    if named != args.approver_linear_id:
         raise NotReady(
             "the onboarding file names a different approver than --approver-linear-id, so"
             " the reporter could post as the approver"
         )
+    if args.source == "linear":
+        from controller.intake import IntakeBlocked, policy_from
+
+        try:
+            policy_from(config)
+        except IntakeBlocked as e:
+            raise NotReady(
+                f"intake can't run with the onboarding file {config_path}: {e}"
+            ) from None
     if args.preparer == "linear":
         from controller.prepare import policy as drafting
 
@@ -483,7 +527,7 @@ ROLANDO_LINEAR_ID = "cd9ec650-f957-4f25-b5f0-9c14bcae49c8"
 """Rolando's Linear user. The factory never posts as this user."""
 
 
-def _reporter(args: argparse.Namespace, secrets):
+def _reporter(args: argparse.Namespace, secrets, forbidden: Callable[[], frozenset[str]]):
     from controller.service import fixtures
 
     if getattr(args, "reporter", "log") != "linear":
@@ -495,7 +539,7 @@ def _reporter(args: argparse.Namespace, secrets):
         HttpTransport(
             lambda: secrets.get("linear-key"),
             linear_opener(),
-            forbidden_user=args.approver_linear_id,
+            forbidden_user=forbidden,
         ),
         approver_id=args.approver_linear_id,
     )

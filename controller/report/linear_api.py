@@ -23,7 +23,7 @@ import http.client
 import json
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 from controller.ledger.redact import redact
 
@@ -89,7 +89,11 @@ class HttpTransport:
     value: before the first request made with a key it hasn't seen, the
     transport asks Linear who the key acts as, and refuses every request
     made with a key that acts as ``forbidden_user`` (Rolando) or as anyone
-    but ``expected_user``. A key swapped in later can't skip the check."""
+    but ``expected_user``. A key swapped in later can't skip the check.
+
+    ``forbidden_user`` may be a callable returning one id or several. It is
+    asked again on every request, so a change in who is forbidden (the
+    onboarding file names a new approver) applies to keys already checked."""
 
     def __init__(
         self,
@@ -97,7 +101,7 @@ class HttpTransport:
         opener: Callable[..., object] | None = None,
         *,
         agent: str = "software-factory-reporter",
-        forbidden_user: str | None = None,
+        forbidden_user: str | Callable[[], str | Iterable[str] | None] | None = None,
         expected_user: str | None = None,
     ) -> None:
         self._key = key
@@ -120,14 +124,13 @@ class HttpTransport:
 
     def _viewer(self, key: str) -> str:
         fp = hashlib.sha256(key.encode()).hexdigest()
-        known = self._viewers.get(fp)
-        if known is not None:
-            return known
-        viewer = self._post(key, VIEWER_QUERY, {}).get("viewer")
-        vid = str(viewer.get("id") or "") if isinstance(viewer, Mapping) else ""
+        vid = self._viewers.get(fp) or ""
         if not vid:
-            raise LinearDown("Linear did not say whose key this is", "IDENTITY")
-        if self._forbidden and vid == self._forbidden:
+            viewer = self._post(key, VIEWER_QUERY, {}).get("viewer")
+            vid = str(viewer.get("id") or "") if isinstance(viewer, Mapping) else ""
+            if not vid:
+                raise LinearDown("Linear did not say whose key this is", "IDENTITY")
+        if vid in self._forbidden_now():
             raise LinearDown(
                 "the factory's Linear key acts as Rolando, so anything it posted would look like"
                 " his. Nothing is sent until the factory has its own Linear identity.",
@@ -140,6 +143,12 @@ class HttpTransport:
             )
         self._viewers[fp] = vid
         return vid
+
+    def _forbidden_now(self) -> frozenset[str]:
+        f = self._forbidden() if callable(self._forbidden) else self._forbidden
+        if not f:
+            return frozenset()
+        return frozenset([f] if isinstance(f, str) else (x for x in f if x))
 
     def _post(self, key: str, query: str, variables: Mapping[str, object]) -> Mapping[str, object]:
         auth = key if key.startswith("lin_api_") else f"Bearer {key}"

@@ -40,7 +40,16 @@ For now, `HOME` is `/data/qualification`, so the qualification run's fake worker
 
 The pilot's onboarding file ships with `intake_enabled: false`, so the live service refuses every Todo move, says so on the ticket, and starts nothing until that file says otherwise.
 
-Before its first round, the live service checks what it needs. It does not start, and says why, if any of these is missing or wrong: the `linear-key` or `github-token` secret, the signer, a usable onboarding file whose approver matches the one the reporter must never post as, or a drafting policy for every onboarded project with the same base branch. These checks read only local files.
+Before its first round, the live service checks what it needs. It does not start, and says why, if any of these is missing or wrong:
+
+- the `linear-key` or `github-token` secret;
+- the signer, which must actually answer on its socket;
+- the onboarding file, which must be readable and name the approver (the same one as `--approver-linear-id`) and the time intake reads from;
+- the drafting policy, which needs an entry with the same base branch for every onboarded project.
+
+These checks ask only local files and the signer, never Linear or GitHub.
+
+While it runs, the factory's Linear key is checked before every request against everyone it must never act as: Rolando, and whoever the onboarding file has named as approver since the service started. If the file is changed to name another user, that user's key stops working for posting too, not just for intake.
 
 Switching it on belongs to the qualification run (ENG-163), after the factory has its own Linear login and the probe in `docs/reporting.md` has passed.
 
