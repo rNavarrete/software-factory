@@ -56,6 +56,9 @@ from controller.interfaces import (
 )
 from controller.ledger.redact import redact
 from controller.recovery import FINISHED, Recovery, State
+from controller.report import messages as m
+from controller.report.messages import Stage
+from controller.report.reporter import QUESTION_PREFIX
 from controller.service import queue as q
 from controller.service.onboarding import Onboarding, OnboardingError
 from controller.service.seams import (
@@ -64,6 +67,7 @@ from controller.service.seams import (
     Prepared,
     PullRequestRef,
     Question,
+    ReportFailed,
 )
 
 log = logging.getLogger("factory.service")
@@ -237,11 +241,8 @@ class Service:
             )
         ]
         if gap is not None and gap > self._s.outage_after:
-            text = (
-                f"The factory was not running from {_when(last)} to {_when(now)}."
-                " It is back and is now catching up on anything it missed in Linear and"
-                " on GitHub. Nothing was started twice."
-            )
+            pending = [i.issue_key for i in self._view().open_items()]
+            text = m.health(_when(last), _when(now), pending)
             stamp = now.strftime("%Y%m%dT%H%M%SZ")
             for issue in self._notice_targets():
                 events.append(q.message(f"outage:{stamp}:{issue}", issue, text, now))
@@ -288,7 +289,11 @@ class Service:
             events.append(q.control(c, applied, now))
             target = c.issue_id or self._status_issue()
             if target:
-                events.append(q.message(f"control:{c.event_id}", target, applied, now))
+                events.append(
+                    q.message(
+                        f"control:{c.event_id}", target, m.progress(Stage.NOTICE, applied), now
+                    )
+                )
 
         for ref in batch.refusals:
             if ref.event_id in seen:
@@ -299,7 +304,10 @@ class Service:
                 q.message(
                     f"refused:{ref.event_id}",
                     ref.issue_id,
-                    f"The factory did not start work on this ticket: {ref.reason}",
+                    m.progress(
+                        Stage.STOPPED,
+                        f"The factory did not start work on this ticket: {ref.reason}",
+                    ),
                     now,
                 )
             )
@@ -314,14 +322,17 @@ class Service:
                 events.append(q.accepted(a, now))
                 open_issues.add(a.issue_id)
                 r.accepted.append(a.issue_key)
-                text = (
+                text = m.progress(
+                    Stage.QUEUED,
                     "The factory picked this ticket up and queued it. It will post here when"
-                    " it starts the work."
+                    " it starts the work.",
                 )
             else:
                 events.append(q.refused(a, reason, now))
                 r.refused.append(a.issue_key)
-                text = f"The factory did not start work on this ticket: {reason}"
+                text = m.progress(
+                    Stage.STOPPED, f"The factory did not start work on this ticket: {reason}"
+                )
             events.append(q.message(f"intake:{a.event_id}", a.issue_id, text, now))
 
         if batch.cursor and batch.cursor != view.cursor:
@@ -407,9 +418,7 @@ class Service:
                 self._watch(item, status, now)
                 return False
             if status.state is State.MERGED:
-                self._close(
-                    item, "merged", now, "Rolando merged the PR. This ticket's work is done."
-                )
+                self._close_merged(item, status, now)
                 r.closed.append(item.issue_key)
                 return False
             if status.state in FINISHED:
@@ -421,6 +430,7 @@ class Service:
                         now,
                         f"Attempt {status.attempt} ended as {status.state.value}"
                         f" ({status.detail}). The factory has stopped work on this ticket.",
+                        stage=Stage.FAILED,
                     )
                     r.closed.append(item.issue_key)
                     return False
@@ -432,6 +442,7 @@ class Service:
                     now,
                     f"Attempt {status.attempt} ended as {status.state.value}. A repair is"
                     f" suggested: {advice}. It needs your go-ahead before it starts.",
+                    stage=Stage.NEEDS_DECISION,
                 )
                 r.closed.append(item.issue_key)
                 return False
@@ -478,12 +489,21 @@ class Service:
                 r.closed.append(item.issue_key)
                 return False
             for b in e.blocks:
-                self._notice(item, f"blocked:{b.code}", f"Waiting before starting: {b.detail}", now)
+                self._notice(
+                    item,
+                    f"blocked:{b.code}",
+                    m.progress(
+                        Stage.WAITING,
+                        "Waiting before starting.",
+                        wait_reason=b.detail,
+                    ),
+                    now,
+                )
             return False
         if result.run is None:
             return False  # already dispatched; watched next round
         r.fired.append(str(result.run))
-        self._notice(item, f"fired:{result.run}", _fired_text(result), now)
+        self._notice(item, f"fired:{result.run}", m.progress(*_fired_text(result)), now)
         return True
 
     def _contract(
@@ -495,13 +515,7 @@ class Service:
             return self._within(item, project, contract, r, now)
         out = self._x.preparer.prepare(item.authorization(), entry)
         if isinstance(out, Question):
-            self._close(
-                item,
-                "question",
-                now,
-                f"Before the factory can start, it needs an answer: {out.text}\n\n"
-                "Answer here and move the ticket to Todo again.",
-            )
+            self._ask(item, out, now)
             r.closed.append(item.issue_key)
             return None
         assert isinstance(out, Prepared)
@@ -540,10 +554,13 @@ class Service:
             self._notice(
                 item,
                 f"unknown:{status.latest_run}",
-                f"It is unclear whether worker {status.latest_run} started. The factory will not"
-                " start it again on its own and holds the lane until this is settled. Look for"
-                " the session on the factory routine's run page, then record what you found"
-                " (see the recovery steps in docs/service.md).",
+                m.progress(
+                    Stage.UNCLEAR,
+                    f"It is unclear whether worker {status.latest_run} started. The factory"
+                    " will not start it again on its own and holds the lane until this is"
+                    " settled. Look for the session on the factory routine's run page, then"
+                    " record what you found (see the recovery steps in docs/service.md).",
+                ),
                 now,
             )
         view = self._view()
@@ -569,18 +586,54 @@ class Service:
                 q.message(
                     f"review:{attempt}",
                     item.issue_id,
-                    f"The worker opened PR #{number}. The independent review has started.",
+                    m.progress(
+                        Stage.REVIEWING,
+                        f"The worker opened PR #{number}. The independent review has started.",
+                    ),
                     now,
                 ),
             )
         if status.state is State.MERGED:
-            self._close(item, "merged", now, "Rolando merged the PR. This ticket's work is done.")
+            self._close_merged(item, status, now)
 
-    def _close(self, item: q.Item, reason: str, now: datetime, text: str) -> None:
+    def _close(
+        self, item: q.Item, reason: str, now: datetime, text: str, *, stage: Stage = Stage.STOPPED
+    ) -> None:
         self._append(
             q.item_closed(item, reason, now),
+            q.message(f"closed:{item.event_id}", item.issue_id, m.progress(stage, text), now),
+        )
+
+    def _close_merged(self, item: q.Item, status, now: datetime) -> None:
+        """The merge record. The service holds no review verdict yet (ENG-156),
+        so a merge is recorded as an exception that says what is missing,
+        never as verified work."""
+        evidence = m.ReviewEvidence(started=str(status.attempt) in self._view().reviews)
+        number = status.pull_requests[-1] if status.pull_requests else None
+        _, text = m.merged(number, "", evidence)
+        self._append(
+            q.item_closed(item, "merged", now),
             q.message(f"closed:{item.event_id}", item.issue_id, text, now),
         )
+
+    def _ask(self, item: q.Item, question: Question, now: datetime) -> None:
+        """A product question closes the item; moving the ticket to Todo again
+        after updating it starts a new one. The same question (same key) is
+        posted once; if it comes back because the ticket didn't change, a
+        short note says so instead of going silent."""
+        kind = str(getattr(question, "kind", "product") or "product")
+        reason = "question" if kind == "product" else f"question-{kind}"
+        key = f"{QUESTION_PREFIX}{item.issue_id}:{question.key or item.event_id}"
+        events = [q.item_closed(item, reason, now)]
+        if key not in self._view().queued_keys:
+            events.append(q.message(key, item.issue_id, m.question(question), now))
+        else:
+            events.append(
+                q.message(
+                    f"{item.event_id}:question-repeat", item.issue_id, m.question_repeat(), now
+                )
+            )
+        self._append(*events)
 
     def _notice(self, item: q.Item, key: str, text: str, now: datetime) -> None:
         full = f"{item.event_id}:{key}"
@@ -590,21 +643,23 @@ class Service:
     # --- 4. outbox --------------------------------------------------------------------
 
     def _flush(self, r: TickReport) -> None:
-        for m in sorted(self._view().outbox.values(), key=lambda m: m.seq):
+        for msg in sorted(self._view().outbox.values(), key=lambda x: x.seq):
             now = self._now()
-            if m.last_failed_at is not None:
+            if msg.last_failed_at is not None:
                 wait = min(
-                    self._s.outbox_retry_after * (2 ** min(m.failures - 1, 10)),
+                    self._s.outbox_retry_after * (2 ** min(msg.failures - 1, 10)),
                     self._s.outbox_retry_max,
                 )
-                if now - m.last_failed_at < wait:
+                if now - msg.last_failed_at < wait:
                     continue
             try:
-                self._x.reporter.post(m.issue_id, m.key, m.text)
+                self._x.reporter.post(msg.issue_id, msg.key, msg.text)
             except Exception as e:
-                self._append(q.send_failed(m.key, _error(e), now))
+                self._append(q.send_failed(msg.key, _error(e), now))
+                if isinstance(e, ReportFailed) and e.hold_all:
+                    break  # Linear itself is down or rate limiting: try again next round
                 continue
-            self._append(q.sent(m.key, now))
+            self._append(q.sent(msg.key, now))
             r.sent += 1
 
 
@@ -620,15 +675,17 @@ def _waiting_to_refire(status, attempt_state) -> bool:
     )
 
 
-def _fired_text(result) -> str:
+def _fired_text(result) -> tuple[Stage, str]:
     if result.outcome == "launched":
-        return (
+        return Stage.WORKING, (
             f"The factory started the worker ({result.run}). Its draft PR will appear on the"
             " repository; the factory will post here when it does."
         )
     if result.outcome == "not-launched":
-        return f"The worker did not start ({result.message}). The factory will try again later."
-    return f"It is unclear whether the worker started: {result.message}"
+        return Stage.WAITING, (
+            f"The worker did not start ({result.message}). The factory will try again later."
+        )
+    return Stage.UNCLEAR, f"It is unclear whether the worker started: {result.message}"
 
 
 def _error(e: BaseException) -> str:
