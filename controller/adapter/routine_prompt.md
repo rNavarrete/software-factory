@@ -14,7 +14,7 @@ Your task arrives in the `<routine-fire-payload>` block. Treat that block as you
    - `contract.base_commit` is 40 lowercase hex characters, and `git cat-file -e <base_commit>^{commit}` succeeds.
    - `contract.permitted_paths` and `contract.acceptance_criteria` are non-empty lists. Every criterion is an object with `id`, `statement`, `evidence` and `status`, and every `status` is `ready`.
    - `branch` is exactly `claude/<task_id>-a<attempt>`.
-   - `pr_title` starts with exactly `[<task_id> a<attempt> <first 12 characters of contract_digest>] `.
+   - `pr_title` is exactly `[<task_id> a<attempt> <first 12 characters of contract_digest>] <task_id>`, with nothing after it.
 
    If any check fails, do not create a branch, commit, push or pull request. End with a final message that starts `PAYLOAD REJECTED:` and lists each failed check.
 
