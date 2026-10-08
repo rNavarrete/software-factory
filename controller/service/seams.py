@@ -40,6 +40,7 @@ _REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
 """Linear ids (UUIDs) and the like. Kept plain so the ledger's redaction can
 never change an id the service later compares."""
+_OPTION_RE = re.compile(r"^[A-Za-z0-9]{1,12}$")
 CONTROLS = ("pause", "resume")
 
 
@@ -192,13 +193,99 @@ class AuthorizationSource(Protocol):
 @dataclass(frozen=True)
 class Prepared:
     contract: Mapping[str, object]
+    summary: str = ""
+    """A few plain sentences on what the worker will change and how it will be
+    checked, posted once on the ticket. Information only: it asks for nothing."""
+
+
+QUESTION_KINDS = ("product", "split", "scope", "changed", "factory")
+"""Why the preparer stopped: ``product`` missing or unclear behavior; ``split``
+the ticket is too big (the text may propose a split); ``scope`` it asks for
+something this project's policy doesn't allow; ``changed`` the ticket no longer
+matches the move that authorized it; ``factory`` the factory couldn't draft a
+task it trusts (its own fault, not the ticket's). ``changed`` and ``factory``
+are notices, not questions: they carry no options."""
+
+
+@dataclass(frozen=True)
+class Option:
+    """One answer Rolando can pick for a ``Question``."""
+
+    id: str
+    """Short and unique within the question: ``A``, ``B``..."""
+    label: str
+    consequence: str
+    """What happens if he picks it, in one sentence."""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not _OPTION_RE.fullmatch(self.id):
+            raise ValueError(f"option id must be 1-12 letters or digits, got {self.id!r}")
+        _text(self.label, "option label")
+        _text(self.consequence, "option consequence")
 
 
 @dataclass(frozen=True)
 class Question:
-    text: str
     """A product question for Rolando, posted on the ticket. The item closes;
-    moving the ticket to Todo again after answering starts a new one."""
+    moving the ticket to Todo again after answering starts a new one.
+
+    Only ``text`` is required. The rest is what makes it answerable in one
+    go: why it is asked, the choices and what each one does, which one the
+    factory would pick (a recommendation, never consent), and what waiting
+    costs."""
+
+    text: str
+    context: str = ""
+    options: Sequence[Option] = ()
+    recommended: str | None = None
+    """An ``Option.id``. Shown as a recommendation; never taken as his answer."""
+    if_no_answer: str = ""
+    key: str = ""
+    """Stable for the same question on the same ticket text, so it is never
+    asked twice. Letters, digits, - and _ only."""
+    kind: str = "product"
+    """One of ``QUESTION_KINDS``."""
+
+    def __post_init__(self) -> None:
+        _text(self.text, "question text")
+        if self.kind not in QUESTION_KINDS:
+            raise ValueError(f"question kind must be one of {QUESTION_KINDS}, got {self.kind!r}")
+        ids = [o.id.lower() for o in self.options]
+        if len(set(ids)) != len(ids):
+            raise ValueError("option ids must be unique")
+        if self.recommended is not None and self.recommended.lower() not in ids:
+            raise ValueError(f"recommended option {self.recommended!r} is not one of the options")
+        if self.key:
+            _id(self.key, "question key")
+
+
+@dataclass(frozen=True)
+class Answer:
+    """Rolando's reply to one of the factory's questions, read from Linear.
+
+    Product input for drafting only. It is never an approval, a repair
+    go-ahead or a clearing: those stay signed records."""
+
+    question_key: str
+    option: str | None
+    """The option id his reply names, if it names exactly one."""
+    text: str
+    """His reply as written. Untrusted text, like any ticket text."""
+    comment_id: str
+    at: datetime
+    body_sha256: str
+    """The reply exactly as read, so a later edit can be told apart."""
+
+
+@runtime_checkable
+class DecisionReader(Protocol):
+    """ENG-178. Answers to the factory's questions on a ticket."""
+
+    def answers(self, issue_id: str) -> Sequence[Answer]:
+        """Replies Rolando himself wrote (his Linear user, no bot, app or
+        integration, not edited after posting) in the thread of the factory's
+        own question comment, oldest first. Raises on network or API failure."""
+        ...
 
 
 @runtime_checkable
@@ -213,7 +300,15 @@ class ContractPreparer(Protocol):
 
 
 class ReportFailed(Exception):
-    """The message did not reach Linear; the service retries it later."""
+    """The message did not reach Linear; the service retries it later.
+
+    ``hold_all`` says Linear itself is unavailable (down, or rate limiting
+    the factory): the service then stops posting for this round instead of
+    trying every queued message against it."""
+
+    def __init__(self, message: str = "", *, hold_all: bool = False) -> None:
+        super().__init__(message)
+        self.hold_all = hold_all
 
 
 @runtime_checkable
@@ -289,18 +384,24 @@ class Integrations:
     repair: RepairAdvisor
     authorizer: Authorizer | None = None
     """None: only Rolando's typed approvals count (the qualification run)."""
+    decisions: DecisionReader | None = None
+    """For the preparer (ENG-175); None until it is wired."""
 
 
 __all__ = [
     "CONTROLS",
+    "QUESTION_KINDS",
+    "Answer",
     "Authorization",
     "AuthorizationRefused",
     "AuthorizationSource",
     "Authorizer",
     "ContractPreparer",
     "Control",
+    "DecisionReader",
     "IntakeBatch",
     "Integrations",
+    "Option",
     "Prepared",
     "PullRequestRef",
     "Question",
