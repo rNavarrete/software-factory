@@ -95,6 +95,9 @@ class LedgerView:
     repairs: set[AttemptId] = field(default_factory=set)
     refires: set[RunId] = field(default_factory=set)
     escalations: set[str] = field(default_factory=set)
+    failures: list[tuple[TaskId, str]] = field(default_factory=list)
+    """Recorded failures in ledger order: launch errors and, from repair
+    authorizations, the work failures Rolando named."""
 
     @classmethod
     def build(cls, stored: Sequence[StoredEvent]) -> LedgerView:
@@ -141,6 +144,14 @@ class LedgerView:
             self.all_fires[index] = new
             fires = self.attempts[e.run.attempt].fires
             fires[fires.index(old)] = new
+            if new.outcome is not LaunchOutcome.LAUNCHED:
+                self.failures.append(
+                    (
+                        e.run.attempt.task,
+                        f"{new.run}: launch {new.outcome.value}"
+                        f" (HTTP {new.http_status}, {new.reason or 'no reason'})",
+                    )
+                )
         elif e.kind == ev.ATTEMPT_CLEARED and e.attempt in self.attempts:
             basis = ev.ClearingBasis(d["basis"])
             evidence = d[ev.clearing_evidence_field(basis)]
@@ -149,6 +160,10 @@ class LedgerView:
         elif e.kind == ev.REPAIR_AUTHORIZED and e.attempt is not None:
             if e.attempt.number >= 2 and _text(d.get("failure")) and _text(d.get("by")):
                 self.repairs.add(e.attempt)
+                failed = AttemptId(e.attempt.task, e.attempt.number - 1)
+                self.failures.append(
+                    (e.attempt.task, f"{failed}: {d['failure']} (as named by {d['by']})")
+                )
         elif e.kind == ev.REFIRE_AUTHORIZED and e.run is not None:
             if _text(d.get("by")):
                 self.refires.add(e.run)
@@ -483,13 +498,8 @@ def escalation_data(
     """One escalation: prior attempts, current state, last error and next decision (G-C5)."""
     attempts = view.task_attempts(task) if task is not None else []
     if last_error is None:
-        last_error = "none recorded"
-        for state in reversed(attempts):
-            failed = [f for f in state.fires if f.outcome not in (None, LaunchOutcome.LAUNCHED)]
-            if failed:
-                f = failed[-1]
-                last_error = f"{f.run}: {f.outcome.value} (HTTP {f.http_status}) {f.reason}".strip()
-                break
+        recorded = [text for t, text in view.failures if t == task]
+        last_error = recorded[-1] if recorded else "none recorded"
     return {
         "dedup": dedup,
         "reason": reason,

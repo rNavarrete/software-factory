@@ -33,6 +33,7 @@ from controller.interfaces import (
     LedgerEvent,
     LedgerStore,
     RunId,
+    StoredEvent,
     TaskId,
 )
 
@@ -188,11 +189,14 @@ class AttemptGate:
                     seconds = min(max(result.retry_after_seconds, 0), _MAX_RETRY_AFTER)
                     wait = timedelta(seconds=seconds)
                 else:
-                    streak = view.trailing_rate_limits() + 1
-                    wait = min(
-                        self._limits.rate_limit_default_wait * 2 ** (streak - 1),
-                        self._limits.rate_limit_max_wait,
-                    )
+                    # Double once per earlier consecutive 429, capping at each
+                    # step so a long streak cannot overflow.
+                    wait = self._limits.rate_limit_default_wait
+                    for _ in range(view.trailing_rate_limits()):
+                        if wait >= self._limits.rate_limit_max_wait:
+                            break
+                        wait *= 2
+                    wait = min(wait, self._limits.rate_limit_max_wait)
                 new.append(
                     LedgerEvent(
                         ev.RATE_LIMIT_WAIT,
@@ -205,7 +209,13 @@ class AttemptGate:
                 and result.response_body
                 and _EXHAUSTED_RE.search(result.response_body)
             ):
-                new += self._exhausted(view, run, result, now)
+                # Describe the task as it stands once this result is recorded;
+                # everything is still appended in one transaction below.
+                last = stored[-1].seq if stored else 0
+                after = LedgerView.build(
+                    [*stored, *(StoredEvent(last + i + 1, e) for i, e in enumerate(new))]
+                )
+                new += self._exhausted(after, run, result, now)
             self._store.append(*new)
 
     def _exhausted(

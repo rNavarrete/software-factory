@@ -482,6 +482,56 @@ class AttemptGateTests(unittest.TestCase):
             waits.append(until - at)
         self.assertEqual(waits, [timedelta(minutes=m) for m in (15, 30, 60, 120, 120)])
 
+    def test_long_429_streak_is_still_recorded_and_capped(self):
+        for i in range(40):
+            at = NOW + timedelta(days=8 * i)
+            self.gate.record_snapshot(at, 0, 10, 0, at)
+            self.run_attempt(TaskId(f"r{i}"), not_launched(429), at=at)
+        self.assertEqual(len(self.kinds(ev.FIRE_RESULT)), 40)
+        last = self.kinds(ev.RATE_LIMIT_WAIT)[-1]
+        until = datetime.fromisoformat(last.data["not_before"])
+        self.assertEqual(until - last.at, timedelta(hours=2))
+
+    def test_escalation_names_the_latest_work_failure(self):
+        failures = {2: "CI red: test_filter fails", 3: "lint fails on main.ts"}
+        for number in (1, 2, 3):
+            if number > 1:
+                self.append(
+                    ev.repair_authorized(AttemptId(TASK, number), failures[number], "Rolando", NOW)
+                )
+            run = self.gate.reserve(TASK, DIGEST, NOW)
+            self.gate.record_launch(run, launched(number), NOW)
+            self.clear(TASK, number)
+        self.refused("attempt-cap")
+        last_error = self.kinds(ev.ESCALATION)[0].data["last_error"]
+        self.assertIn("pilot-1-a2", last_error)
+        self.assertIn("lint fails on main.ts", last_error)
+
+    def test_exhaustion_escalation_shows_the_result_just_received(self):
+        cases = (
+            (TASK, not_launched(400, body="usage limit"), "not-launched", 400),
+            (
+                OTHER,
+                LaunchResult(
+                    LaunchOutcome.OUTCOME_UNKNOWN, http_status=503, response_body="usage limit"
+                ),
+                "launch-outcome-unknown",
+                503,
+            ),
+        )
+        for task, result, state, status in cases:
+            self.run_attempt(task, result)
+            data = self.kinds(ev.ESCALATION)[-1].data
+            attempt = data["prior_attempts"][-1]
+            self.assertEqual(attempt["state"], state)
+            self.assertEqual(attempt["fires"][-1]["outcome"], state)
+            self.assertEqual(attempt["fires"][-1]["http_status"], status)
+            self.assertIn(state, data["current_state"])
+            self.gate.resume("window reset", NOW)
+            if state == "launch-outcome-unknown":
+                break
+            self.clear(task, 1)
+
     def test_exhaustion_text_sets_one_hold_and_one_escalation(self):
         self.run_attempt(TASK, not_launched(400, body="Weekly limit reached"))
         self.refused("hold", task=OTHER)
