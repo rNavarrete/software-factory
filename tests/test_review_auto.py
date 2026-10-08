@@ -1099,3 +1099,34 @@ class SupersededEvidenceTests(Base):
         self.assertIsNot(status.state, ReviewState.FAILED)
         self.assertEqual(status.for_repair(), ())
         self.assertTrue(status.for_rolando())
+
+
+class RepairAttemptTests(Base):
+    """A repair is a new attempt with its own PR, under the same contract."""
+
+    def test_the_repair_attempts_pr_gets_the_verification_pass(self):
+        w = World()
+        w.comments = [review_for(fx.HEAD, findings=[CODE_FINDING])]
+        r = self.reviewer(world=w, decisions=his_answers)
+        r.start(PR, "req-1")
+        first = r.check(ATTEMPT)
+        self.assertIs(first.state, ReviewState.FAILED)
+        code = first.for_repair()[0].id
+
+        a2 = AttemptId(ATTEMPT.task, 2)
+        with self.store.writer_lock():
+            self.store.append(aev.attempt_reserved(a2, fx.DIGEST, T0))
+        w2 = pushed(World(), fx.NEW_HEAD)
+        w2.comments = []
+        w2.pr["head"]["ref"] = a2.branch
+        w2.pr["title"] = w2.pr["title"].replace(" a1 ", " a2 ")
+        r2 = self.reviewer(world=w2, decisions=his_answers_for(fx.NEW_HEAD))
+        r2.start(PullRequestRef(a2, NUMBER), "req-2")
+        status = r2.check(a2)
+        self.assertIs(status.state, ReviewState.RUNNING, status.note)
+        job = json.loads(self.runtime.texts[-1])
+        self.assertEqual(job["pass"], "verify")
+        self.assertEqual([f["id"] for f in job["previous_findings"]], [code])
+        # The first attempt's PR, unchanged, starts nothing more.
+        self.assertIs(r.check(ATTEMPT).state, ReviewState.FAILED)
+        self.assertEqual(len(self.runtime.texts), 1)
