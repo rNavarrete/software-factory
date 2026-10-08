@@ -26,6 +26,9 @@ Todo intake (ENG-174) reads three more things from it:
   how baseline tasks that share a Linear project with factory tasks stay out
   of the factory: list the factory tasks in ``issues``, and label the
   baseline tickets too as a second guard.
+- per project, ``protected_paths``: paths a contract approved by a Todo move
+  alone may not touch (workflows, agent instructions, build config). Such a
+  change still needs Rolando's typed approval.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ from pathlib import Path
 
 from controller import contract as contracts
 from controller.attempts.limits import PILOT_LIMITS
+from controller.contract.contract import _path as _check_path
 
 FORMAT = "factory-onboarding/v1"
 _REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
@@ -56,6 +60,7 @@ _KEYS = {
     "status_issue_id",
     "issues",
     "skip_labels",
+    "protected_paths",
 }
 _ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-[1-9][0-9]*$")
 
@@ -81,6 +86,8 @@ class Project:
     """If set, only these ticket keys may start (ENG-174)."""
     skip_labels: frozenset[str] = frozenset()
     """Tickets with any of these labels never start (ENG-174)."""
+    protected_paths: frozenset[str] = frozenset()
+    """Paths a Todo move alone can't approve a change to (ENG-174)."""
 
     def as_mapping(self) -> Mapping[str, object]:
         return {
@@ -116,6 +123,31 @@ class Project:
         if not isinstance(budget, int) or budget > self.max_attempts:
             problems.append(f"attempt budget {budget!r} is over this project's {self.max_attempts}")
         return problems
+
+    def source_problems(self, contract: Mapping[str, object], task: str) -> list[str]:
+        """``contract_problems``, plus what a Todo move alone can't approve:
+        a permitted path that could reach a protected one."""
+        problems = self.contract_problems(contract, task)
+        if problems:
+            return problems
+        paths = contract.get("permitted_paths") or ()
+        touched = sorted(
+            str(p)
+            for p in paths  # type: ignore[union-attr]
+            if any(_may_overlap(str(p), q) for q in self.protected_paths)
+        )
+        if touched:
+            problems.append(
+                f"paths that may reach protected files need Rolando's typed approval: {touched}"
+            )
+        return problems
+
+
+def _may_overlap(path: str, protected: str) -> bool:
+    """Whether a path or glob could match a file under ``protected``, judged
+    by the text before any wildcard; errs towards yes."""
+    a, b = path.split("*", 1)[0], protected.split("*", 1)[0]
+    return a.startswith(b) or b.startswith(a)
 
 
 @dataclass(frozen=True)
@@ -229,6 +261,14 @@ def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
             if bad:
                 raise OnboardingError(f"{where}: not ticket keys: {bad}")
         skip = _strings(e["skip_labels"], f"{where}.skip_labels") if "skip_labels" in e else None
+        protected = None
+        if "protected_paths" in e:
+            protected = _strings(e["protected_paths"], f"{where}.protected_paths")
+            for q in protected:
+                errors = []
+                _check_path(errors, q.removesuffix("/"), f"{where}.protected_paths")
+                if errors:
+                    raise OnboardingError(errors[0])
         projects[pid] = Project(
             pid,
             name,
@@ -241,6 +281,7 @@ def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
             status,
             issues,
             skip or frozenset(),
+            protected or frozenset(),
         )
     return Onboarding(projects, hashlib.sha256(raw).hexdigest(), enabled, approver, since)
 

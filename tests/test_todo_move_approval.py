@@ -302,6 +302,40 @@ class AuthorizerTests(AuthorizerCase):
             )
         self.assertTrue(cm.exception.final)
 
+    def test_paths_that_may_reach_protected_files_are_refused(self):
+        self.config = intake_config(entry={"protected_paths": [".github/", "package.json"]})
+        eid = self.move()
+        for paths in (
+            [".github/workflows/ci.yml"],
+            [".github/**"],
+            ["src/books.ts", "package.json"],
+            ["**"],
+            ["*.json"],
+            ["package.json.bak"],
+        ):
+            with self.subTest(paths=paths):
+                e = self.refused(eid, contract=contract_for("ENG-187", permitted_paths=paths))
+                self.assertTrue(e.final)
+                self.assertIn("typed approval", e.reason)
+
+    def test_paths_clear_of_protected_files_are_signed(self):
+        self.config = intake_config(entry={"protected_paths": [".github/", "package.json"]})
+        contract = contract_for("ENG-187", permitted_paths=["src/books.ts", "tests/*.test.ts"])
+        self.assertEqual(
+            self.authorize(self.move(), contract=contract).data["digest"],
+            contracts.digest(contract).value,
+        )
+
+    def test_the_pilot_onboarding_protects_its_control_files(self):
+        raw = (Path(__file__).parents[1] / "deploy" / "pilot" / "onboarding.json").read_bytes()
+        from controller.dispatch.dispatch import FACTORY_ROUTINE
+        from controller.recovery import PILOT_REPO
+
+        pilot = onboarding.parse(raw, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
+        (project,) = pilot.projects.values()
+        for path in (".github/", ".claude/", "CLAUDE.md", "package.json", "tsconfig.json"):
+            self.assertIn(path, project.protected_paths)
+
     def test_contracts_outside_the_projects_limits_are_refused(self):
         self.config = intake_config(entry={"max_attempts": 2})
         eid = self.move()
@@ -474,6 +508,34 @@ class SourceAuthorizationApprovalTests(AuthorizerCase):
                 self.assertFalse(verdict.approved)
                 code = {"reject": "approval-rejected", "revoke": "approval-revoked"}[decision]
                 self.assertIn(code, self.codes(verdict))
+
+    def test_asking_the_signer_again_after_a_withdrawal_brings_nothing_back(self):
+        # A compromised service can call the signer itself; the signer would
+        # sign the same contract for the same move with a later time.
+        for decision in ("reject", "revoke"):
+            with self.subTest(decision):
+                self.store = MemoryLedger()
+                self.append(self.event)
+                desk = Approvals(self.store, KEY, confirm=yes, os_user="rolando")
+                later = NOW + timedelta(minutes=1)
+                if decision == "reject":
+                    desk.reject(self.contract, "not this", later)
+                else:
+                    desk.revoke(TaskId("eng-187"), contracts.digest(self.contract), "stop", later)
+                self.now = later + timedelta(minutes=1)
+                again = self.authorize(self.eid)
+                self.assertGreater(again.at, later)
+                self.append(again)
+                self.assertFalse(self.check(at=self.now).approved)
+                # Rolando's own typed approval still brings it back.
+                desk.approve(self.contract, self.now)
+                self.assertTrue(self.check(at=self.now).approved)
+
+    def test_a_withdrawal_of_another_contract_changes_nothing(self):
+        desk = Approvals(self.store, KEY, confirm=yes, os_user="rolando")
+        desk.reject(contract_for("ENG-187", attempt_budget=2), "not this", NOW)
+        self.append(self.event)
+        self.assertTrue(self.check().approved)
 
     def test_repairs_still_need_a_typed_go_ahead(self):
         self.append(self.event)

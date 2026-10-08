@@ -735,6 +735,10 @@ class Approvals:
                     approvals.append((item.seq, digest, decided, expires))
         return approvals, withdrawals, unsigned
 
+    @staticmethod
+    def _source_seqs(stored: Sequence[StoredEvent]) -> set[int]:
+        return {item.seq for item in stored if item.event.kind == SOURCE_AUTHORIZATION}
+
     def _source_ok(self, e: LedgerEvent) -> bool:
         """A signed Todo-move authorization counts only for this dispatcher's
         routine, for its own task, never for a single attempt or run."""
@@ -750,8 +754,14 @@ class Approvals:
         self, stored: Sequence[StoredEvent], task: TaskId, digest: ContractDigest, now: datetime
     ) -> Notice | None:
         approvals, withdrawals, unsigned = self._decisions(stored, task)
+        sources = self._source_seqs(stored)
 
         def withdrawn(seq: int, digest: str, decided: datetime) -> bool:
+            if seq in sources and digest in withdrawals:
+                # The signer can't see the ledger and would sign the same
+                # contract for the same move again: once Rolando rejected or
+                # revoked a contract, only his typed approval brings it back.
+                return True
             return any(
                 w_seq > seq or (w_at is not None and decided < w_at)
                 for w_seq, w_at, _ in withdrawals.get(digest, ())

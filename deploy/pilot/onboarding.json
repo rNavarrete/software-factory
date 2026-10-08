@@ -28,6 +28,15 @@
       ],
       "skip_labels": [
         "baseline"
+      ],
+      "protected_paths": [
+        ".github/",
+        ".claude/",
+        "CLAUDE.md",
+        "package.json",
+        "package-lock.json",
+        "tsconfig.json",
+        "vite.config.ts"
       ]
     }
   ]

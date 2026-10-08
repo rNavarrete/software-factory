@@ -94,6 +94,7 @@ def policy_sha256(onboarding: Onboarding, project_id: str) -> str:
         **p.as_mapping(),
         "issues": None if p.issues is None else sorted(p.issues),
         "skip_labels": sorted(p.skip_labels),
+        "protected_paths": sorted(p.protected_paths),
         "approver_linear_user_id": onboarding.approver_linear_user_id,
     }
     return hashlib.sha256(contracts.canonical_bytes(body)).hexdigest()
@@ -161,7 +162,7 @@ class TodoMoveAuthorizer:
         project = config.project(verdict.project_id)
         if project is None:
             raise Refused("the ticket's project is not onboarded", final=True)
-        problems = project.contract_problems(contract, verdict.task.value)
+        problems = project.source_problems(contract, verdict.task.value)
         if problems:
             raise Refused(
                 "the contract is outside the project's limits: " + "; ".join(problems), final=True

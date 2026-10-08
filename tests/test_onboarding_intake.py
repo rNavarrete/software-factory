@@ -84,11 +84,22 @@ class IntakeKeysTests(unittest.TestCase):
             "skip blank": config(entry={"skip_labels": [" "]}),
             "skip not text": config(entry={"skip_labels": [1]}),
             "skip empty": config(entry={"skip_labels": []}),
+            "protected text": config(entry={"protected_paths": ".github/"}),
+            "protected empty": config(entry={"protected_paths": []}),
+            "protected absolute": config(entry={"protected_paths": ["/etc"]}),
+            "protected parent": config(entry={"protected_paths": ["../x"]}),
+            "protected root": config(entry={"protected_paths": ["/"]}),
             "unknown top key": config(approver="x"),
         }
         for name, doc in bad.items():
             with self.subTest(name), self.assertRaises(onboarding.OnboardingError):
                 parse(doc)
+
+    def test_protected_paths_parse_and_are_hashed(self):
+        doc = config(entry={"protected_paths": [".github/", "CLAUDE.md"]})
+        (project,) = parse(doc).projects.values()
+        self.assertEqual(project.protected_paths, frozenset({".github/", "CLAUDE.md"}))
+        self.assertNotEqual(parse(doc).sha256, parse(config()).sha256)
 
     def test_null_values_mean_not_set(self):
         c = parse(config(approver_linear_user_id=None, intake_since=None))
