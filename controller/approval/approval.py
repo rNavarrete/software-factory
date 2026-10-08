@@ -310,6 +310,16 @@ def _payload(
     fields = {n: data[n] for n in names}
     if not all(v is None or isinstance(v, str) for v in fields.values()):
         return None
+    # Optional only for compatibility with old source records. Presence and
+    # value are signed: adding/removing it from a record invalidates the MAC.
+    # A legacy record never grants a repair allowance.
+    if kind == SOURCE_AUTHORIZATION and "repair_allowance" in data:
+        allowance = data["repair_allowance"]
+        binding = data.get("binding")
+        budget = binding.get("attempt_budget") if isinstance(binding, Mapping) else None
+        if type(allowance) is not int or type(budget) is not int or not 0 <= allowance < budget:
+            return None
+        fields["repair_allowance"] = allowance
     body = {
         "kind": kind,
         "task": None if task is None else str(task),
