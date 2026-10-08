@@ -3,7 +3,7 @@
 This offline probe carries a fictional Linear ticket, project brief, Notion response,
 repository notes and annotated PNG through the factory's existing task envelope.
 It needs no account, credential, network connection or user-provided example.
-It does not launch a worker or enable context capture in production.
+It does not launch a worker or enable network source capture in the service.
 
 Run from the repository root, choosing an output directory that does not exist:
 
@@ -12,7 +12,8 @@ python3 -m tools.context_fixture --out /tmp/eng199-context-proof
 python3 -m unittest tests.test_context_fixture -v
 ```
 
-The output contains `fire-text.json`, recovered source files and `report.json`.
+The output contains `fire-text.json`, recovered source files, `report.json` and a
+private retained source snapshot under `sources/`, created by the capture module.
 The report distinguishes a successful local byte round trip from hosted-worker and
 reviewer image inspection, which remain `not_run`. The contract deliberately uses
 an all-zero base commit; it is a transport specimen, not a dispatchable task.
@@ -29,16 +30,19 @@ Executable tests cover exact binary round trips, modification after authorizatio
 missing chunks, unsafe filenames, oversized payload rejection and honest reporting
 of which checks actually ran. The fixture answer key is excluded from the packet.
 
-This proves neither source permissions nor Notion retrieval, completeness, conflict
-resolution, prompt-injection resistance, image readability by a model or reviewer
-context delivery. No production module uses this probe. Hashing verifies bytes;
+The transport probe proves neither source permissions nor live Notion retrieval,
+conflict resolution, prompt-injection resistance, image readability by a model or
+reviewer context delivery. No production module uses this probe. Hashing verifies bytes;
 it does not establish that anyone understood their contents.
 
 ## Scenario fixtures for the remaining implementation
 
-`tests/fixtures/context/cases.json` describes expected future behavior. These are
+`tests/fixtures/context/cases.json` describes expected end-to-end behavior. These are
 test vectors, **not passing end-to-end tests**. Only the complete scenario is packed
-by the offline probe; the other responses are inputs for subsequent integration tests.
+by the offline probe. `tests/test_context_capture.py` now exercises source retention,
+missing required/optional content, changed content and incomplete responses at the
+capture boundary. Contradiction resolution, visual inspection and dispatch holds
+based on changed external sources remain unimplemented.
 
 | Scenario | Expected behavior when context capture is implemented |
 | --- | --- |
@@ -75,10 +79,11 @@ pixels. Record the session and evidence. Independently verify that a reviewer ca
 consume the same captured context. A session link, successful launch or correct
 local hash is not a substitute for either proof. No live launch is part of this PR.
 
-ENG-199 remains open for source acquisition, retained source/version manifests,
-preparation and authorization integration, worker/reviewer delivery, executable
-scenario checks and hosted qualification. This probe introduces no new credentials
-or storage service and makes no production transport commitment.
+ENG-199 remains open for production source acquisition, preparation and authorization
+integration, worker/reviewer delivery, remaining scenario checks and hosted
+qualification. The capture module and Notion reader are described in
+[Captured product context](captured-context.md). This probe introduces no new
+credentials or storage service and makes no production transport commitment.
 
 ## References
 

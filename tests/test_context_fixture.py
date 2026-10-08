@@ -80,6 +80,13 @@ class ContextFixtureTests(unittest.TestCase):
             self.assertEqual(report["local_byte_round_trip"], "passed")
             self.assertEqual(report["hosted_visual_inspection"], "not_run")
             self.assertEqual(report["reviewer_visual_inspection"], "not_run")
+            captured = json.loads((out / "sources" / report["source_snapshot"]).read_bytes())
+            self.assertFalse(captured["ready_for_dispatch"])
+            self.assertEqual(len(captured["sources"]), 4)
+            self.assertEqual(
+                {s["key"]: s["problem"] for s in captured["sources"]},
+                {"project": None, "notion": None, "repository": None, "design": None},
+            )
             original = ROOT / "tests/fixtures/context/design.png"
             self.assertEqual((out / "recovered/design.png").read_bytes(), original.read_bytes())
             capsule = json.loads((out / "fire-text.json").read_text())

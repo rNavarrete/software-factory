@@ -12,11 +12,13 @@ import base64
 import hashlib
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 from controller import contract as contracts
 from controller.adapter.routine import build_fire_text, envelope_errors
 from controller.interfaces import AttemptId, ContractDigest, TaskId
+from controller.prepare.context import Content, Source, capture
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "context"
@@ -148,12 +150,32 @@ def main() -> None:
     (args.out / "recovered").mkdir()
     for name, data in recovered.items():
         (args.out / "recovered" / name).write_bytes(data)
+    page_id = json.loads(files["notion-ready.json"])["id"]
+    refs = (
+        Source(
+            "project", "project", "synthetic-reading-room", "https://linear.app/example/project/p"
+        ),
+        Source("notion", "notion", page_id, f"https://www.notion.so/{page_id}"),
+        Source("repository", "repository", "synthetic-repo", "https://github.com/example/repo"),
+        Source("design", "image", "synthetic-design", "https://assets.example.test/design.png"),
+    )
+    contents = {
+        "project": Content(files["project.md"], "text/markdown"),
+        "notion": Content(files["notion-ready.json"], "application/json"),
+        "repository": Content(files["repository.md"], "text/markdown"),
+        "design": Content(files["design.png"], "image/png"),
+    }
+    captured = capture(refs, lambda source: contents[source.key], datetime.now(UTC))
+    if captured.problems:
+        raise ValueError("; ".join(captured.problems))
+    snapshot_path = captured.save(args.out / "sources")
     (args.out / "fire-text.json").write_text(text, encoding="utf-8")
     report = {
         "local_byte_round_trip": "passed",
         "hosted_visual_inspection": "not_run",
         "reviewer_visual_inspection": "not_run",
         "fires": 0,
+        "source_snapshot": snapshot_path.name,
         "fire_text_characters": len(text),
         "files": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()},
     }
