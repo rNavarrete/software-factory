@@ -115,6 +115,7 @@ class GitHubOpener:
         return Resp(json.dumps(answer).encode())
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "SO_PEERCRED is Linux only")
 class LiveCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

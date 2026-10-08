@@ -1055,17 +1055,21 @@ class Service:
 
     def _close_merged(self, item: q.Item, status, now: datetime) -> None:
         """The merge record. It counts as verified work only when the
-        independent review passed on exactly the PR's last commit; otherwise
-        it is recorded as an exception that says what is missing."""
+        independent review still applies to the merged PR, including its
+        destination and contract markers; otherwise it is an exception."""
         attempt = status.attempt
         started = str(attempt) in self._view().reviews
         evidence = m.ReviewEvidence(started=started)
         head = ""
-        recorded = getattr(self._x.reviewer, "evidence", None)
+        check = getattr(self._x.reviewer, "check", None)
         last = getattr(self._x.reviewer, "merged_head", None)
-        if started and recorded is not None and last is not None:
+        if started and check is not None and last is not None:
             try:
-                verdict = recorded(attempt)
+                # MERGED bypasses _watch, so its saved pass may predate a
+                # retarget, changed base or removed contract marker. The
+                # reviewer preserves a merged verdict only if it still fits.
+                # An unreadable check must never fall back to the saved pass.
+                verdict = check(attempt)
                 head = last(attempt)
             except Exception as e:  # recorded as an exception rather than not at all
                 log.warning("%s: review evidence: %s", item.issue_key, _error(e))
