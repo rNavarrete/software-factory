@@ -30,6 +30,10 @@ not built yet, so for now the service runs with the fixtures in a folder:
 ``events.json`` (Todo moves, refusals, pause/resume) and one contract per
 ticket in ``contracts/<ISSUE-KEY>.json``. With ``--fake-runtime`` (the
 default with fixtures) no real worker is fired.
+
+``--reporter linear`` posts the service's messages on the Linear tickets
+(ENG-178) with the ``linear-key`` secret, as the factory's own Linear user.
+The default, ``log``, writes them to the service log instead.
 """
 
 from __future__ import annotations
@@ -219,7 +223,7 @@ def build(args: argparse.Namespace):
     integrations = Integrations(
         source=source,
         preparer=fixtures.FixturePreparer(contracts_by_issue),
-        reporter=fixtures.LogReporter(),
+        reporter=_reporter(args, secrets),
         reviewer=fixtures.RecordingReviewer(),
         repair=fixtures.NoRepair(),
         authorizer=_authorizer(socket_path) if args.source == "linear" else None,
@@ -364,6 +368,24 @@ def status(root: Path) -> int:
     return 0
 
 
+ROLANDO_LINEAR_ID = "cd9ec650-f957-4f25-b5f0-9c14bcae49c8"
+"""Rolando's Linear user. The factory never posts as this user."""
+
+
+def _reporter(args: argparse.Namespace, secrets):
+    from controller.service import fixtures
+
+    if getattr(args, "reporter", "log") != "linear":
+        return fixtures.LogReporter()
+    from controller.report.linear_api import HttpTransport
+    from controller.report.reporter import LinearReporter
+
+    return LinearReporter(
+        HttpTransport(lambda: secrets.get("linear-key"), forbidden_user=args.approver_linear_id),
+        approver_id=args.approver_linear_id,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python3 -m controller.service")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -373,6 +395,8 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--real-runtime", dest="fake_runtime", action="store_false")
         s.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
         s.add_argument("--onboarding", help="mapping file (default: onboarding.json in the home)")
+        s.add_argument("--reporter", choices=("log", "linear"), default="log")
+        s.add_argument("--approver-linear-id", default=ROLANDO_LINEAR_ID)
         s.add_argument("--source", choices=("fixtures", "linear"), default="fixtures")
         s.add_argument("--user", help="become this user before starting (on the host)")
     sub.add_parser("status")
