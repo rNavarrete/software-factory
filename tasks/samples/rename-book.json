@@ -1,0 +1,33 @@
+{
+  "format": "factory-contract/v1",
+  "task_id": "rename-book",
+  "version": "1",
+  "goal": "Add the domain function for correcting a book's title or author, so a later task can put an Edit button on the page. No page change in this task.",
+  "inputs": [
+    "src/books.ts holds the pure domain functions; new logic goes there with unit tests in tests/books.test.ts.",
+    "Follow addBook's rule for a missing title or author: throw an Error. Do not trim or otherwise change the text."
+  ],
+  "repository": "rNavarrete/factory-pilot-demo",
+  "base_commit": "6c6badb8f086b7c4a3eaf3ba43317854e87e9b96",
+  "permitted_paths": ["src/books.ts", "tests/books.test.ts"],
+  "permitted_actions": ["modify-files", "add-tests"],
+  "risk_markers": [],
+  "acceptance_criteria": [
+    {
+      "id": "ac1",
+      "statement": "renameBook(books, id, title, author) returns a new array in which only the book with that id has the given title and author; every other field and every other book is unchanged, and the input array and its books are not modified.",
+      "evidence": {"type": "automated-check", "command": "npm test"},
+      "status": "ready"
+    },
+    {
+      "id": "ac2",
+      "statement": "renameBook throws an Error when the title or the author is empty, and when no book has that id.",
+      "evidence": {"type": "automated-check", "command": "npm test"},
+      "status": "ready"
+    }
+  ],
+  "verification_commands": ["npm run typecheck", "npm test", "npm run build"],
+  "attempt_budget": 2,
+  "escalate_to": "rNavarrete",
+  "depends_on": []
+}
