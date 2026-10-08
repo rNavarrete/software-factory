@@ -2,9 +2,10 @@
 
 - Linear: [ENG-138](https://linear.app/rolando-projects/issue/ENG-138/define-enforceable-attempt-limits-and-honest-usage-metrics)
 - Status: **Accepted** (Rolando approved as written 2026-10-08, see sign-off record)
-- Bounded by: [ADR 0001](adr/0001-operating-model.md) (accepted), [ADR 0003](adr/0003-pilot-and-value-thresholds.md) (accepted), [governance map](governance-map.md) (accepted). Uses the runtime facts in [ADR 0002](adr/0002-runtime-controller-identity.md) (still Proposed; section 10 says what to re-check if it changes).
+- Bounded by: [ADR 0001](adr/0001-operating-model.md) (accepted), [ADR 0003](adr/0003-pilot-and-value-thresholds.md) (accepted), [governance map](governance-map.md) (accepted). Uses the runtime facts in [ADR 0002](adr/0002-runtime-controller-identity.md) (still Proposed; section 10 says what to re-check if it changes). *Superseded: ADR 0002's architecture was accepted 2026-10-08 01:31Z.*
 - Moves to `docs/limits.md` in the factory repo once ENG-185 creates it (implementation plan section 4).
 - Built by: ENG-146 (caps, threshold blocks, hold), ENG-147 (ledger), ENG-176 (dispatch path), ENG-182 (fire adapter). ENG-183 buys the factory plan and supplies the evidence that the overage setting is applied; **this document records the overage decision** (governance map G-C11). Used by ENG-162.
+- Amended 2026-10-08 (Linear-first, [ADR 0001 section 12](adr/0001-operating-model.md#12-authorization-policy-v2-2026-10-08-todo-move-as-approval)): every number below still holds. Notes marked *Note 2026-10-08* say where the way a limit is used changed. The controller now runs on Fly.io, so `factory …` commands run as `/app/factory …` over `fly ssh console` ([service.md](service.md)).
 - Review: drafted, then checked by a separate critic agent against ADR 0001-0003 and the governance map; its 20 findings are fixed in this version.
 
 ## 1. What this sets, in plain terms
@@ -30,11 +31,11 @@ No public API cancels a running cloud session. The UI offers archive and delete,
 
 | Limit | Value | Class | How it works | Governance ID |
 |---|---|---|---|---|
-| **Attempts per task** | **3 total, including the first** | Code + Human gate | An attempt is reserved in the ledger, in the same transaction as the dispatch intent, **before** the fire call. Every reserved attempt counts, whether or not it reaches a branch or PR. Attempts 2 and 3 each need Rolando's repair authorization naming the failure and attempt number. A fourth attempt is an exception: a fresh contract approval with a new budget (ADR 0001 §4) | G-C1, G-C2, G-A3, G-C5 |
+| **Attempts per task** | **3 total, including the first** | Code + Human gate | An attempt is reserved in the ledger, in the same transaction as the dispatch intent, **before** the fire call. Every reserved attempt counts, whether or not it reaches a branch or PR. Attempts 2 and 3 each need Rolando's repair authorization naming the failure and attempt number. A fourth attempt is an exception: a fresh contract approval with a new budget (ADR 0001 §4). *Note 2026-10-08: a repair may instead use the signer's go-ahead within the Todo move's `repair_allowance`, which counts inside this cap, never on top of it. An onboarding entry's `max_attempts` can be lower than 3 ([repair.md](repair.md))* | G-C1, G-C2, G-A3, G-C5 |
 | **Fires per attempt** | **2** (the original fire plus one re-fire) | Code + Human gate | A re-fire is allowed only after a *definite* `not-launched` result (400, 401, 403, 404, 429; ADR 0002 §6), only with Rolando's re-fire decision record naming the prior fire, and keeps the same attempt number because no session was created. Such a re-fire does not consume the approval (G-A6) and is not a repeated trigger (G-D6). G-D6 still applies to `launched` and `launch-outcome-unknown`. A `launch-outcome-unknown` fire is **never** re-fired; it holds the lock until Rolando reconciles (G-D5). If the second fire is also `not-launched`, the attempt ends as `not-launched`, and going on needs a new attempt (repair authorization, G-C2) | Proposed G-C12 |
 | **Fires per task** | **6** (3 attempts × 2 fires) | Code | A task cannot use more fires than its attempts allow. Reaching the cap escalates once (as G-C5) | Proposed G-C12 |
-| **Fires per rolling 7 days** (whole factory) | **12** | Code | Counted from timestamped fire rows in the ledger. Every fire counts, including re-fires, `launch-outcome-unknown` fires, and qualification or test fires made through the factory routine (ADR 0002 Appendix A, ENG-145, ENG-158, ENG-163). 12 fits the 4 factory-arm pilot tasks at 3 attempts each **with no re-fires**; reaching it blocks dispatch until the window rolls or Rolando records a raised cap. The platform's own caps (30 fires/hour per routine, 100 API fires/hour per account) are far above this | Proposed G-C13 (a G-C8 threshold) |
-| **Active attempts at once** | **1** | Code | Single-writer lock (ADR 0001 §7). No new attempt while a prior one is running, unresolved or `launch-outcome-unknown` | G-D4, G-D5 |
+| **Fires per rolling 7 days** (whole factory) | **12** | Code | Counted from timestamped fire rows in the ledger. Every fire counts, including re-fires, `launch-outcome-unknown` fires, and qualification or test fires made through the factory routine (ADR 0002 Appendix A, ENG-145, ENG-158, ENG-163). 12 fits the 4 factory-arm pilot tasks at 3 attempts each **with no re-fires**; reaching it blocks dispatch until the window rolls or Rolando records a raised cap. The platform's own caps (30 fires/hour per routine, 100 API fires/hour per account) are far above this. *Note 2026-10-08: each Codex review run also counts against these 12 ([review.md](review.md))* | Proposed G-C13 (a G-C8 threshold) |
+| **Active attempts at once** | **1** | Code | Single-writer lock (ADR 0001 §7). No new attempt while a prior one is running, unresolved or `launch-outcome-unknown`. *Note 2026-10-08: still 1. A two-job worker pool (ENG-154) is an approved target, not enabled* | G-D4, G-D5 |
 | **Hold** | On or off | Code + Human gate | `factory hold <reason>` writes a hold record and every dispatch refuses while it is set. Only `factory resume` with Rolando's note clears it. The controller sets a hold automatically only for subscription exhaustion (§5). Rolando sets it by hand for the upkeep cap (§4) or anything else | Proposed G-C14 (implements G-C7) |
 | **Run wall time** | Alert at **45 min**; **90 min** marks the run overdue | Advisory | Compared with the fire time whenever `factory status` or `factory reconcile` runs. No daemon polls, and it cannot stop the run. An overdue run still holds the lock, so nothing new starts | G-C9 |
 
@@ -49,7 +50,7 @@ CI re-runs, extra CI jobs and review comments are **not** attempts. Attempts are
 | Worker runs | 12 fires per rolling 7 days (above) | Code |
 | Plan usage | Dispatch refuses unless the latest usage snapshot is at most 7 days old and shows the weekly usage bar under 75% (§4) | Code on the recorded snapshot; the reading is human |
 | Subscription money | One fixed plan price per month, usage credits **off**, so variable spend is $0 (§6) | Platform |
-| Infrastructure money | $0 expected (public repo, so GitHub Actions and Pages are free; no separate cloud VM charge) | Advisory, checked monthly against invoices |
+| Infrastructure money | $0 expected (public repo, so GitHub Actions and Pages are free; no separate cloud VM charge) | Advisory, checked monthly against invoices. *Superseded 2026-10-08: the Fly.io service costs about $2.10 a month ([service.md](service.md)), and Codex reviews are billed per use on OpenAI's API, not yet measured ([review.md](review.md))* |
 | Rolando's upkeep time | 2 active hours/week during the pilot (ADR 0001 §8; no second number set here) | Human gate |
 
 ### Requested governance-map amendment
@@ -114,6 +115,8 @@ Prices and plan facts checked 2026-10-07; ENG-183 confirms them at purchase.
 
 **Expected extra spend: $20/month, all of it fixed.**
 
+*Superseded 2026-10-08:* add about $2.10 a month for the Fly.io service ([service.md](service.md)) and the Codex review's OpenAI API spend, which is per use and is measured at the first qualification run ([review.md](review.md)). Its cap is the separate OpenAI project's monthly budget that Rolando sets.
+
 ## 7. Honest usage metrics
 
 Every number the factory reports carries one of four labels. ENG-147 stores the label with the value, and ENG-162 prints it.
@@ -135,6 +138,7 @@ Rules:
 ## 8. Persistence
 
 - All counters, fire rows, holds, escalations, the factory-wide `retry_not_before` and snapshots live in the controller's SQLite ledger at `~/.software-factory` on Rolando's workstation, outside every checkout (ADR 0002). The worker has no path or credential to it (G-D2).
+  *Superseded 2026-10-08:* the ledger now lives under `$HOME/.software-factory/` on the Fly.io service's volume, with daily snapshots ([service.md](service.md)). The worker still has no path or credential to it.
 - Counts are derived from ledger rows every time, never held in memory, so a restart cannot reset them. G-C3 is the test: after 2 attempts, kill and restart the controller, ask for 2 more; only 1 is allowed and there is still one escalation. G-C13 repeats this for the weekly fire cap.
 - An attempt is counted when it is reserved, before the fire call. Work that never reaches a branch or PR still uses its attempt and its fire (G-C1).
 
@@ -180,3 +184,4 @@ Sign-off applies to this file as it stands at the version below; any later edit 
   3. Allowances: 3 attempts per task, 2 fires per attempt, 6 per task, 12 fires per rolling 7 days, 75% plan-usage stop with a snapshot at most 7 days old, 45-minute advisory run-time alert, pilot dispatch pauses at the 2 h/week upkeep cap.
 - Open follow-up: governance-map amendment G-C12..G-C14 (section 3) handed to the coordinator; the map is unchanged until its owner applies it.
 - Rolando's active time on ENG-138: about 3 minutes (reading the summary and one decision).
+- Post-sign-off notes (2026-10-08, Linear-first): the notes marked *Note 2026-10-08* or *Superseded* record where the limits now run and what now counts against them. No number changed. The version hash above covers the file before them.

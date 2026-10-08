@@ -4,6 +4,7 @@
 - Date: 2026-10-07
 - Linear: [ENG-134](https://linear.app/rolando-projects/issue/ENG-134/define-the-personal-factory-operating-model-and-human-authority)
 - Decider: Rolando Navarrete (sole owner and approver)
+- Amended: 2026-10-08 by Rolando's "Linear-first" decision, recorded in [section 12](#12-authorization-policy-v2-2026-10-08-todo-move-as-approval). Notes marked *Superseded 2026-10-08* say what changed. The signed text is kept as it was.
 - Moves to `docs/adr/0001-operating-model.md` in the factory repo once ENG-185 creates it.
 
 ## 1. Context
@@ -30,16 +31,17 @@ Humans own intent, approved scope, exceptions and release; Rolando performs ever
 
 | Area | Decision owner | Who does the work | Required evidence before the step counts as done | Enforced by |
 |---|---|---|---|---|
-| **Scope** (what to build) | Rolando | Rolando writes the contract (agents may help draft; Rolando's approval makes it real) | Approval record: Rolando's identity, timestamp, canonical contract digest and version, repository, base commit, permitted scope, attempt budget | Controller refuses dispatch without a matching, unexpired, unrevoked approval (ENG-144, ENG-151) |
+| **Scope** (what to build) | Rolando | Rolando writes the contract (agents may help draft; Rolando's approval makes it real) | Approval record: Rolando's identity, timestamp, canonical contract digest and version, repository, base commit, permitted scope, attempt budget | Controller refuses dispatch without a matching, unexpired, unrevoked approval (ENG-144, ENG-151). *Superseded 2026-10-08 in part: Rolando's own Todo move on a listed ticket can be this approval, signed by the signer process as a `source-authorization` record (section 12, [intake.md](../intake.md))* |
 | **Execution** (making the change) | Controller (mechanically, within the approval) | Worker | Ledger record written *before* firing: task, contract digest, run, attempt number, dispatch intent; then outcome or `launch-outcome-unknown`, session URL, base and candidate commit, PR link | Controller ledger outside the worker's checkout; attempt cap; single-writer lock (ENG-146, ENG-147, ENG-153, ENG-176) |
 | **Verification** (is it right) | Rolando (checks and reviewer supply the evidence; they do not decide) | CI and a read-only reviewer (human-assisted is fine in the pilot) | Required CI green from the pinned source on the exact candidate commit; per-criterion report mapping each acceptance criterion to an assertion or human observation, naming contract digest and commit. Worker self-report is never evidence | Ruleset required checks (ENG-142), verifier (ENG-156, ENG-157), bypass tests (ENG-158) |
-| **Exceptions** (anything outside the approval: extra attempt, scope change, failed or unknown launch, changed check, protected-file change) | Rolando | Controller stops and escalates; Rolando decides | A written decision in the ledger or on the PR naming the exception and Rolando's choice. A changed contract needs a **fresh approval**, never an edit to the old one. A **repair attempt** (re-running the worker on the same approved contract after a failure) needs Rolando's recorded authorization naming the failure and the attempt number, and counts against the attempt cap; going past the cap is a separate exception that needs a new budget in a fresh approval | Controller blocks on unknown or over-budget states; protected-control changes need Rolando's review (ENG-143) |
+| **Exceptions** (anything outside the approval: extra attempt, scope change, failed or unknown launch, changed check, protected-file change) | Rolando | Controller stops and escalates; Rolando decides | A written decision in the ledger or on the PR naming the exception and Rolando's choice. A changed contract needs a **fresh approval**, never an edit to the old one. A **repair attempt** (re-running the worker on the same approved contract after a failure) needs Rolando's recorded authorization naming the failure and the attempt number, and counts against the attempt cap; going past the cap is a separate exception that needs a new budget in a fresh approval. *Superseded 2026-10-08 in part: a repair inside the allowance recorded with the Todo move needs no typed authorization; Rolando still records that the earlier worker finished (section 12, [repair.md](../repair.md))* | Controller blocks on unknown or over-budget states; protected-control changes need Rolando's review (ENG-143) |
 | **Merge** (code lands on main) | Rolando | Rolando merges in the pilot. (A bot may technically be able to merge after approval and checks; that is recorded in ENG-142, not relied on.) | Rolando's PR approval on the latest push; stale approvals dismissed; required checks green on that commit; empty bypass list | GitHub ruleset on main (ENG-142) |
 | **Release** (reaches production or users) | Rolando | Rolando triggers the release through a human-only mechanism | A release authorization naming the exact tested commit or artifact. Any changed artifact needs fresh authorization. Merge alone never deploys | Release credentials unavailable to worker, controller and any bot; environment gate or equivalent human-only mechanism (ENG-142) |
 
 ## 5. Approval binding and separation of decisions
 
 1. **Contract approval is bound to immutable content.** Rolando approves a canonical contract identified by its digest, together with the repository, the exact base commit, the permitted scope and the attempt budget. If any byte of the contract or any of those bound fields changes, the old approval no longer matches and the controller refuses to dispatch until Rolando approves the new version. Approvals can be revoked or expire; the controller checks this at dispatch time (ENG-144, ENG-151).
+   *Superseded 2026-10-08 in part:* with a Todo move, Rolando approves the ticket text, not the contract itself. The signer binds his move to the digest of the one contract drafted from that text, and a changed ticket or contract needs a new move (section 12).
 2. **PR review is a separate decision.** Approving the contract does not approve the resulting code. Rolando reviews the PR on its latest push with the evidence from section 4. A new push after approval invalidates it.
 3. **Release authorization is a third, separate decision.** A PR approval, a merge, a green build or a comment does **not** authorize a production deployment. Release needs its own authorization by Rolando, bound to the exact tested commit or artifact, through a mechanism the worker and controller cannot trigger. Until ENG-142 demonstrates such a mechanism, nothing the factory produces is released except by Rolando by hand.
 4. **No step infers the next.** "PR exists", "worker says done", "runtime shows success" and "merged" are states, not authorizations.
@@ -48,15 +50,17 @@ Humans own intent, approved scope, exceptions and release; Rolando performs ever
 
 Rolando approves **every** pilot contract and **every** release. There is no low-risk, trivial, documentation-only, dependency-bump or "small change" tier that skips contract approval, PR review or release authorization. Risk tiers, if ever added (optional ENG-159), may only add review, never remove these three gates. Any change to this rule needs a new ADR approved by Rolando.
 
+*Note 2026-10-08:* a Todo move counts as Rolando's contract approval (section 12). It is not a risk tier. It skips no gate, and a task that could touch protected paths still needs his typed approval.
+
 ## 7. First pilot limits
 
 | Setting | Pilot value | Notes |
 |---|---|---|
-| Task selection | **Manual.** Rolando picks each task and writes or approves its contract | No queue scanning |
-| Lanes | **One.** At most one active implementation attempt across the whole factory | Controller enforces single-writer ownership |
-| Auto-fix | **Off.** No automatic repair of CI failures or review comments; routine schedules and GitHub event triggers disabled | Each repair attempt needs Rolando's authorization and counts against the cap (default 3 total attempts per task, set in ENG-138). Turning auto-fix on needs the optional bounded-repair experiment and a new decision |
-| Intake | **None automatic.** No Linear, GitHub-issue or chat intake listener | Optional ENG-174 is out of v1 |
-| Approval interface | **Existing tools only** (an operator command or file plus GitHub's own review UI). No custom approval inbox or Grok widgets | Optional later |
+| Task selection | **Manual.** Rolando picks each task and writes or approves its contract | No queue scanning. *Superseded 2026-10-08: Rolando still picks each task, by moving its ticket to Todo; the service reads Linear for those moves and drafts the contract ([intake.md](../intake.md), [prepare.md](../prepare.md))* |
+| Lanes | **One.** At most one active implementation attempt across the whole factory | Controller enforces single-writer ownership. *Still true 2026-10-08: the first configuration has one lane. A two-job worker pool across providers (ENG-154) is an approved target, not enabled* |
+| Auto-fix | **Off.** No automatic repair of CI failures or review comments; routine schedules and GitHub event triggers disabled | Each repair attempt needs Rolando's authorization and counts against the cap (default 3 total attempts per task, set in ENG-138). Turning auto-fix on needs the optional bounded-repair experiment and a new decision. *Superseded 2026-10-08 in part: native auto-fix stays off, but the factory may start a bounded repair inside the Todo move's repair allowance ([repair.md](../repair.md), section 12)* |
+| Intake | **None automatic.** No Linear, GitHub-issue or chat intake listener | Optional ENG-174 is out of v1. *Superseded 2026-10-08: ENG-174 is built. The service polls Linear for Rolando's Todo moves on onboarded projects; there is still no GitHub-issue or chat intake ([intake.md](../intake.md))* |
+| Approval interface | **Existing tools only** (an operator command or file plus GitHub's own review UI). No custom approval inbox or Grok widgets | Optional later. *Superseded 2026-10-08: the Todo move in Linear is also an approval; typed approvals now run over `fly ssh console`. Linear comments only report and never approve ([reporting.md](../reporting.md))* |
 | Repository | One pilot repository chosen in ENG-137 | |
 | Parallelism | Building the factory may use parallel agents; the factory itself does not run tasks in parallel | See implementation plan section 5 |
 
@@ -93,6 +97,7 @@ These come from current official docs and shape how later tickets must enforce s
 - Rolando is the bottleneck by design: every task passes through him at least four times (contract approval, PR review, merge, release authorization), plus once per authorized repair. That is acceptable because the pilot is small and the goal is to measure his time honestly, not to remove him.
 - Several controls depend on GitHub and Routine behaviour that later tickets must demonstrate (bot merge authority, release gate, launch idempotency). Where a control cannot be demonstrated, it is recorded as a limitation, never bypassed or assumed.
 - Anything outside this ADR (parallel lanes, auto-fix, automatic intake, risk-based skipping) is out of v1 and needs ENG-162's stop/simplify/continue decision plus a new ADR.
+  *Superseded 2026-10-08 in part:* Rolando brought Linear intake and bounded repairs into v1 (section 12). Parallel lanes, native auto-fix and risk-based skipping stay out.
 
 ## 11. Acceptance criteria trace (ENG-134)
 
@@ -104,6 +109,38 @@ These come from current official docs and shape how later tickets must enforce s
 | First pilot: manual selection, one lane, auto-fix off, no automatic intake or custom approval inbox | Section 7 |
 | Rolando signs off on the operating model and maximum setup/maintenance effort before implementation | Section 8 and the sign-off record below |
 
+## 12. Authorization policy v2, 2026-10-08: Todo move as approval
+
+Rolando decided this on 2026-10-08 (the "Linear-first" scope change). It is built and described in [intake.md](../intake.md), [service.md](../service.md), [prepare.md](../prepare.md), [reporting.md](../reporting.md), [review.md](../review.md) and [repair.md](../repair.md). It changes sections 4, 5, 6, 7 and 10 where their notes say so. Everything else above still holds.
+
+**What approves a task.** Rolando's own move of a ticket to Todo in Linear approves the one task the factory drafts from that ticket. The ticket must be listed in an explicitly onboarded project (`deploy/pilot/onboarding.json`). The task must stay inside that entry's limits: repository, routine, actions, checks and attempt budget.
+
+**Who checks the move.** A separate signer process, running as its own OS user, is the only holder of the approval key on the service machine. It reads the ticket and its history from Linear itself and trusts nothing the service sends. It then signs a short-lived `source-authorization` record for exactly one contract digest. That record is never a typed `human-decision` and can't pass for one. It counts only for attempt 1 and the service's routine.
+
+**What still needs Rolando's typed approval.**
+
+- A task that could touch protected paths (workflows, `CLAUDE.md`, `.claude/`, package and build config).
+- A contract after he rejects or revokes it. No Todo-move record for it counts again.
+- Re-fires and clearings, as before.
+
+His typed approval over `fly ssh console` always works and always counts.
+
+**When a move stops counting.** A queued ticket that leaves Todo, is edited, is removed from the onboarding list or gets a skip label is withdrawn. Eligibility and protected paths are checked again right before each dispatch try.
+
+**Linear is read and commented on, never changed.** The factory never changes a ticket's state or labels. It only posts comments, in order, each once. A comment reply never approves anything.
+
+**Repairs.** The factory may start a repair on its own only within the repair allowance recorded with the Todo move (`repair_allowance`, counted inside `max_attempts`, default 0). Only routine findings qualify, and only after Rolando records that the earlier worker finished. Anything else goes to him. Native auto-fix stays off.
+
+**Independent review.** OpenAI Codex reviews each worker PR through a protected workflow in the factory repo, bound to the exact commit, base and contract. A pass is evidence, never approval. The default is one full review and one verification pass per task.
+
+**The service.** It runs always-on on Fly.io: one machine, one volume, one worker lane. It never approves, merges or releases.
+
+**Lanes.** The first configuration is one implementation lane, one worker at a time. A two-job worker pool across providers (ENG-154 and related tickets) is an approved target. It is not enabled, and enabling it is its own change.
+
+**Unchanged.** Rolando approves and merges every PR. Release needs his separate authorization. No step infers the next (section 5). Existing limits stay as set in [limits.md](../limits.md), including the weekly cap of 12 fires and the attempt budgets.
+
+**What the move does not check.** The signer can't judge whether the drafted goal and criteria match what Rolando meant. The factory picks the base commit itself, from the newest main commit that passed CI. Independent review, CI and Rolando's merge are the checks on the result.
+
 ## Sign-off record
 
 Sign-off applies to this file as it stands at the version below; any later edit to sections 2 to 8 needs a fresh sign-off.
@@ -112,3 +149,4 @@ Sign-off applies to this file as it stands at the version below; any later edit 
 - Operating model (sections 2 to 7): approved
 - Maximum setup/maintenance effort (section 8): approved with other caps: 40 active hours setup, 2 active hours/week maintenance
 - Signed by / date: Rolando Navarrete, 2026-10-07 (decision card in the ENG-134 project thread)
+- Post-sign-off notes (2026-10-08): section 12 and the *Superseded 2026-10-08* notes record Rolando's Linear-first decision as built. They change no signed text. The version hash above covers the file before them. Section 12 has no sign-off of its own here yet.

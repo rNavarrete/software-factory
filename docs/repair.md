@@ -2,7 +2,7 @@
 
 When the independent review fails a worker's PR for an ordinary implementation defect, the factory can start the next attempt on its own to fix it. It only does this within the repair allowance that came with Rolando's Todo move, and it never goes past the task's attempt budget. Anything that isn't a routine fix goes to Rolando instead, with one report.
 
-This is off until Rolando turns it on. The pilot onboarding keeps `repair_allowance` at 0, so for now every repair still needs his typed go-ahead.
+This is off until Rolando turns it on, and the default allowance is 0. For the go-live qualification the pilot onboarding sets `repair_allowance` to 1 inside `max_attempts` 2, so one automatic repair is possible per task (docs/go-live.md).
 
 ## What a repair is
 

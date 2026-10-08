@@ -10,4 +10,9 @@ cd /app || exit 1
 # Give the files back even if the session drops or is interrupted.
 trap 'chown -R factory:factory "$HOME/.software-factory"' EXIT
 trap 'exit 130' HUP INT TERM
-python3 -s -m controller "$@"
+if [ "${1:-}" = queue ]; then
+    # The service's own view: each ticket it has taken in, and how that ended.
+    python3 -s -m controller.service status
+else
+    python3 -s -m controller "$@"
+fi

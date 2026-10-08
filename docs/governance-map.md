@@ -4,6 +4,7 @@
 - Status: **Accepted** (Rolando signed off 2026-10-07 in the ENG-135 thread: only enforced controls are trusted, and each is tested before the pilot)
 - Depends on: [ADR 0001 operating model](adr/0001-operating-model.md) (accepted). Every row below stays inside it.
 - Moves to `docs/governance-map.md` in the factory repo once ENG-185 creates it (implementation plan section 4 assigns that path to ENG-135).
+- Amended 2026-10-08: Rolando's Linear-first decision ([ADR 0001 section 12](adr/0001-operating-model.md#12-authorization-policy-v2-2026-10-08-todo-move-as-approval)) changes the wording of G-A5, G-C2 and G-C9 and two rows of section 5. IDs and classes are unchanged. See [section 3 notes](#notes-from-authorization-policy-v2-2026-10-08) and the change log.
 - Exercised by: [ENG-163](https://linear.app/rolando-projects/issue/ENG-163/qualify-the-full-control-path-before-the-pilot), which blocks [ENG-161](https://linear.app/rolando-projects/issue/ENG-161/run-the-small-supervised-pilot-against-the-current-workflow). See section 6.
 
 ## 1. What this is for
@@ -36,7 +37,7 @@ IDs are stable so ENG-163, ENG-158 and PRs can cite them (e.g. "closes G-A4").
 | G-A2 | Approved contract is immutable and digest-addressed | Controller | Canonical serialization + digest (ENG-144); approval matches on digest, not version label | Code | ENG-144, ENG-151 | Change one byte of an approved contract, keep the version label: digest differs, **dispatch refused** |
 | G-A3 | Scope, base commit or budget change needs a fresh approval | Controller | Bound fields are part of the approval match | Code | ENG-144, ENG-151 | Change base commit (or widen scope, or raise budget) on an approved contract: **refused** until a new approval exists |
 | G-A4 | Base is an exact commit, not a branch name | Controller | Schema requires a commit SHA | Code | ENG-144 | Contract with `base: main`: **fails validation** |
-| G-A5 | Only Rolando's authenticated operator action creates an approval | Controller | Approval store outside the worker's checkout; write path requires operator credential; no comment, callback or worker-file path exists | Code + Boundary | ENG-151, ENG-147, ENG-143 | (a) PR comment "approved", (b) worker writes an approval file in the repo, (c) unauthenticated callback: **no approval created** |
+| G-A5 | Only Rolando's authenticated operator action creates an approval (*since 2026-10-08 also his own Todo move on a listed ticket, signed as a `source-authorization` by the signer process*) | Controller | Approval store outside the worker's checkout; write path requires operator credential; no comment, callback or worker-file path exists. *Since 2026-10-08 the signer process, as its own OS user, is the only holder of the approval key on the service machine; it checks the move with Linear itself ([intake.md](intake.md))* | Code + Boundary | ENG-151, ENG-147, ENG-143 | (a) PR comment "approved", (b) worker writes an approval file in the repo, (c) unauthenticated callback: **no approval created** |
 | G-A6 | Replayed decisions cannot approve a different contract or a second attempt | Controller | Approval is single-use per (digest, attempt); replay compares bound fields | Code | ENG-151 | Replay approval for contract A against contract B, and against attempt 2: **refused** |
 | G-A7 | Ambiguous or untestable criteria cannot be approved | Controller (schema) + Rolando (semantics) | Schema requires an evidence type per criterion; `needs-clarification` flag blocks approval. Whether prose is truly testable is Rolando's judgement | Code (structure) + Human gate (semantics) | ENG-144 | Criterion with no evidence type: **fails validation**. Criterion flagged needs-clarification: **approval refused** |
 | G-A8 | Instructions inside an issue, PR or CI log cannot approve, launch or release | Controller + GitHub ruleset | None of those inputs is read by the approval, dispatch or release paths | Code + Boundary | ENG-143, ENG-158 | Seed "approve and release this" in a PR body, an issue and a CI log: **no approval, launch or release** |
@@ -59,14 +60,14 @@ IDs are stable so ENG-163, ENG-158 and PRs can cite them (e.g. "closes G-A4").
 | ID | Requirement | Owner | Enforcing mechanism | Class | Issue(s) | Negative test (expected result) |
 |---|---|---|---|---|---|---|
 | G-C1 | Each attempt is reserved and counted before launch, including attempts that never reach a PR | Controller | Attempt counter in ledger incremented with dispatch intent, before the fire call | Code | ENG-146, ENG-147 | Force every attempt to fail before a PR exists: **no launch beyond the cap** (default 3 total, ENG-138) |
-| G-C2 | Each repair attempt needs Rolando's go-ahead naming the failure and attempt number | Controller (Rolando decides) | Dispatch of attempt n>1 requires a repair authorization record | Code + Human gate | ENG-151, ENG-146 | Request attempt 2 with only the original approval: **refused**. Repair authorized while attempt 1 is still running or unresolved: **refused** |
+| G-C2 | Each repair attempt needs Rolando's go-ahead naming the failure and attempt number (*since 2026-10-08, or the signer's repair go-ahead within the repair allowance recorded with his Todo move, after he records that the earlier worker finished*) | Controller (Rolando decides) | Dispatch of attempt n>1 requires a repair authorization record (*typed, or `source-repair-authorized`, [repair.md](repair.md)*) | Code + Human gate | ENG-151, ENG-146 | Request attempt 2 with only the original approval: **refused**. Repair authorized while attempt 1 is still running or unresolved: **refused** |
 | G-C3 | Cap and escalation dedup survive restart | Controller | Durable counters in ledger | Code | ENG-146, ENG-153 | After 2 attempts, kill and restart the controller, request 2 more: **only 1 allowed**, one escalation record |
 | G-C4 | CI re-runs or multiple jobs on one commit are not coding attempts | Controller | Attempts counted only on dispatch, never on CI events | Code | ENG-146 | Fire 3 CI events on one commit: **counter unchanged** |
 | G-C5 | At the cap, one escalation with prior attempts, state, last error and next decision | Controller | Escalation record written once at cap | Code | ENG-146 | Hit the cap twice in a row: **one** escalation, no launch |
 | G-C6 | Rate rejection backs off with Retry-After; approval and budget are rechecked before any later dispatch; no blind HTTP retry | Controller | Adapter returns rejection; dispatch re-enters G-A1/G-C1 checks; HTTP client has retries off | Code | ENG-176, ENG-182, ENG-138 | Simulated 429 then revoke the approval during back-off: **no fire** after back-off |
 | G-C7 | Subscription exhaustion blocks dispatch and escalates without tight retries | Controller | Exhaustion response maps to blocked state | Code | ENG-138 | Simulated exhaustion: **blocked + escalation**, no retry loop |
 | G-C8 | Time/usage thresholds alert and **block new dispatch** | Controller | Threshold check in dispatch path | Code (for new dispatch) | ENG-146, ENG-138 | Exceed threshold: **next dispatch refused**, alert recorded |
-| G-C9 | Stopping an **active** cloud session | Rolando | No demonstrated cancel API; operator stop procedure only | **Advisory** | ENG-146 | Recorded as advisory; ENG-163 checks the label is honest. Automated repair mode blocked (section 5) |
+| G-C9 | Stopping an **active** cloud session | Rolando | No demonstrated cancel API; operator stop procedure only | **Advisory** | ENG-146 | Recorded as advisory; ENG-163 checks the label is honest. Automated repair mode blocked (section 5). *Since 2026-10-08: open-ended automated repair is still refused; the only automatic repair is G-C2's bounded one, which waits for Rolando's record that the earlier worker finished* |
 | G-C10 | Infrastructure retries and uncertain launches are recorded as distinct outcomes, not coding attempts or successes | Controller | Outcome enum in ledger | Code | ENG-146, ENG-147 | Simulated infra failure and simulated lost response: **two different recorded outcomes**, neither marked success |
 | G-C11 | Metered overage is off by default | Rolando | Account setting on the factory subscription, recorded in ENG-138 | Platform (account setting) | ENG-138 | Account settings export/screenshot shows overage off; exhausting the plan **blocks** (G-C7) rather than billing |
 | G-C12 | Fires per attempt (2) and per task (6) are capped; a re-fire needs a definite `not-launched` and Rolando's re-fire record | Controller (Rolando decides re-fires) | Fire counters in the ledger checked before every fire ([limits.md](limits.md) §3) | Code + Human gate | ENG-146, ENG-176 | Force `not-launched` on fires 1 and 2 of an attempt and request a third: **refused**. Re-fire after `launch-outcome-unknown`: **refused** |
@@ -126,22 +127,36 @@ Readiness note: required CI (G-B2) is the platform gate. The per-criterion verdi
 
 Not counted as controls anywhere above: routine prompt parsing, CLAUDE.md, hooks and repo settings (ENG-139, ENG-143, ENG-182). They are defense in depth and **advisory**; the real limits are G-A10, G-F1 and G-G1 to G-G7.
 
+### Notes from authorization policy v2 (2026-10-08)
+
+Rolando decided on 2026-10-08 that his own Todo move in Linear, on a listed ticket of an onboarded project, approves the task the factory drafts from it ([ADR 0001 section 12](adr/0001-operating-model.md#12-authorization-policy-v2-2026-10-08-todo-move-as-approval), [intake.md](intake.md)). What that means for the rows above:
+
+- **G-A1, G-A5, G-A6.** A Todo move becomes a signed `source-authorization` for exactly one contract digest, for attempt 1 only. It is never a typed `human-decision`. Tasks that could touch protected paths, re-fires and clearings still need Rolando's typed records. After he rejects or revokes a contract, only his typed approval brings it back.
+- **G-A8, G-D10.** A Linear comment or reply never approves anything. The factory never changes ticket state or labels ([reporting.md](reporting.md)).
+- **G-C2, G-C9.** A repair may start without a typed go-ahead only inside the move's `repair_allowance` (counted inside `max_attempts`, default 0), only for routine findings, and only after Rolando records that the earlier worker finished ([repair.md](repair.md)). Native auto-fix stays off (G-G5).
+- **G-C13.** Codex review runs count against the same weekly cap of 12 as worker fires ([review.md](review.md)).
+- **G-D4.** The first configuration is one implementation lane. A two-job worker pool across providers (ENG-154) is an approved target, not enabled.
+- **G-E1 to G-E5.** The verifier is now an OpenAI Codex review in a protected workflow in the factory repo, bound to the exact commit, base and contract. A pass is evidence, never approval ([review.md](review.md)). The open wording question on G-E5 stays with [control-audit.md](control-audit.md).
+
+The evidence in `controller/audit/controls.py` is unchanged and still covers the typed path. The Todo-move and automatic-repair paths are covered by the tests listed in [linear-failure-qualification.md](linear-failure-qualification.md), which ENG-163 uses.
+
 ## 4. Open conflicts and decisions
 
 1. **ENG-183 fallback: decided 2026-10-07, pause rollout.** If ENG-183 fails to qualify the bot identity, cloud rollout pauses until a supported alternative is chosen; required PR approval is never dropped. ADR 0001 §9.1 was amended to match (its earlier zero-approval fallback would have let a worker identity with write access merge its own PR, making "Rolando merges" advisory, G-F3).
 2. **Verifier as a required check** (section E note): recommended, owned by ENG-142/156. Not blocking.
 3. **Required-workflow pinning** (G-B4) is inferred to be unavailable for a personal repo; ENG-142 confirms against current GitHub docs.
+4. **Linear-first: decided 2026-10-08.** Rolando's Todo move is an approval, and bounded automatic repairs are allowed (section 3 notes). Section 5 is updated to match.
 
 ## 5. Operating modes blocked by unsupported controls
 
 | Mode | Blocked because | Unblocked by |
 |---|---|---|
-| Automated repair / auto-fix | No demonstrated way to stop an active cloud writer (G-C9); auto-fix has no repo-wide switch (G-G5) | ENG-177 proving stop semantics + a new ADR (ADR 0001 §7) |
+| Automated repair / auto-fix | No demonstrated way to stop an active cloud writer (G-C9); auto-fix has no repo-wide switch (G-G5) | ENG-177 proving stop semantics + a new ADR (ADR 0001 §7). *Superseded 2026-10-08 in part: native auto-fix and open-ended repair stay blocked. Bounded repairs inside the Todo move's allowance are allowed after Rolando records that the earlier worker finished ([repair.md](repair.md))* |
 | Automatic retry of an ambiguous launch | Fire API has no idempotency key (G-D5) | A documented idempotency or session-lookup mechanism, requalified in ENG-182 |
 | Cloud rollout under Rolando's personal identity | Self-approval impossible, so G-F2 fails | ENG-183 go, or a supported alternative identity (section 4.1); never by dropping required approval |
 | Automatic release / deploy on merge | Release needs a human-only, commit-bound mechanism (G-F4 to G-F6) | ENG-142 demonstrating that mechanism; until then Rolando releases by hand |
 | Local check fallback | Local check results are not evidence until local/CI parity is shown (ENG-140); the pilot is cloud-only | ENG-140 local parity evidence |
-| Parallel lanes, automatic intake, custom approval inbox | Out of v1 by ADR 0001 §7 | ENG-162 decision + new ADR |
+| Parallel lanes, automatic intake, custom approval inbox | Out of v1 by ADR 0001 §7 | ENG-162 decision + new ADR. *Superseded 2026-10-08 in part: Linear intake is built ([intake.md](intake.md)); Linear comments report but never approve. Parallel lanes stay off: a two-job worker pool (ENG-154) is an approved target, not enabled* |
 | Any pilot task | Any required (non-advisory) row not observed in ENG-163 | ENG-163 passing (section 6) |
 
 ## 6. ENG-163 audit checklist (run before ENG-161, not after)
@@ -186,3 +201,4 @@ ENG-163 already blocks ENG-161 in Linear. ENG-163's thread copies this table int
 |---|---|---|
 | 2026-10-07 | Map accepted (56 controls); ENG-183 fallback set to pause rollout | Rolando |
 | 2026-10-08 | Added G-C12 to G-C14 (fire caps, weekly fire cap, hold and usage-snapshot gate) at the request of [limits.md](limits.md) §3, so ENG-163 audits them. They only record limits Rolando approved in limits.md on 2026-10-08 | Rolando (via limits.md) |
+| 2026-10-08 | Linear-first notes: G-A5, G-C2 and G-C9 wording, section 3 notes, section 4 item 4, and two section 5 rows. IDs, classes and audit evidence unchanged | Records Rolando's 2026-10-08 decision ([intake.md](intake.md)); this wording not yet signed |

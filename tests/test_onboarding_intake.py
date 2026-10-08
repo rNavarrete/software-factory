@@ -113,9 +113,12 @@ class IntakeKeysTests(unittest.TestCase):
         if not path.exists():
             self.skipTest("no pilot onboarding file")
         doc = json.loads(path.read_text())
-        self.assertFalse(doc.get("intake_enabled", False))
         (entry,) = doc["projects"]
-        self.assertEqual(sorted(entry["issues"]), ["ENG-187", "ENG-188", "ENG-189", "ENG-191"])
+        # The pilot's factory tickets plus the go-live samples (docs/go-live.md).
+        self.assertEqual(
+            sorted(entry["issues"]),
+            ["ENG-187", "ENG-188", "ENG-189", "ENG-191", "ENG-200", "ENG-201", "ENG-202"],
+        )
         for baseline in ("ENG-186", "ENG-190", "ENG-192", "ENG-193"):
             self.assertNotIn(baseline, entry["issues"])
 

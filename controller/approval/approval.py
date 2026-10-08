@@ -27,11 +27,12 @@ Rules ``Approvals.check`` applies at dispatch, reading the ledger afresh:
   contract their attempt ran, and made after what they decide on (a clearing
   names the exact fire it clears).
 
-Threat model: the ledger lives on Rolando's Mac and only the controller writes
-it. The signature stops anything that can append records without the operator
-key (a bug, a future callback, a copied record) from creating or stretching a
-decision. It does not protect the records the gate itself writes (fire results,
-reservations); something able to forge those already controls the controller.
+Threat model: the ledger lives on the factory's machine (or Rolando's Mac for
+terminal runs) and only the controller writes it. The signature stops anything
+that can append records without the operator key (a bug, a future callback, a
+copied record) from creating or stretching a decision. It does not protect the
+records the gate itself writes (fire results, reservations); something able to
+forge those already controls the controller.
 
 A second way to approve attempt 1 (ENG-174, Rolando's choice on
 2026-10-08): a ``source-authorization`` record, signed by the separate signer
