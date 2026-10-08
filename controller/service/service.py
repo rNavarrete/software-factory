@@ -42,6 +42,7 @@ from pathlib import Path
 
 from controller import contract as contracts
 from controller.approval import ContractStore
+from controller.approval.approval import SOURCE_AUTHORIZATION
 from controller.attempts import AttemptGate
 from controller.attempts import events as gate_events
 from controller.attempts.policy import LedgerView
@@ -60,10 +61,12 @@ from controller.service import queue as q
 from controller.service.onboarding import Onboarding, OnboardingError
 from controller.service.seams import (
     Authorization,
+    AuthorizationRefused,
     Integrations,
     Prepared,
     PullRequestRef,
     Question,
+    Standing,
 )
 
 log = logging.getLogger("factory.service")
@@ -80,6 +83,11 @@ _WATCHED = frozenset(
 _FINAL_REFUSALS = frozenset(
     {"contract-invalid", "wrong-repository", "base-not-on-main", "contract-changed"}
 )
+
+# When the signer may stand in for a missing approval: nothing in force for
+# this contract. Never after Rolando rejected or revoked it.
+_ASK_SIGNER = frozenset({"approval-missing", "approval-expired", "approval-for-different-contract"})
+_NEVER_ASK_SIGNER = frozenset({"approval-rejected", "approval-revoked"})
 
 
 def never(summary: str, code: str) -> bool:
@@ -279,6 +287,7 @@ class Service:
         events: list[LedgerEvent] = []
         seen = set(view.seen)
         open_issues = {i.issue_id for i in view.open_items()}
+        earlier = {i.issue_id: i for i in view.open_items()}
 
         for c in batch.controls:
             if c.event_id in seen:
@@ -310,6 +319,13 @@ class Service:
                 continue
             seen.add(a.event_id)
             reason = self._acceptance_problem(a, open_issues)
+            old = earlier.pop(a.issue_id, None)
+            if reason is not None and old is not None and self._replaceable(old, a):
+                # A newer move of a ticket whose older move hasn't started
+                # anything: the newer one is what Rolando approved last.
+                events += self._replace(old, now)
+                open_issues.discard(a.issue_id)
+                reason = self._acceptance_problem(a, open_issues)
             if reason is None:
                 events.append(q.accepted(a, now))
                 open_issues.add(a.issue_id)
@@ -327,6 +343,44 @@ class Service:
         if batch.cursor and batch.cursor != view.cursor:
             events.append(q.cursor(batch.cursor, now))
         self._append(*events)
+
+    def _replaceable(self, old: q.Item, new: Authorization) -> bool:
+        return (
+            self._config is not None
+            and self._config.intake_enabled
+            and self._config.project(new.project_id) is not None
+            and new.moved_at > datetime.fromisoformat(old.moved_at)
+            and not self._owned_attempts(old)
+        )
+
+    def _replace(self, old: q.Item, now: datetime) -> list[LedgerEvent]:
+        return [
+            q.item_closed(old, "replaced", now),
+            q.message(
+                f"closed:{old.event_id}",
+                old.issue_id,
+                "You moved this ticket to Todo again before the factory started it. It will"
+                " work from that newer move instead.",
+                now,
+            ),
+        ]
+
+    def _owned_attempts(self, item: q.Item) -> set[AttemptId]:
+        """The attempts reserved for the item's task after it was accepted."""
+        return {
+            s.event.attempt
+            for s in self._store.events(item.task)
+            if s.event.kind == gate_events.ATTEMPT_RESERVED
+            and s.seq > item.seq
+            and s.event.attempt is not None
+        }
+
+    def _standing(self, item: q.Item) -> Standing:
+        source = self._x.source
+        check = getattr(source, "standing", None)
+        if check is not None:
+            return check(item.authorization())
+        return Standing(withdrawn=source.revalidate(item.authorization()))
 
     def _acceptance_problem(self, a: Authorization, open_issues: set[str]) -> str | None:
         assert self._config is not None
@@ -413,6 +467,17 @@ class Service:
                 r.closed.append(item.issue_key)
                 return False
             if status.state in FINISHED:
+                if item.withdrawn is not None:
+                    self._close(
+                        item,
+                        "withdrawn",
+                        now,
+                        f"Attempt {status.attempt} ended as {status.state.value}. You had moved"
+                        " the ticket out of Todo, so the factory stops here and suggests no"
+                        " repair.",
+                    )
+                    r.closed.append(item.issue_key)
+                    return False
                 advice = self._x.repair.advise(status.attempt, status.detail)
                 if advice is None:
                     self._close(
@@ -456,13 +521,48 @@ class Service:
             )
             r.closed.append(item.issue_key)
             return False
-        reason = self._x.source.revalidate(item.authorization())
-        if reason is not None:
-            self._close(item, "authorization-withdrawn", now, f"The factory stopped: {reason}")
+        if item.withdrawn is not None:
+            self._close(
+                item,
+                "withdrawn",
+                now,
+                "The factory won't start anything more for this ticket: you moved it out of"
+                " Todo after its worker started. For new work, write a new ticket.",
+            )
             r.closed.append(item.issue_key)
+            return False
+        standing = self._standing(item)
+        if standing.reason is None and not standing.in_todo:
+            standing = Standing(withdrawn="the ticket left Todo before the factory started it")
+        if standing.reason is not None:
+            again = (
+                " To start from the new text, move it out of Todo and back."
+                if standing.withdrawn is None
+                else ""
+            )
+            self._close(
+                item,
+                "authorization-withdrawn",
+                now,
+                f"The factory stopped before starting: {standing.reason}.{again}",
+            )
+            r.closed.append(item.issue_key)
+            return False
+        if standing.waiting_on:
+            names = ", ".join(standing.waiting_on)
+            self._notice(
+                item,
+                f"waiting-on:{names}",
+                f"Waiting before starting: this ticket is blocked by {names}, which isn't done.",
+                now,
+            )
             return False
         contract = self._contract(item, project.as_mapping(), project, r)
         if contract is None:
+            return False
+        if not self._protected_ok(item, project, contract, now):
+            return False
+        if not self._authorized(item, contract, r, now):
             return False
         try:
             result = self._dispatcher.dispatch(contract)
@@ -484,6 +584,63 @@ class Service:
             return False  # already dispatched; watched next round
         r.fired.append(str(result.run))
         self._notice(item, f"fired:{result.run}", _fired_text(result), now)
+        return True
+
+    def _protected_ok(self, item: q.Item, project, contract: Mapping[str, object], now) -> bool:
+        """A contract that may reach the project's protected paths (as the
+        onboarding file says now) starts only on Rolando's typed approval,
+        never on a Todo move alone, even one signed before the paths were
+        protected."""
+        problems = project.protected_problems(contract)
+        if not problems or self._dispatcher.approvals.typed_approval_in_force(contract, now):
+            return True
+        self._notice(
+            item,
+            "needs-typed-approval",
+            "Waiting before starting: " + "; ".join(problems) + ".",
+            now,
+        )
+        return False
+
+    def _authorized(
+        self, item: q.Item, contract: Mapping[str, object], r: TickReport, now: datetime
+    ) -> bool:
+        """Rolando's Todo move as the approval (his choice, 2026-10-08): if
+        the contract has no standing approval, ask the signer, which checks
+        the move with Linear itself and signs. The service only appends what
+        the signer signed; it can't sign anything."""
+        authorizer = self._x.authorizer
+        if authorizer is None:
+            return True
+        _, _, blocks = self._dispatcher.launcher.check(contract, now)
+        codes = {b.code for b in blocks}
+        if not codes & _ASK_SIGNER:
+            return True  # approved already, or blocked for another reason dispatch reports
+        if codes & _NEVER_ASK_SIGNER:
+            return True  # Rolando rejected or revoked it; dispatch reports that
+        try:
+            event = authorizer.authorize(item.authorization(), contract)
+        except AuthorizationRefused as e:
+            if e.final:
+                self._close(
+                    item,
+                    "authorization-refused",
+                    now,
+                    f"The factory can't count your Todo move as approval: {e.reason}.",
+                )
+                r.closed.append(item.issue_key)
+            else:
+                self._notice(item, "authorize-wait", f"Waiting before starting: {e.reason}.", now)
+            return False
+        d = event.data
+        if (
+            event.kind != SOURCE_AUTHORIZATION
+            or event.task != item.task
+            or d.get("event_id") != item.event_id
+            or d.get("digest") != contracts.digest(contract).value
+        ):
+            raise RuntimeError("the signer answered for a different move or contract")
+        self._append(event)
         return True
 
     def _contract(
@@ -538,6 +695,9 @@ class Service:
         ):
             self._last_reconcile[attempt] = now
             status = self._dispatcher.reconcile(attempt).status
+            if status.state is not State.MERGED:
+                # A merge moves the ticket to Done; that is not a withdrawal.
+                self._check_standing_while_running(item, now)
         if status.state is State.UNKNOWN:
             self._notice(
                 item,
@@ -577,6 +737,42 @@ class Service:
             )
         if status.state is State.MERGED:
             self._close(item, "merged", now, "Rolando merged the PR. This ticket's work is done.")
+
+    def _check_standing_while_running(self, item: q.Item, now: datetime) -> None:
+        """Rolando's move is checked again while the worker runs. A change
+        never alters the contract or starts anything; it is reported."""
+        if item.withdrawn is not None:
+            return
+        try:
+            standing = self._standing(item)
+        except Exception as e:  # Linear down: reconcile still goes on
+            log.warning("%s: can't read Linear: %s", item.issue_key, _error(e))
+            return
+        if standing.withdrawn is not None:
+            self._append(
+                q.item_withdrawn(item, standing.withdrawn, now),
+                q.message(
+                    f"{item.event_id}:withdrawn",
+                    item.issue_id,
+                    f"This ticket no longer stands as approved ({standing.withdrawn}) after the"
+                    " worker started. The factory won't start anything more for it, repairs"
+                    " included. It can't stop a worker that is already running: if it should"
+                    " stop, stop the session from the factory routine's run page, then record"
+                    " what you found (docs/service.md, recovery steps). The factory keeps"
+                    " checking GitHub for what the worker did.",
+                    now,
+                ),
+            )
+        elif standing.changed is not None:
+            self._notice(
+                item,
+                "changed-while-running",
+                f"This ticket changed while the worker was running ({standing.changed}). The"
+                " worker keeps the task it started with and nothing new starts. If the change"
+                " matters, say what you want here, or move the ticket out of Todo and In"
+                " Progress to stop further work on it.",
+                now,
+            )
 
     def _close(self, item: q.Item, reason: str, now: datetime, text: str) -> None:
         self._append(

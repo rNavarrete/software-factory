@@ -25,6 +25,7 @@ from controller.service.seams import (
     Question,
     Refusal,
     ReportFailed,
+    Standing,
 )
 
 log = logging.getLogger("factory.service.fixtures")
@@ -43,6 +44,10 @@ class FixtureSource:
         self.events = list(events)
         self.withdrawn = dict(withdrawn or {})
         """issue_id -> reason ``revalidate`` gives."""
+        self.changed: dict[str, str] = {}
+        """issue_id -> what changed after the move."""
+        self.blocked: dict[str, tuple[str, ...]] = {}
+        """issue_id -> keys of open tickets that block it."""
         self.fail_next: Exception | None = None
         self.polls: list[str | None] = []
 
@@ -61,7 +66,11 @@ class FixtureSource:
         )
 
     def revalidate(self, authorization: Authorization) -> str | None:
-        return self.withdrawn.get(authorization.issue_id)
+        return self.standing(authorization).reason
+
+    def standing(self, authorization: Authorization) -> Standing:
+        i = authorization.issue_id
+        return Standing(self.withdrawn.get(i), self.changed.get(i), self.blocked.get(i, ()))
 
 
 class FixturePreparer:
