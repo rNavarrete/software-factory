@@ -2,7 +2,7 @@
 
 Runs every test and red-team case the control list names, checks each
 control's evidence against the governance map, prints the table (and writes
-it to FILE if given) and exits 0 only when every control the pilot needs is
+it to FILE if given) and exits 0 only when every control is
 observed. Read-only: it fires nothing, reads no ledger and touches no network.
 """
 
@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.write(text)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
-    return 0 if report.pilot_may_start else 1
+    return 0 if report.all_observed else 1
 
 
 def _autofix() -> int:

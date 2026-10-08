@@ -52,7 +52,13 @@ def check_autofix(api: GitHubApi, repo: str, worker_logins: Iterable[str]) -> Au
         checked.append(n)
         try:
             commits = list(_pages(api, f"repos/{repo}/pulls/{n}/commits?per_page=100"))
-            runs = api.json(f"repos/{repo}/actions/runs?event=pull_request&branch={ref}")
+            runs = list(
+                _pages(
+                    api,
+                    f"repos/{repo}/actions/runs?event=pull_request&branch={ref}&per_page=100",
+                    key="workflow_runs",
+                )
+            )
         except GitHubUnreadable as e:
             findings.append(f"PR #{n} could not be read ({e})")
             continue
@@ -65,11 +71,7 @@ def check_autofix(api: GitHubApi, repo: str, worker_logins: Iterable[str]) -> Au
                     f"PR #{n}: commit {str(c.get('sha'))[:12]} at {when},"
                     f" after it opened at {opened}"
                 )
-        heads = {
-            r.get("head_sha")
-            for r in (runs.get("workflow_runs", []) if isinstance(runs, Mapping) else [])
-            if isinstance(r, Mapping)
-        }
+        heads = {r.get("head_sha") for r in runs}
         if len(heads) > 1:
             findings.append(f"PR #{n}: CI ran at {len(heads)} different head commits")
     if not checked:
@@ -77,9 +79,11 @@ def check_autofix(api: GitHubApi, repo: str, worker_logins: Iterable[str]) -> Au
     return AutofixReport(tuple(checked), tuple(findings))
 
 
-def _pages(api: GitHubApi, path: str):
+def _pages(api: GitHubApi, path: str, key: str | None = None):
     for page in range(1, MAX_PAGES + 1):
         items = api.json(f"{path}&page={page}")
+        if key is not None:
+            items = items.get(key) if isinstance(items, Mapping) else None
         if not isinstance(items, list):
             raise GitHubUnreadable(f"{path} did not return a list")
         yield from (i for i in items if isinstance(i, Mapping))

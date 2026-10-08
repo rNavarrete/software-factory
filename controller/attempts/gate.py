@@ -143,6 +143,16 @@ class AttemptGate:
             self._store.append(*new)
             return run
 
+    def record_refusal(self, decision: Decision, now: datetime, **extra: object) -> None:
+        """Record a refusal decided outside ``reserve`` (dispatch's preview),
+        with the same one escalation at a cap that ``reserve`` writes (G-C5).
+        ``extra`` goes into the refusal record's data."""
+        with self._store.writer_lock():
+            events = self._refusal(self._store.events(), decision, now)
+            first = events[0]
+            events[0] = LedgerEvent(first.kind, first.at, first.task, data={**first.data, **extra})
+            self._store.append(*events)
+
     def _refusal(self, stored, decision: Decision, now: datetime) -> list[LedgerEvent]:
         out = [
             LedgerEvent(

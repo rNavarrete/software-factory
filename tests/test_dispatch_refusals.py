@@ -9,7 +9,11 @@ from datetime import timedelta
 
 from controller import contract as contracts
 from controller.attempts import events as ev
-from tests.test_dispatch import NOW, Confirm, DispatchCase, example
+from controller.dispatch import Refused
+from controller.interfaces import AttemptId
+from controller.recovery import State
+from tests.test_attempts import launched
+from tests.test_dispatch import NOW, Confirm, DispatchCase, ScriptedAdapter, example
 
 
 class RefusalRecordTests(DispatchCase):
@@ -80,3 +84,56 @@ class RefusalRecordTests(DispatchCase):
         codes = self.refused()
         self.assertIn("not-approved", codes)
         self.assertIn("not-recorded", codes)
+
+
+class CapAndLauncherTests(DispatchCase):
+    """Found by the review of the audit: cap refusals through dispatch never
+    escalated, a bad task id lost the refusal, and the launcher's own
+    refusals (the qualification script's path) were not recorded."""
+
+    def refusals(self):
+        return [s.event for s in self.store.events() if s.event.kind == ev.DISPATCH_REFUSED]
+
+    def test_attempt_cap_through_dispatch_escalates_once(self):
+        c = example(attempt_budget=3)
+        self.approve(c)
+        for n in (1, 2, 3):
+            self.adapter = ScriptedAdapter([launched(n)])
+            self.assertEqual(self.dispatch(c).outcome, "launched")
+            a = AttemptId(self.task, n)
+            self.now += timedelta(hours=1)
+            saved, self.confirm = self.confirm, Confirm()
+            self.recovery.clear(
+                a,
+                ev.ClearingBasis.COMPLETED,
+                self.now,
+                session_urls=[f"https://claude.ai/code/cse_{n}"],
+            )
+            self.recovery.close_attempt(a, State.FAILED, "tests failed", self.now)
+            if n < 3:
+                self.approvals.authorize_repair(c, n + 1, "tests failed", self.now)
+            self.confirm = saved
+        self.now += timedelta(minutes=1)
+        self.assertIn("attempt-cap", self.refused(c))
+        self.assertIn("attempt-cap", self.refused(c))
+        self.assertEqual(len(self.kinds(ev.ESCALATION)), 1)
+        self.assertEqual(len(self.refusals()), 2)
+        self.assertTrue(all(r.data["before_gate"] for r in self.refusals()))
+
+    def test_bad_task_id_is_still_a_recorded_refusal(self):
+        bad = example()
+        bad["task_id"] = "Bad_ID"
+        with self.assertRaises(Refused):
+            self.dispatcher.dispatch(bad)
+        (r,) = self.refusals()
+        self.assertIsNone(r.task)
+
+    def test_launcher_refusals_are_recorded(self):
+        def prepare(run, digest):
+            raise AssertionError("never prepared when refused")
+
+        with self.assertRaises(Refused):
+            self.dispatcher.launcher.fire(self.contract, prepare)  # not approved
+        (r,) = self.refusals()
+        self.assertTrue(r.data["before_gate"])
+        self.assert_nothing_sent()

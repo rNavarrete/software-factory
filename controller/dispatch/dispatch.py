@@ -42,7 +42,7 @@ import hashlib
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -52,7 +52,7 @@ from controller.approval import ApprovalRefused, Approvals
 from controller.attempts import AttemptGate
 from controller.attempts import DispatchRefused as GateRefused
 from controller.attempts.events import DISPATCH_REFUSED
-from controller.attempts.policy import LedgerView, Notice
+from controller.attempts.policy import Decision, LedgerView, Notice
 from controller.dispatch.base import BaseCheck, BaseUnreadable
 from controller.interfaces import (
     AttemptId,
@@ -104,11 +104,54 @@ _GOING = frozenset(
 class Refused(Exception):
     """Nothing was sent. ``blocks`` says why, one notice per reason."""
 
-    def __init__(self, blocks: Sequence[Notice], *, recorded: bool = False) -> None:
+    def __init__(
+        self,
+        blocks: Sequence[Notice],
+        *,
+        recorded: bool = False,
+        decision: Decision | None = None,
+    ) -> None:
         self.blocks = tuple(blocks)
         self.recorded = recorded
-        """The refusal is already in the ledger (the gate wrote it)."""
+        """The refusal is already in the ledger (the gate wrote it), or can't be."""
+        self.decision = decision
+        """The gate's decision behind it, when the gate decided it, so a cap
+        refusal is recorded with its one escalation (G-C5)."""
         super().__init__("; ".join(f"{b.code}: {b.detail}" for b in self.blocks))
+
+
+def record_refusal(
+    store: LedgerStore,
+    gate: AttemptGate,
+    now: datetime,
+    contract: Mapping[str, object],
+    e: Refused,
+) -> None:
+    """Put a refusal raised before the gate in the ledger (G-A1); one the gate
+    already recorded is left alone. If it can't be recorded, the refusal still
+    stands and says so."""
+    if e.recorded:
+        return
+    e.recorded = True  # once, however many wrappers it passes through
+    try:
+        if e.decision is not None:
+            gate.record_refusal(e.decision, now, before_gate=True)
+            return
+        task_id = contract.get("task_id") if isinstance(contract, Mapping) else None
+        try:
+            task = TaskId(task_id) if isinstance(task_id, str) and task_id else None
+        except ValueError:
+            task = None
+        event = LedgerEvent(
+            DISPATCH_REFUSED,
+            now,
+            task,
+            data={"blocks": [b.as_data() for b in e.blocks], "alerts": [], "before_gate": True},
+        )
+        with store.writer_lock():
+            store.append(event)
+    except Exception as err:  # the refusal itself must still reach Rolando
+        e.blocks += (Notice("not-recorded", f"this refusal could not be recorded: {err}"),)
 
 
 @dataclass(frozen=True)
@@ -183,7 +226,21 @@ class Launcher:
     ) -> Fired:
         """One fire, in order: recover, check, prepare, reserve (checks again
         under the lock), record the run context, send, record the result,
-        back up. Raises Refused if nothing was sent."""
+        back up. Raises Refused if nothing was sent, with the refusal in the
+        ledger (G-A1)."""
+        try:
+            return self._fire(contract, prepare, refire_of=refire_of)
+        except Refused as e:
+            record_refusal(self._store, self._gate, self._now(), contract, e)
+            raise
+
+    def _fire(
+        self,
+        contract: Mapping[str, object],
+        prepare: Prepare,
+        *,
+        refire_of: RunId | None = None,
+    ) -> Fired:
         now = self._now()
         self._recovery.recover(now)
         run, digest, blocks = self.check(contract, now, refire_of)
@@ -235,7 +292,7 @@ class Launcher:
         except LedgerLocked:
             raise Refused(
                 [Notice("ledger-busy", "Another controller command is writing; try again.")],
-                recorded=True,  # nothing can be written while another command holds the lock
+                recorded=True,  # not recorded: another command holds the lock
             ) from None
         assert reserved == run
 
@@ -380,24 +437,8 @@ class Dispatcher:
         try:
             return self._dispatch(contract)
         except Refused as e:
-            if not e.recorded:
-                self._record_refusal(contract, e)
+            record_refusal(self._store, self._gate, self._now(), contract, e)
             raise
-
-    def _record_refusal(self, contract: Mapping[str, object], e: Refused) -> None:
-        task_id = contract.get("task_id") if isinstance(contract, Mapping) else None
-        task = TaskId(task_id) if isinstance(task_id, str) and task_id else None
-        event = LedgerEvent(
-            DISPATCH_REFUSED,
-            self._now(),
-            task,
-            data={"blocks": [b.as_data() for b in e.blocks], "alerts": [], "before_gate": True},
-        )
-        try:
-            with self._store.writer_lock():
-                self._store.append(event)
-        except Exception as err:  # the refusal itself must still reach Rolando
-            e.blocks += (Notice("not-recorded", f"this refusal could not be recorded: {err}"),)
 
     def _dispatch(self, contract: Mapping[str, object]) -> DispatchResult:
         now = self._now()
@@ -539,7 +580,7 @@ class Dispatcher:
             if b.code not in _ASKABLE and b not in blocks:
                 blocks.append(b)
         if blocks:
-            raise Refused(blocks)
+            raise Refused(blocks, decision=replace(decision, blocks=tuple(blocks)))
 
     def _approve_if_needed(
         self, contract: Mapping[str, object], now: datetime, refire_of: RunId | None

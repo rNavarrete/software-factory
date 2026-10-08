@@ -1,13 +1,16 @@
-# Full control check before the pilot
+# Per-control check (parked for the final go/no-go)
 
-- Linear: [ENG-163](https://linear.app/rolando-projects/issue/ENG-163/qualify-the-full-control-path-before-the-pilot), which blocks ENG-161 (the pilot)
+- Linear: [ENG-163](https://linear.app/rolando-projects/issue/ENG-163), now the one consolidated go/no-go of the Linear Todo-to-reviewed-change path
 - Checks every row of the [governance map](governance-map.md) against evidence: `python3 -m controller.audit`
 - The full table, one row per control with its evidence: [control-audit-table.md](control-audit-table.md) (regenerate with `python3 -m controller.audit --out docs/control-audit-table.md`)
-- Status on 2026-10-08: **the pilot stays blocked.** 39 of the 59 controls are observed, and the 3 advisory-only ones are labeled honestly. The other 17 are held, by 20 open items in total, which fall into the three groups below.
+
+**Status: parked, not a gate.** This was written as the check before a pilot of the terminal loop. On 2026-10-08 the plan changed: the factory is now started from Linear, and the go/no-go waits for that path to exist (the background service, Todo intake, contract drafting, Linear feedback, automatic review and bounded repairs). This check, its evidence list and the open items below are kept so the go/no-go can reuse them. They describe the terminal loop as of 2026-10-08 and will need new rows and fresh evidence for the Linear path.
+
+Snapshot on 2026-10-08: 35 of the 59 controls observed, 3 advisory-only and labeled as such, 21 held by 25 open items.
 
 ## What this is
 
-Every control the pilot relies on is listed in the governance map, with the test that shows it refusing the unsafe case. `controller/audit/controls.py` names the evidence for each one. That evidence is the offline tests and red-team cases, which the audit runs on the spot, plus records of what was seen live, with the date and the exact configuration. The audit stops the pilot unless:
+Every control the factory relies on is listed in the governance map, with the test that shows it refusing the unsafe case. `controller/audit/controls.py` names the evidence for each one. That evidence is the offline tests and red-team cases, which the audit runs on the spot, plus records of what was seen live, with the date and the exact configuration. The audit passes only when:
 
 - every map row appears exactly once, with the same class the map gives it (so "advisory" can't quietly become "enforced", or the other way round);
 - Code and Detective rows have a passing test or red-team case;
@@ -17,11 +20,11 @@ Every control the pilot relies on is listed in the governance map, with the test
 
 Advisory rows need only a note on what is recorded about them. Nothing else relies on them.
 
-## What still holds the pilot
+## What was still open on 2026-10-08
 
-### 1. The bypass-test live session (owned by the "Tests that try to sneak past checks" thread)
+### 1. Live cases (owned by the "Tests that try to sneak past checks" thread)
 
-This is one worker fire on a new ordinary sample task, run by Rolando after PR #21 (the loop fixes) merges. It covers:
+These were planned as one worker fire on the terminal loop. That thread now tests the Linear-to-PR path instead, so they will be observed there. They cover:
 
 - G-A8, G-F5, G-F6: the planted-text and release cases. A PR comment is treated as data. A release run for anything but main is refused, and publishing waits for Rolando.
 - G-B2, G-B4: a second check also named `verified`, on a probe PR that edits a workflow. It must be flagged as a control change, and the release must refuse it. Also: the collector reads each run's source from GitHub.
@@ -38,6 +41,7 @@ Each of these rows describes something that isn't true of the live setup. Each n
 - **G-F5:** the bot can start a Release run. The run then waits for Rolando's approval before publishing anything, so "trigger: denied" should read "publish: denied".
 - **G-B5:** a worker's own check run never counts as evidence; only CI on the exact commit does. So comparing a cloud run with CI on a failing example is proposed as not needed for the pilot.
 - **G-D8:** a merge before the loop's "ready" is now detected and recorded (PR #21) but not prevented. Merging stays Rolando's call on GitHub.
+- **G-D2, G-G2, G-G6, G-G7:** each is covered by tests or by a nearby live case, but the exact live case the map names was never run. The table says what was seen and what is proposed instead.
 
 ### 3. One screenshot (Rolando)
 
@@ -50,9 +54,9 @@ Each of these rows describes something that isn't true of the live setup. Each n
 - The Claude app installation shows "All repositories". The bot is still limited to the pilot repo by its collaborator rights (G-G1).
 - Run-time thresholds only alert. New dispatch is still blocked while a run is overdue, because that run holds the single lane (G-C8).
 - The map's G-F6 row has its owner and mechanism in one cell. The audit reads its class from the 4th column.
-- `planning/eng-158/offline-results.md` is older than the current red-team run, which blocks all 124 offline cases.
+- `planning/eng-158/offline-results.md` is older than the current red-team run, which blocks all 124 offline cases, so it is not used as evidence.
 
-## Blocked modes (governance map section 5), all confirmed off
+## Blocked modes (governance map section 5)
 
 | Mode | Still off because | Evidence |
 |---|---|---|
@@ -65,16 +69,16 @@ Each of these rows describes something that isn't true of the live setup. Each n
 
 ## Configuration this ran against
 
-- Factory controller: rNavarrete/software-factory branch `claude/eng-163-control-check-jyyyqw` (on main `8bd6ebb` plus PR #21). The table records the exact commit.
+- Factory controller: rNavarrete/software-factory, main with PR #21 merged. The table records the commit it ran on.
 - Pilot repo: rNavarrete/factory-pilot-demo, main `6704028`, main ruleset 24692198, `release` environment (Rolando as the only reviewer).
 - Worker: routine `trig_01CHWbQ267i1CMLGUym1kGd9` on the factory account, environment `factory`.
-- Fires this week: about 6 of 12. The audit itself fires nothing and reads no ledger.
+- The audit itself fires nothing and reads no ledger.
 
 ## Operator recovery instructions
 
 - **A launch whose outcome is unknown, or an attempt that has to be closed:** [controller/recovery/reconcile-procedure.md](../controller/recovery/reconcile-procedure.md). Nothing re-fires by itself. The lane is freed only by a signed clearing that meets ADR 0002 section 6.1.
 - **Stopping a running worker:** [controller/attempts/stop-procedure.md](../controller/attempts/stop-procedure.md). This is advisory: there is no API to stop a cloud session, so it's done by hand.
-- **A PR merged before the loop said ready:** the close-out run says so and records it as `merged-before-ready` in the ledger. Nothing more is needed. The pilot's numbers count it.
+- **A PR merged before the loop said ready:** the close-out run says so and records it as `merged-before-ready` in the ledger. Nothing more is needed.
 - **Main moved after a PR was checked:** the loop says which review no longer counts. The review is posted again for the new main, and CI runs again on the new main.
 - **Re-running this check:** `python3 -m controller.audit` (exit 0 only when nothing holds); `python3 -m controller.audit --autofix` for the auto-fix detector.
 
@@ -82,4 +86,4 @@ Each of these rows describes something that isn't true of the live setup. Each n
 
 | Date | Minutes | What |
 |---|---|---|
-| 2026-10-08 | 0 | Nothing asked of him yet |
+| 2026-10-08 | 0 | Nothing asked of him |

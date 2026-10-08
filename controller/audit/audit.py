@@ -13,7 +13,7 @@ observed:
   release run), with where it is written down, the date and the exact
   configuration or commit it ran against. Records can't be re-run from here,
   so each one must say all four.
-- ``pending``: what still has to be observed. Anything here holds the pilot.
+- ``pending``: what still has to be observed. Anything here holds the check.
 
 The rules (governance map section 6):
 
@@ -28,8 +28,8 @@ The rules (governance map section 6):
 - Every ID in the map appears exactly once, and nothing else does except the
   blocked-mode checks (IDs starting ``M-``).
 
-``Report.pilot_may_start`` is true only when nothing holds. It is a statement
-about evidence, not an approval: whether the pilot starts stays Rolando's.
+``Report.all_observed`` is true only when nothing holds. It is a statement
+about evidence, not an approval: whether to go ahead stays Rolando's.
 """
 
 from __future__ import annotations
@@ -44,6 +44,12 @@ CLASSES = ("Code", "Platform", "Boundary", "Human gate", "Detective", "Advisory"
 _ID_RE = re.compile(r"^G-[A-G]\d{1,2}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MODE_PREFIX = "M-"
+_UNSTATED = re.compile(r"^\s*(not stated|unknown|n/?a|none|-)?\s*$", re.I)
+_NOT_SEEN = re.compile(
+    r"\b(pending|not (yet )?(tested|observed|run|done|captured|attempted|demonstrated)"
+    r"|never (run|tried|attempted|observed)|could not be read)\b",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -63,6 +69,10 @@ class Record:
         out = [f"record has no {k}" for k in ("what", "where", "revision") if not getattr(self, k)]
         if not _DATE_RE.match(self.observed_on):
             out.append(f"record date {self.observed_on!r} is not YYYY-MM-DD")
+        if _UNSTATED.search(self.revision):
+            out.append(f"record names no configuration ({self.revision!r})")
+        if _NOT_SEEN.search(self.what):
+            out.append(f"record says it was not observed: {self.what[:80]!r}")
         return out
 
 
@@ -75,7 +85,7 @@ class Control:
     redteam: tuple[str, ...] = ()
     records: tuple[Record, ...] = ()
     pending: str = ""
-    """What still has to be observed. Holds the pilot while set."""
+    """What still has to be observed. Holds the check while set."""
     note: str = ""
     """For Advisory rows: what is recorded about it, and that nothing relies on it."""
 
@@ -115,7 +125,7 @@ class Report:
         return tuple(out)
 
     @property
-    def pilot_may_start(self) -> bool:
+    def all_observed(self) -> bool:
         return not self.holds
 
 
@@ -132,17 +142,19 @@ def map_classes(text: str) -> dict[str, tuple[str, ...]]:
     for line in text.splitlines():
         if line.startswith("## "):
             section = line
-        if not section.startswith("## 3.") or not line.startswith("| G-"):
+        if not section.startswith("## 3.") or not line.lstrip().startswith("|"):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        # The signed map's G-F6 row has its owner and mechanism in one cell
-        # (6 columns); its class is then the 4th. Anything else is unreadable.
-        class_at = {7: 4, 6: 3}.get(len(cells))
-        if class_at is None:
-            raise ValueError(f"can't read map row {cells[0]!r}: {len(cells)} columns, not 7")
+        if cells[0] == "ID" or set("".join(cells)) <= set("-: "):
+            continue  # a header or separator row
         cid = cells[0]
         if not _ID_RE.match(cid):
-            raise ValueError(f"can't read map ID {cid!r}")
+            raise ValueError(f"can't read map row {cid!r}: not a control ID")
+        # The signed map's G-F6 row has its owner and mechanism in one cell
+        # (6 columns); its class is then the 4th. Any other short row is unreadable.
+        class_at = 4 if len(cells) == 7 else 3 if (len(cells), cid) == (6, "G-F6") else None
+        if class_at is None:
+            raise ValueError(f"can't read map row {cid!r}: {len(cells)} columns, not 7")
         if cid in out:
             raise ValueError(f"{cid} is listed twice in the map")
         out[cid] = _classes(cells[class_at])
@@ -151,19 +163,27 @@ def map_classes(text: str) -> dict[str, tuple[str, ...]]:
     return out
 
 
+_CLASS_NOTES = {
+    # Prose the signed map puts after a class name, accepted as written.
+    "Code on the recorded snapshot; the usage reading itself is human": "Code",
+    "Human gate in the pilot; Code once the verifier is a program": "Human gate",
+}
+
+
 def _classes(cell: str) -> tuple[str, ...]:
-    """'Detective (Code once the verifier is a program) + Human gate' -> (Detective, Human gate)."""
+    """'Detective (Code once the verifier is a program) + Human gate' -> (Detective, Human gate).
+
+    Each part must be exactly a class name once parenthetical notes (and an
+    em-dash note) are removed; anything else stops the audit."""
     plain = re.sub(r"\([^)]*\)", "", cell.replace("**", ""))
     plain = re.sub(r"—.*$", "", plain)
     found = []
     for part in plain.split("+"):
-        part = part.strip()
-        for c in CLASSES:
-            if part.startswith(c):
-                found.append(c)
-                break
-        else:
+        part = " ".join(part.split())
+        part = _CLASS_NOTES.get(part, part)
+        if part not in CLASSES:
             raise ValueError(f"unknown class {part!r} in {cell!r}")
+        found.append(part)
     return tuple(found)
 
 
@@ -187,17 +207,35 @@ def run_unittests(ids: Sequence[str]) -> dict[str, str | None]:
             out[test_id] = "does not exist"
             loader.errors.clear()
             continue
-        if suite.countTestCases() != 1:
-            out[test_id] = f"names {suite.countTestCases()} tests, not exactly one"
+        found = list(_flatten(suite))
+        if len(found) != 1:
+            out[test_id] = f"names {len(found)} tests, not exactly one"
+            continue
+        if found[0].id() != test_id or not test_id.rsplit(".", 1)[-1].startswith(
+            loader.testMethodPrefix
+        ):
+            out[test_id] = "is not a test method"
             continue
         result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
         if result.errors or result.failures:
             out[test_id] = "fails" if result.failures else "errors"
         elif result.skipped:
             out[test_id] = "was skipped"
+        elif result.expectedFailures or result.unexpectedSuccesses:
+            out[test_id] = "is marked as an expected failure"
+        elif not result.wasSuccessful() or result.testsRun != 1:
+            out[test_id] = "did not run as one passing test"
         else:
             out[test_id] = None
     return out
+
+
+def _flatten(suite):
+    for t in suite:
+        if isinstance(t, unittest.TestSuite):
+            yield from _flatten(t)
+        else:
+            yield t
 
 
 def run_redteam(ids: Sequence[str]) -> dict[str, str | None]:
@@ -288,7 +326,12 @@ def _row(c: Control, mapped: tuple[str, ...] | None, tests, cases) -> Row:
         holds.append("no passing test or red-team case shows it refusing the unsafe case")
     if kinds & {"Platform", "Boundary"} and not live:
         holds.append("no live record shows the setting or boundary holding")
-    if kinds == {"Human gate"} and not run and not live:
+    if (
+        "Human gate" in kinds
+        and not kinds & {"Code", "Detective", "Platform", "Boundary"}
+        and not run
+        and not live
+    ):
         holds.append("no test or record shows the loop stopping until his decision exists")
     if "Unsupported" in kinds:
         holds.append("unsupported: the mode that needs it stays blocked")
@@ -302,11 +345,11 @@ def render(report: Report, *, revision: str = "") -> str:
     lines = ["# Full control check", ""]
     if revision:
         lines += [f"Factory commit checked: `{revision}`", ""]
-    if report.pilot_may_start:
-        lines += ["**Every control the pilot needs is observed.** The pilot may start.", ""]
+    if report.all_observed:
+        lines += ["**Every control is observed.** Whether to go ahead stays Rolando's call.", ""]
     else:
         lines += [
-            f"**The pilot stays blocked: {len(report.holds)} thing(s) hold it.**",
+            f"**Not every control is observed yet: {len(report.holds)} thing(s) hold.**",
             "",
         ]
     if report.problems:

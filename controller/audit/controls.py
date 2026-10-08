@@ -178,21 +178,13 @@ CONTROLS: tuple[Control, ...] = (
                 revision="factory account cloud session",
             ),
         ),
-        pending="the planted-text live cases (PR comment, release) on the ENG-158 live session (one worker fire, run by Rolando after PR #21 merges)",
+        pending="the planted-text live cases (PR comment, release) on the ENG-158 live cases on the Linear-to-PR path",
     ),
     Control(
         "G-A9",
         ("Advisory",),
         tests=(
             "tests.test_qualify.QualifierTest.test_l3_notes_ask_for_a_path_outside_the_contract",
-        ),
-        records=(
-            Record(
-                what="'Two worker-refusal tests (l2, l3) are not run yet' / Still open: 'l3 (extra notes ignored) need[s] ... starts'",
-                where="planning/eng-182/live-results.md",
-                observed_on="2026-10-08",
-                revision="routine trig_01CHWbQ267i1CMLGUym1kGd9",
-            ),
         ),
         note="Advisory. The worker's reaction to extra instructions is recorded by the ENG-158 PR-comment live case; nothing relies on it, since scope is checked on the PR (G-A10).",
     ),
@@ -327,7 +319,7 @@ CONTROLS: tuple[Control, ...] = (
                 revision="rNavarrete/software-factory PR #18 + #19 (main 8bd6ebb); pilot PRs #15 e14e80a, #16 6f1b098, #17 7c9eab2",
             ),
         ),
-        pending="re-observing on the ENG-158 live session (one worker fire, run by Rolando after PR #21 merges) with the fixed loop: the clearing and observation notes now have to name what they cover (PR #21)",
+        pending="re-observing on the ENG-158 live cases on the Linear-to-PR path with the fixed loop: the clearing and observation notes now have to name what they cover (PR #21)",
     ),
     Control(
         "G-B4",
@@ -430,14 +422,6 @@ CONTROLS: tuple[Control, ...] = (
             "tests.test_attempts.AttemptGateTests.test_429_waits_for_retry_after_factory_wide",
             "tests.test_dispatch.DispatchTests.test_ac4_rate_limit_wait_with_an_expired_approval_still_asks_nothing",
             "tests.test_routine_adapter.LaunchTest.test_5xx_and_redirects_are_unknown_and_not_retried",
-        ),
-        records=(
-            Record(
-                what="(429 not observed live; only 401 and 200 fires)",
-                where="planning/eng-182/live-results.md",
-                observed_on="2026-10-08",
-                revision="routine trig_01CHWbQ267i1CMLGUym1kGd9",
-            ),
         ),
     ),
     Control(
@@ -551,15 +535,7 @@ CONTROLS: tuple[Control, ...] = (
             "tests.test_ledger.PlacementTest.test_files_are_private",
             "tests.test_ledger.PlacementTest.test_default_path_is_in_the_home_directory",
         ),
-        records=(
-            Record(
-                what="section 4 table: ledger 'Different machine; no network path or credential to it' Test 'D4 (path absent); full G-D2 test once the ledger exists'; section 6 'worker's D output pending paste'",
-                where="planning/eng-143/worker-permissions.md",
-                observed_on="2026-10-08",
-                revision="factory cloud session",
-            ),
-        ),
-        note="The ledger and approval store are a file on Rolando's Mac; a cloud worker has no network path or credential to it.",
+        pending="Rolando's decision on the map wording (see docs/control-audit.md, 'Decisions'): the ledger and approval store are a file on Rolando's Mac, which a cloud worker has no network path or credential to reach; proposed as holding by construction, since the from-a-worker attempt was never run",
     ),
     Control(
         "G-D3",
@@ -671,7 +647,7 @@ CONTROLS: tuple[Control, ...] = (
                 revision="rNavarrete/software-factory PR #18 + #19 (main 8bd6ebb); pilot PRs #15 e14e80a, #16 6f1b098, #17 7c9eab2 (PR #17 7c9eab2)",
             ),
         ),
-        pending="re-observing on the ENG-158 live session (one worker fire, run by Rolando after PR #21 merges) with the fixed loop: the clearing and observation notes now have to name what they cover (PR #21)",
+        pending="re-observing on the ENG-158 live cases on the Linear-to-PR path with the fixed loop: the clearing and observation notes now have to name what they cover (PR #21)",
     ),
     Control(
         "G-D10",
@@ -722,7 +698,7 @@ CONTROLS: tuple[Control, ...] = (
                 revision="rNavarrete/software-factory PR #18 + #19 (main 8bd6ebb); pilot PRs #15 e14e80a, #16 6f1b098, #17 7c9eab2",
             ),
         ),
-        pending="re-observing on the ENG-158 live session (one worker fire, run by Rolando after PR #21 merges) with the fixed loop: the clearing and observation notes now have to name what they cover (PR #21)",
+        pending="re-observing on the ENG-158 live cases on the Linear-to-PR path with the fixed loop: the clearing and observation notes now have to name what they cover (PR #21)",
     ),
     Control(
         "G-E2",
@@ -786,7 +762,7 @@ CONTROLS: tuple[Control, ...] = (
                 revision="rNavarrete/software-factory PR #18 + #19 (main 8bd6ebb); pilot PRs #15 e14e80a, #16 6f1b098, #17 7c9eab2",
             ),
         ),
-        pending="re-observing on the ENG-158 live session (one worker fire, run by Rolando after PR #21 merges) with the fixed loop: the clearing and observation notes now have to name what they cover (PR #21)",
+        pending="re-observing on the ENG-158 live cases on the Linear-to-PR path with the fixed loop: the clearing and observation notes now have to name what they cover (PR #21)",
     ),
     Control(
         "G-E4",
@@ -818,14 +794,8 @@ CONTROLS: tuple[Control, ...] = (
                 observed_on="2026-10-08",
                 revision="rNavarrete/software-factory PR #18 + #19 (main 8bd6ebb); pilot PRs #15 e14e80a, #16 6f1b098, #17 7c9eab2 (PR #17 7c9eab2)",
             ),
-            Record(
-                what="snapshot table (12 cases 'got through', incl. weak-length-assertion, expected-value-mirrors-code, hook-hidden..., typecheck-suppressed-in-src)",
-                where="planning/eng-158/offline-results.md",
-                observed_on="2026-10-08",
-                revision="not stated",
-            ),
         ),
-        pending="re-observing on the ENG-158 live session (one worker fire, run by Rolando after PR #21 merges) with the fixed loop: the clearing and observation notes now have to name what they cover (PR #21)",
+        pending="re-observing on the ENG-158 live cases on the Linear-to-PR path with the fixed loop: the clearing and observation notes now have to name what they cover (PR #21)",
     ),
     Control(
         "G-E5",
@@ -853,12 +823,6 @@ CONTROLS: tuple[Control, ...] = (
                 where="planning/eng-142/results.md",
                 observed_on="2026-10-08",
                 revision="rNavarrete/factory-pilot-demo exported-main-ruleset.json",
-            ),
-            Record(
-                what="Closed out: 'T2 (bot direct push): the exact refusal text was not captured. Main stayed at 8199fc2'",
-                where="planning/eng-142/results.md",
-                observed_on="2026-10-08",
-                revision="rNavarrete/factory-pilot-demo",
             ),
         ),
         pending="Rolando's decision on the map wording (see docs/control-audit.md, 'Decisions'): the ruleset keeps a repo-admin bypass for pull requests (Rolando's own PRs), not the empty bypass list the map asks for",
@@ -891,14 +855,6 @@ CONTROLS: tuple[Control, ...] = (
     Control(
         "G-F3",
         ("Advisory",),
-        records=(
-            Record(
-                what="Ticket criteria 4: 'GitHub lets a write collaborator merge once approval and checks pass ... Not demonstrated live: the agent declined'",
-                where="planning/eng-142/results.md",
-                observed_on="2026-10-08",
-                revision="rNavarrete/factory-pilot-demo ruleset 24692198",
-            ),
-        ),
         note="Advisory: Rolando does every merge by policy; a bot merge after his approval was not tried. Required approval (G-F1, G-F2) is what holds.",
     ),
     Control(
@@ -967,12 +923,6 @@ CONTROLS: tuple[Control, ...] = (
                 observed_on="2026-10-08",
                 revision="rNavarrete/factory-pilot-demo main 6c6badb, site repo 68d993f",
             ),
-            Record(
-                what="section 6 B2 'tag push: Claude's GitHub proxy refuses tag pushes (docs) - Covered by docs, not observed'",
-                where="planning/eng-143/worker-permissions.md",
-                observed_on="2026-10-08",
-                revision="rNavarrete/factory-pilot-demo",
-            ),
         ),
         pending="the release live case (ENG-158): a run for anything but main is refused and publishing waits for Rolando",
     ),
@@ -1016,14 +966,8 @@ CONTROLS: tuple[Control, ...] = (
                 observed_on="2026-10-08",
                 revision="rNavarrete/factory-pilot-demo claude/env-check-a1 727ce6f",
             ),
-            Record(
-                what="section 6 'D credentials: ENG-181 check run: no token-shaped values ... Covered; worker's D output pending paste'",
-                where="planning/eng-143/worker-permissions.md",
-                observed_on="2026-10-08",
-                revision="rNavarrete/factory-pilot-demo",
-            ),
         ),
-        note="Worker environment searched; the fire key is only in Rolando's Keychain and is sent only as the start request's auth header.",
+        pending="Rolando's decision on the map wording (see docs/control-audit.md, 'Decisions'): the worker's environment was searched (it also carries the platform's own cloud credential variables, values unread), but its files were not; the start key lives only in Rolando's Keychain and is sent only as the start request's auth header, so this is proposed as holding by construction",
     ),
     Control(
         "G-G3",
@@ -1060,7 +1004,7 @@ CONTROLS: tuple[Control, ...] = (
                 revision="factory account",
             ),
         ),
-        pending="on the ENG-158 live session (one worker fire, run by Rolando after PR #21 merges): Rolando confirms the factory account's session list shows only the one session that fire started (no session from the merges)",
+        pending="on the ENG-158 live cases on the Linear-to-PR path: Rolando confirms the factory account's session list shows only the one session that fire started (no session from the merges)",
     ),
     Control(
         "G-G5",
@@ -1083,7 +1027,7 @@ CONTROLS: tuple[Control, ...] = (
                 revision="rNavarrete/software-factory PR #18 + #19 (main 8bd6ebb); pilot PRs #15 e14e80a, #16 6f1b098, #17 7c9eab2",
             ),
             Record(
-                what="Every factory-run worker PR (#14, #15, #16, #17) has exactly one commit, committed before the PR was opened: no later push, so auto-fix did not run",
+                what="Every factory-run worker PR (#14, #15, #16, #17) has exactly one commit, committed before the PR was opened: no later push, so auto-fix left no trace",
                 where="https://github.com/rNavarrete/factory-pilot-demo/pulls?q=author%3Arnavarrete-factory-bot",
                 observed_on="2026-10-08",
                 revision="pilot PRs #14 07ba252, #15 e14e80a, #16 6f1b098, #17 7c9eab2 (read via GitHub, 16:25Z)",
@@ -1114,7 +1058,7 @@ CONTROLS: tuple[Control, ...] = (
                 revision="rNavarrete/factory-pilot-demo",
             ),
         ),
-        note="The bot is a write collaborator; GitHub lets only admins edit rulesets or settings. Not attempted from the factory account (no attack-style prompts there).",
+        pending="Rolando's decision on the map wording (see docs/control-audit.md, 'Decisions'): the bot is a write collaborator and GitHub lets only admins edit rulesets or settings, but an actual attempt was never made (attack-style prompts stay off the factory account); proposed as observed from the role",
     ),
     Control(
         "G-G7",
@@ -1125,7 +1069,7 @@ CONTROLS: tuple[Control, ...] = (
         ),
         records=(
             Record(
-                what="'qual-smoke-l1-a1-f1 not-launched, HTTP 401 ... Live proof that a wrong key is refused'; 'Old-key rejection (l5) was not tested live'",
+                what="qual-smoke-l1-a1-f1 was refused with HTTP 401: a wrong start key is rejected",
                 where="planning/eng-182/live-results.md",
                 observed_on="2026-10-08",
                 revision="routine trig_01CHWbQ267i1CMLGUym1kGd9",
@@ -1137,6 +1081,6 @@ CONTROLS: tuple[Control, ...] = (
                 revision="rNavarrete/factory-pilot-demo main 7d88313, branch claude/revocation-probe ee19eae",
             ),
         ),
-        note="A wrong start key was rejected live; the key regenerated after the 13:18Z leak makes the old one a wrong key too.",
+        pending="Rolando's decision on the map wording (see docs/control-audit.md, 'Decisions'): a wrong start key was rejected live and bot access revocation was shown, but a revoked key was never fired (the old key was never kept); proposed as covered by the wrong-key case",
     ),
 )

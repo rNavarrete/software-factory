@@ -75,14 +75,14 @@ class MapTests(unittest.TestCase):
         ):
             with self.subTest(bad=bad[-60:]):
                 r = audit(good(), text=bad)
-                self.assertFalse(r.pilot_may_start)
+                self.assertFalse(r.all_observed)
                 self.assertTrue(r.problems[0].startswith("governance map:"), r.problems)
 
 
 class RuleTests(unittest.TestCase):
     def test_good_list_lets_the_pilot_start(self):
         r = audit(good())
-        self.assertTrue(r.pilot_may_start, r.holds)
+        self.assertTrue(r.all_observed, r.holds)
         self.assertEqual(r.holds, ())
 
     def test_every_map_id_exactly_once_and_nothing_else(self):
@@ -93,32 +93,32 @@ class RuleTests(unittest.TestCase):
         }
         for name, controls in cases.items():
             with self.subTest(name):
-                self.assertFalse(audit(controls).pilot_may_start)
+                self.assertFalse(audit(controls).all_observed)
         # Blocked-mode checks are the only extra IDs allowed.
         extra = (*good(), Control("M-autofix", ("Code",), tests=("t.m",)))
-        self.assertTrue(audit(extra).pilot_may_start, audit(extra).holds)
+        self.assertTrue(audit(extra).all_observed, audit(extra).holds)
 
     def test_class_must_match_the_map(self):
         relabeled = (Control("G-C9", ("Code",), tests=("t",)),) + good()[:2] + good()[3:]
         r = audit(relabeled)
-        self.assertFalse(r.pilot_may_start)
+        self.assertFalse(r.all_observed)
         self.assertIn("differs from the map", "\n".join(r.holds))
         # And an enforced control can't be relabeled advisory to dodge evidence.
         dodged = (Control("G-A1", ("Advisory",), note="x"),) + good()[1:]
-        self.assertFalse(audit(dodged).pilot_may_start)
+        self.assertFalse(audit(dodged).all_observed)
 
     def test_failing_missing_or_unrun_test_holds(self):
         for why in ("fails", "errors", "does not exist", "was skipped"):
             with self.subTest(why=why):
                 r = audit(good(), tests=lambda ids, why=why: {i: why for i in ids})
-                self.assertFalse(r.pilot_may_start)
+                self.assertFalse(r.all_observed)
                 self.assertIn(f"test t.a1 {why}", "\n".join(r.holds))
         r = audit(good(), tests=lambda ids: {})
         self.assertIn("was not run", "\n".join(r.holds))
 
     def test_red_team_case_must_be_blocked(self):
         r = audit(good(), cases=lambda ids: {i: "not run yet" for i in ids})
-        self.assertFalse(r.pilot_may_start)
+        self.assertFalse(r.all_observed)
         self.assertIn("red-team case c.g5: not run yet", "\n".join(r.holds))
 
     def test_code_needs_a_run_test_platform_needs_a_live_record(self):
@@ -138,7 +138,7 @@ class RuleTests(unittest.TestCase):
         ):
             with self.subTest(bad=bad):
                 controls = good()[:1] + (Control("G-B2", ("Platform",), records=(bad,)),)
-                self.assertFalse(audit(controls + good()[2:]).pilot_may_start)
+                self.assertFalse(audit(controls + good()[2:]).all_observed)
 
     def test_pending_holds_even_with_evidence(self):
         pending = (Control("G-B2", ("Platform",), records=(REC,), pending="live case"),)
@@ -147,7 +147,7 @@ class RuleTests(unittest.TestCase):
 
     def test_advisory_needs_only_its_note_and_mixed_rows_need_their_evidence(self):
         no_note = (Control("G-C9", ("Advisory",)),)
-        self.assertFalse(audit(good()[:2] + no_note + good()[3:]).pilot_may_start)
+        self.assertFalse(audit(good()[:2] + no_note + good()[3:]).all_observed)
         no_audit = (Control("G-G5", ("Advisory", "Detective"), note="never enabled"),)
         r = audit(good()[:3] + no_audit)
         self.assertIn("no passing test or red-team case", "\n".join(r.holds))
@@ -155,10 +155,10 @@ class RuleTests(unittest.TestCase):
     def test_render_says_blocked_and_why(self):
         r = audit(good(), tests=lambda ids: {i: "fails" for i in ids})
         text = render(r, revision="abc")
-        self.assertIn("The pilot stays blocked", text)
+        self.assertIn("Not every control is observed yet", text)
         self.assertIn("HOLDS: test t.a1 fails", text)
         self.assertIn("`abc`", text)
-        self.assertIn("Every control the pilot needs is observed", render(audit(good())))
+        self.assertIn("Every control is observed", render(audit(good())))
 
 
 class RealListTests(unittest.TestCase):
@@ -205,8 +205,9 @@ if __name__ == "__main__":
 
 
 class FakeApi:
-    def __init__(self, prs, commits, runs, fail=()):
+    def __init__(self, prs, commits, runs, fail=(), no_runs_key=False):
         self.prs, self.commits, self.runs, self.fail = prs, commits, runs, set(fail)
+        self.no_runs_key = no_runs_key
 
     def json(self, path):
         from controller.loop.collect import GitHubUnreadable
@@ -220,8 +221,13 @@ class FakeApi:
             n = int(path.split("/pulls/")[1].split("/")[0])
             return self.commits.get(n, []) if page == 1 else []
         if "/actions/runs" in path:
-            ref = path.split("branch=")[1]
-            return {"workflow_runs": [{"head_sha": s} for s in self.runs.get(ref, [])]}
+            if self.no_runs_key:
+                return {"message": "Not Found"}
+            ref = path.split("branch=")[1].split("&")[0]
+            heads = self.runs.get(ref, [])
+            return {
+                "workflow_runs": [{"head_sha": s} for s in heads[(page - 1) * 100 : page * 100]]
+            }
         raise AssertionError(path)
 
     def raw(self, path):
@@ -280,3 +286,26 @@ class AutofixTests(unittest.TestCase):
         self.assertFalse(self.check(api).clean)
         self.assertFalse(self.check(FakeApi([], {}, {})).clean)
         self.assertFalse(self.check(FakeApi([_pr(15, login="someone")], {}, {})).clean)
+
+
+class AutofixPagingTests(unittest.TestCase):
+    def check(self, api):
+        from controller.audit.autofix import check_autofix
+
+        return check_autofix(api, "o/r", {"rnavarrete-factory-bot"})
+
+    def test_a_second_head_on_the_second_page_of_runs_is_found(self):
+        api = FakeApi(
+            [_pr(15)],
+            {15: [_commit("a" * 40, "2026-10-08T14:00:00Z")]},
+            {"b15": ["a" * 40] * 100 + ["c" * 40]},
+        )
+        self.assertIn("2 different head commits", self.check(api).findings[0])
+
+    def test_a_runs_reply_without_a_run_list_is_unreadable_not_clean(self):
+        api = FakeApi(
+            [_pr(15)], {15: [_commit("a" * 40, "2026-10-08T14:00:00Z")]}, {}, no_runs_key=True
+        )
+        r = self.check(api)
+        self.assertFalse(r.clean)
+        self.assertIn("could not be read", r.findings[0])
