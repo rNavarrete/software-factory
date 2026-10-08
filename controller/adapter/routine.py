@@ -89,12 +89,8 @@ def envelope_errors(envelope: object, digest: ContractDigest, attempt: AttemptId
         errors.append(f"attempt must be {attempt.number} and at most {MAX_ATTEMPT}")
     if envelope.get("branch") != attempt.branch:
         errors.append(f"branch must be {attempt.branch}")
-    title = envelope.get("pr_title")
-    marker = attempt.pr_title_marker(digest) + " "
-    if not isinstance(title, str) or not title.startswith(marker) or not title[len(marker) :]:
-        errors.append(f"pr_title must be {marker!r} followed by a one-line summary")
-    elif "\n" in title or "\r" in title:
-        errors.append("pr_title must be one line")
+    if envelope.get("pr_title") != pr_title(attempt, digest):
+        errors.append(f"pr_title must be exactly {pr_title(attempt, digest)!r}")
 
     contract = envelope.get("contract")
     if not isinstance(contract, dict):
@@ -113,27 +109,41 @@ def envelope_errors(envelope: object, digest: ContractDigest, attempt: AttemptId
     return errors
 
 
+def pr_title(attempt: AttemptId, digest: ContractDigest) -> str:
+    """The worker's PR title: the marker, then the task id.
+
+    Nothing else goes in it. Free text there would not be covered by the
+    contract digest, so it could carry instructions or a forged second line
+    that nobody approved."""
+    return f"{attempt.pr_title_marker(digest)} {attempt.task}"
+
+
 def build_fire_text(
     contract: Mapping[str, Any],
     digest: ContractDigest,
     attempt: AttemptId,
-    summary: str,
+    *,
     validate_contract: ContractValidator = contract_format.validate,
 ) -> str:
     """The fire text for one attempt. Raises PayloadRejected rather than return
-    anything the adapter or the worker would refuse."""
+    anything the adapter or the worker would refuse.
+
+    ``contract`` may be a plain dict or the read-only form that
+    ``controller.contract.loads`` and ``freeze`` return."""
+    try:
+        plain = json.loads(contract_format.canonical_bytes(contract))
+    except (TypeError, ValueError) as e:
+        raise PayloadRejected([f"contract is not plain JSON: {e}"]) from None
     envelope = {
         "factory_payload": ENVELOPE_VERSION,
-        "contract": dict(contract),
+        "contract": plain,
         "contract_digest": digest.value,
         "attempt": attempt.number,
         "branch": attempt.branch,
-        "pr_title": f"{attempt.pr_title_marker(digest)} {summary.strip()}",
+        "pr_title": pr_title(attempt, digest),
     }
     text = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
     errors = _text_errors(text, digest, attempt, validate_contract)
-    if not summary.strip():
-        errors.append("summary must not be empty")
     if errors:
         raise PayloadRejected(errors)
     return text
@@ -340,4 +350,5 @@ __all__ = [
     "envelope_errors",
     "keychain_key",
     "parse_retry_after",
+    "pr_title",
 ]
