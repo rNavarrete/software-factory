@@ -40,6 +40,13 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _tty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def _real() -> Loop:
     from controller.approval import Approvals, ContractStore, KeychainKey, tty_confirm
     from controller.attempts import AttemptGate
@@ -52,7 +59,7 @@ def _real() -> Loop:
 
     store = SqliteLedgerStore()  # ~/.software-factory, created 0700
     home = DEFAULT_HOME.expanduser()
-    timer = Timer(store, _now)
+    timer = Timer(store, _now, interactive=_tty)
     confirm = timer.confirm(tty_confirm)
     key = KeychainKey()
     gate = AttemptGate(store)

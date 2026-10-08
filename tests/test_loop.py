@@ -176,12 +176,105 @@ class AssessTests(unittest.TestCase):
         self.assertEqual(results[CI_CHECK_NAME]["url"], fx.CI_URL)
 
     def test_checks_event_is_none_without_a_candidate(self):
+        # A missing merge base now raises (read again later); the only
+        # candidate-less Collected left is a malformed PR answer.
         w = World()
-        w.merge_base = "nope"
-        a = assess(fx.CONTRACT, fx.DIGEST, collected(w))
+        w.pr["state"] = "merged"
+        c = collected(w)
+        self.assertIsNone(c.candidate)
+        a = assess(fx.CONTRACT, fx.DIGEST, c)
         from controller.interfaces import RunId
 
         self.assertIsNone(a.checks_event(RunId(ATTEMPT, 1), NOW))
+        self.assertEqual(a.conclusion(), "failure")
+
+
+def outside_scope(world, path="package.json", text='{"name": "x"}\n'):
+    """The worker also changed ``path``, outside the contract's permitted paths."""
+    world.files.append({"filename": path, "status": "modified"})
+    world.pr["changed_files"] = len(world.files)
+    world.contents[(path, fx.HEAD)] = text.encode()
+    world.contents[(path, fx.BASE)] = b"{}\n"
+
+
+def changes_ci(world):
+    """The worker changed the trusted workflow, and CI flagged it."""
+    from tests.github_world import control_change, zipped
+
+    outside_scope(world, ".github/workflows/ci.yml", "on: pull_request\njobs: {}\n")
+    world.blobs[2] = zipped(
+        "control-change",
+        control_change(flagged=True, reasons=["changes .github/workflows/ci.yml"]),
+    )
+
+
+class ConclusionTests(unittest.TestCase):
+    def assess(self, world, **kw):
+        return assess(fx.CONTRACT, fx.DIGEST, collected(world), **kw)
+
+    def test_only_rolandos_answers_missing_is_action_required(self):
+        a = self.assess(World())
+        self.assertTrue(a.only_rolando_missing)
+        self.assertEqual(a.conclusion(), "action_required")
+
+    def test_only_the_flag_missing_is_action_required(self):
+        a = self.assess(World(), observations=(fx.observation(),))
+        self.assertTrue(a.only_rolando_missing)
+        self.assertEqual(a.conclusion(), "action_required")
+
+    def test_only_the_observation_missing_is_action_required(self):
+        a = self.assess(World(), clearances=(fx.clearance(),))
+        self.assertEqual(a.conclusion(), "action_required")
+
+    def test_scope_violation_is_failure_even_with_open_flags(self):
+        w = World()
+        outside_scope(w)
+        a = self.assess(w)
+        self.assertTrue(a.collected.usable, a.collected.problems)
+        self.assertTrue(a.open_flags())
+        self.assertFalse(a.only_rolando_missing)
+        self.assertEqual(a.conclusion(), "failure")
+
+    def test_scope_violation_stays_failure_with_all_his_answers(self):
+        w = World()
+        outside_scope(w)
+        a = self.assess(
+            w,
+            observations=(fx.observation(),),
+            clearances=tuple(fx.clearance(f.key) for f in self.assess(w).open_flags()),
+        )
+        self.assertFalse(a.ready)
+        self.assertEqual(a.conclusion(), "failure")
+
+    def test_ci_workflow_change_is_failure(self):
+        w = World()
+        changes_ci(w)
+        a = self.assess(w)
+        self.assertFalse(a.only_rolando_missing)
+        self.assertEqual(a.conclusion(), "failure")
+
+    def test_observed_fail_is_failure(self):
+        a = self.assess(World(), observations=(fx.observation(verdict=Verdict.FAIL),))
+        self.assertFalse(a.only_rolando_missing)
+        self.assertEqual(a.conclusion(), "failure")
+
+    def test_uncovered_criterion_is_failure_not_action_required(self):
+        from tests.github_world import honest_review
+
+        w = World()
+        w.comments[0]["body"] = honest_review(links=[], proofs=[])
+        a = self.assess(w)
+        self.assertIsNotNone(a.review.url)
+        self.assertEqual(a.conclusion(), "failure")
+
+    def test_edited_review_is_waiting_on_review_not_ready(self):
+        w = World()
+        w.comments[0]["updated_at"] = "2026-10-08T15:30:00Z"
+        a = self.assess(w, observations=(fx.observation(),), clearances=(fx.clearance(),))
+        self.assertFalse(a.ready)
+        self.assertTrue(a.waiting_on_review)
+        self.assertFalse(a.only_rolando_missing)
+        self.assertTrue(any(i.startswith("edited:") for i in a.review.ignored))
 
 
 # --- ReviewDecisions and Timer ----------------------------------------------------
@@ -411,6 +504,26 @@ class TimerTests(unittest.TestCase):
         (e,) = self.times()
         self.assertGreater(e.data["minutes"], 0)
 
+    def test_not_interactive_records_nothing(self):
+        timer = Timer(self.store, lambda: NOW, interactive=lambda: False)
+        self.assertEqual(timer.timed(lambda: "answer", "a prompt"), "answer")
+        self.assertTrue(timer.confirm(lambda s, c: True)("Approve", "abc"))
+        self.assertEqual(self.times(), [])
+
+    def test_not_interactive_still_raises_from_the_prompt(self):
+        timer = Timer(self.store, lambda: NOW, interactive=lambda: False)
+
+        def boom():
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            timer.timed(boom, "a prompt")
+        self.assertEqual(self.times(), [])
+
+    def test_interactive_is_the_default(self):
+        Timer(self.store, lambda: NOW).timed(lambda: None, "a prompt")
+        self.assertEqual(len(self.times()), 1)
+
     def test_time_entries_csv(self):
         self.timer.record(5, "read the PR", "worker stuck", entered_by="Rolando")
         lines = time_entries(self.store)
@@ -633,7 +746,7 @@ class LoopTests(LoopCase):
         self.ci_done()
         self.review_posted()
         self.said.clear()
-        code = self.run_loop("y\n\nlooked\n")
+        code = self.run_loop("y\n\nRead the diff: only the filterByStatus import changed.\n")
         self.assertEqual(code, EXIT_READY, self.text())
         self.assertEqual(len(self.adapter.requests), 1)
         self.assertEqual(len(self.events("fire-intent")), 1)
@@ -665,14 +778,17 @@ class LoopTests(LoopCase):
         self.ci_done()
         self.review_posted()
         self.world.jobs[RUN_ID][1]["conclusion"] = "failure"
-        code = self.run_loop("y\n\nlooked\n")
+        code = self.run_loop("y\n\nRead the diff: only the filterByStatus import changed.\n")
         self.assertEqual(code, EXIT_STOPPED, self.text())
         text = self.text()
-        self.assertIn(f"PR #{NUMBER} is not ready for review:", text)
+        self.assertIn(f"PR #{NUMBER} (commit {fx.HEAD[:12]}) is not ready for review:", text)
+        self.assertNotIn("Only your answers are missing", text)
         self.assertIn("verified job concluded failure", text)
         self.assertIn("python3 -m controller repair", text)
         # Collection problems: Rolando is not asked for anything.
-        self.assertEqual(self.stdin.read(), "y\n\nlooked\n")
+        self.assertEqual(
+            self.stdin.read(), "y\n\nRead the diff: only the filterByStatus import changed.\n"
+        )
         (e,) = self.checks()
         results = {r["name"]: r["conclusion"] for r in e.data["results"]}
         self.assertEqual(results[CHECK_NAME], "failure")
@@ -704,7 +820,9 @@ class LoopTests(LoopCase):
         self.open_pr()
         self.ci_done()
         self.review_posted()
-        code = self.run_loop("n\nThe filter did nothing.\nlooked\n")
+        code = self.run_loop(
+            "n\nThe filter did nothing.\nRead the diff: only the filterByStatus import changed.\n"
+        )
         self.assertEqual(code, EXIT_STOPPED, self.text())
         (e,) = self.checks()
         self.assertEqual(
@@ -715,8 +833,11 @@ class LoopTests(LoopCase):
         self.open_pr()
         self.ci_done()
         self.review_posted()
-        self.loop = self.build("y\n\nlooked\n")
-        self.loop.asker = Asker(io.StringIO("y\n\nlooked\n"), io.StringIO())
+        self.loop = self.build("y\n\nRead the diff: only the filterByStatus import changed.\n")
+        self.loop.asker = Asker(
+            io.StringIO("y\n\nRead the diff: only the filterByStatus import changed.\n"),
+            io.StringIO(),
+        )
         self.assertEqual(self.loop.run(self.contract), EXIT_STOPPED)
 
     def test_worker_claims_in_body_never_make_the_loop_ready(self):
@@ -726,11 +847,125 @@ class LoopTests(LoopCase):
         self.review_posted()
         self.assertEqual(self.run_loop("\n\n"), EXIT_STOPPED)
 
+    def test_ready_output_names_the_checked_commit(self):
+        self.open_pr()
+        self.ci_done()
+        self.review_posted()
+        self.assertEqual(self.run_loop("y\n\nRead the diff: import only.\n"), EXIT_READY)
+        self.assertIn(f"Checked commit: {fx.HEAD}", self.text())
+
+    def test_only_answers_missing_says_so_instead_of_the_repair_hint(self):
+        self.open_pr()
+        self.ci_done()
+        self.review_posted()
+        self.assertEqual(self.run_loop("\n\n"), EXIT_STOPPED)
+        text = self.text()
+        self.assertIn(f"PR #{NUMBER} (commit {fx.HEAD[:12]}) is not ready for review:", text)
+        self.assertIn("Only your answers are missing", text)
+        self.assertNotIn("python3 -m controller repair", text)
+        (e,) = self.checks()
+        conclusion = {r["name"]: r["conclusion"] for r in e.data["results"]}[CHECK_NAME]
+        self.assertEqual(conclusion, "action_required")
+
+    def test_not_a_note_leaves_the_flag_open(self):
+        for word in ("n", "no", "No.", "ok", "y", "yes", "skip", "lgtm", "LGTM!", "short"):
+            with self.subTest(word=word):
+                self.setUp()
+                self.open_pr()
+                self.ci_done()
+                self.review_posted()
+                code = self.run_loop(f"y\n\n{word}\n")
+                self.assertEqual(code, EXIT_STOPPED, self.text())
+                self.assertIn("Left open", self.text())
+                cand = collected().candidate
+                decisions = ReviewDecisions(self.store, KEY)
+                self.assertEqual(decisions.clearances(ATTEMPT, fx.DIGEST, cand), ())
+                self.assertEqual(len(decisions.observations(ATTEMPT, fx.DIGEST, cand)), 1)
+
+    def test_eight_character_note_clears(self):
+        self.open_pr()
+        self.ci_done()
+        self.review_posted()
+        self.assertEqual(self.run_loop("y\n\nread it!\n"), EXIT_READY, self.text())
+
+    def test_scope_violation_asks_nothing_even_with_open_flags(self):
+        outside_scope(self.world)
+        self.open_pr()
+        self.ci_done()
+        self.review_posted()
+        answers = "y\n\nRead the diff: it is fine.\nRead it too, fine.\n"
+        code = self.run_loop(answers)
+        self.assertEqual(code, EXIT_STOPPED, self.text())
+        self.assertEqual(self.stdin.read(), answers)
+        self.assertIn("python3 -m controller repair", self.text())
+        self.assertNotIn("Only your answers are missing", self.text())
+        self.assertEqual(self.events(kinds.HUMAN_DECISION)[1:], [])
+        (e,) = self.checks()
+        conclusion = {r["name"]: r["conclusion"] for r in e.data["results"]}[CHECK_NAME]
+        self.assertEqual(conclusion, "failure")
+
+    def test_ci_workflow_change_asks_nothing(self):
+        changes_ci(self.world)
+        self.open_pr()
+        self.ci_done()
+        self.review_posted()
+        answers = "y\n\nRead the workflow change, fine.\n"
+        self.assertEqual(self.run_loop(answers), EXIT_STOPPED, self.text())
+        self.assertEqual(self.stdin.read(), answers)
+        self.assertNotIn("Needs your eyes", self.text())
+
+    def test_worker_editing_rolandos_review_comment_is_never_ready(self):
+        self.open_pr()
+        self.ci_done()
+        self.review_posted()
+        # Same author on GitHub, but edited after it was posted.
+        self.world.comments[0]["updated_at"] = "2026-10-08T15:45:00Z"
+        code = self.run_loop("y\n\nRead the diff: import only.\n", wait=2)
+        self.assertEqual(code, EXIT_WAITING, self.text())
+        self.assertIn("waiting for the independent review comment", self.text())
+        self.assertNotIn("Ready for your review", self.text())
+        self.assertEqual(self.stdin.read(), "y\n\nRead the diff: import only.\n")
+
+    def test_attempt_from_another_contract_version_stops(self):
+        self.assertEqual(self.run_loop(wait=0), EXIT_WAITING)
+        self.contract = dict(fx.CONTRACT, goal="Something else entirely.")
+        self.said.clear()
+        self.open_pr()
+        self.ci_done()
+        self.review_posted()
+        code = self.run_loop("y\n\nRead the diff: import only.\n")
+        self.assertEqual(code, EXIT_STOPPED, self.text())
+        self.assertIn("was started from another version of this contract", self.text())
+        self.assertIn(fx.DIGEST.short, self.text())
+        self.assertEqual(len(self.adapter.requests), 1)
+        self.assertEqual(self.checks(), [])
+
+    def test_ctrl_c_during_dispatch_returns_3(self):
+        def interrupt(request):
+            raise KeyboardInterrupt
+
+        self.adapter.answers = [interrupt]
+        self.assertEqual(self.run_loop(), EXIT_WAITING)
+        self.assertIn("Whatever was sent is on record", self.text())
+
+    def test_not_interactive_loop_records_no_minutes(self):
+        self.open_pr()
+        self.ci_done()
+        self.review_posted()
+        self.loop = self.build("y\n\nRead the diff: import only.\n")
+        self.loop.timer.interactive = lambda: False
+        self.assertEqual(self.loop.run(self.contract), EXIT_READY, self.text())
+        timed = [e for e in self.events(kinds.HUMAN_TIME) if e.data["entered_by"] != "Rolando"]
+        self.assertEqual(timed, [])
+
     def test_new_push_after_ready_needs_new_answers(self):
         self.open_pr()
         self.ci_done()
         self.review_posted()
-        self.assertEqual(self.run_loop("y\n\nlooked\n"), EXIT_READY)
+        self.assertEqual(
+            self.run_loop("y\n\nRead the diff: only the filterByStatus import changed.\n"),
+            EXIT_READY,
+        )
         # The worker pushes again: new head, new CI run, and a new review.
         self.world.pr["head"]["sha"] = fx.NEW_HEAD
         self.world.runs[0]["head_sha"] = fx.NEW_HEAD
@@ -745,7 +980,11 @@ class LoopTests(LoopCase):
         new_cand = replace(fx.candidate(), head_commit=fx.NEW_HEAD)
         from verify.review import review_block
 
-        self.world.comments[0]["body"] = review_block(
+        self.world.comments.append(dict(self.world.comments[0], id=901))
+        self.world.comments[1]["html_url"] = f"{PR_URL}#issuecomment-901"
+        self.world.comments[1]["created_at"] = "2026-10-08T18:00:00Z"
+        self.world.comments[1]["updated_at"] = "2026-10-08T18:00:00Z"
+        self.world.comments[1]["body"] = review_block(
             str(fx.DIGEST),
             new_cand,
             links=[
@@ -764,6 +1003,8 @@ class LoopTests(LoopCase):
         self.said.clear()
         self.assertEqual(self.run_loop("\n\n"), EXIT_STOPPED, self.text())
         self.assertIn("ac3 is unknown", self.text())
+        self.assertIn(f"(commit {fx.NEW_HEAD[:12]})", self.text())
+        self.assertIn("Only your answers are missing", self.text())
 
 
 class MergedTests(LoopCase):
@@ -789,11 +1030,42 @@ class MergedTests(LoopCase):
             [e for e in self.events(kinds.HUMAN_TIME) if e.data["entered_by"] == "Rolando"], []
         )
 
+    def minutes(self):
+        return [e for e in self.events(kinds.HUMAN_TIME) if e.data["entered_by"] == "Rolando"]
+
+    def test_f_minutes_bounds(self):
+        cases = {
+            "480\n": [480],
+            "0.5\n": [0.5],
+            "nan\n12\n": [12],
+            "inf\n7\n": [7],
+            "1e9\n30\n": [30],
+            "481\n5\n": [5],
+            "0\n-3\n": [],
+            "nan\ninf\n9\n": [],
+            "lots\n\n": [],
+        }
+        for answers, want in cases.items():
+            with self.subTest(answers=answers):
+                self.setUp()
+                self.open_pr(merged=True)
+                self.assertEqual(self.run_loop(answers), EXIT_READY, self.text())
+                self.assertEqual([e.data["minutes"] for e in self.minutes()], want)
+
+    def test_f_bad_minutes_are_reasked_once(self):
+        self.open_pr(merged=True)
+        self.run_loop("nan\ninf\n9\n")
+        self.assertEqual(self.stdin.read(), "9\n")
+        self.assertEqual(self.text().count("A number of minutes"), 2)
+
     def test_f_merged_rerun_does_not_clear_twice(self):
         self.open_pr(merged=True)
         self.assertEqual(self.run_loop("\n"), EXIT_READY)
-        self.assertEqual(self.run_loop("\n"), EXIT_READY)
+        self.said.clear()
+        self.assertEqual(self.run_loop("15\n"), EXIT_READY)
         self.assertEqual(len(self.recovery.clears), 0)  # the rebuilt recovery's spy
+        self.assertIn("already closed out", self.text())
+        self.assertEqual(self.stdin.read(), "15\n")  # minutes not asked twice
         cleared = [e for e in self.store.events() if e.event.kind == "attempt-cleared"]
         self.assertLessEqual(len(cleared), 1)
 

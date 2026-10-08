@@ -83,6 +83,11 @@ class NotFound(GitHubUnreadable):
     """GitHub answered 404: the thing asked for does not exist (or is hidden)."""
 
 
+class Unusable(Exception):
+    """GitHub answered, and the answer can't be judged (too many files, a
+    binary file). Unlike GitHubUnreadable, reading again won't help."""
+
+
 class GitHubApi(Protocol):
     def json(self, path: str) -> Any:
         """GET ``path`` from the REST API and parse it. Raises NotFound on 404."""
@@ -191,9 +196,10 @@ def collect(
     """Read PR ``pr_number`` in ``repo`` and everything the verifiers need about it.
 
     ``approved`` is the digest from Rolando's approval record, never the PR's
-    own claim. Raises GitHubUnreadable only when the PR itself can't be read;
-    any later read that fails becomes a problem, so a half-read PR is never
-    judged.
+    own claim. Raises GitHubUnreadable when any read fails (try again later;
+    a half-read PR is never judged), including when the PR's head or base
+    moved while it was being read. What GitHub answered but can't be judged
+    becomes a problem.
     """
     if not _REPO_RE.fullmatch(repo):
         raise ValueError(f"not an owner/name repository: {repo!r}")
@@ -275,14 +281,12 @@ def collect(
             " this attempt's output."
         )
 
-    merge_base, paths = None, ()
+    merge_base = _merge_base(api, repo, base_sha, head_sha)
+    paths: tuple[str, ...] = ()
     try:
-        merge_base = _merge_base(api, repo, base_sha, head_sha)
         paths = _changed_paths(api, repo, pr_number, changed_count)
-    except GitHubUnreadable as e:
-        problems.append(f"Could not read what PR #{pr_number} changes: {e}.")
-    if merge_base is None:
-        return Collected(**shell, candidate=None, problems=tuple(problems))
+    except Unusable as e:
+        problems.append(f"Can't judge what PR #{pr_number} changes: {e}.")
 
     candidate = Candidate(
         repository=base_repo,
@@ -299,34 +303,30 @@ def collect(
         for commit in (head_sha, merge_base):
             try:
                 sources.append(TestSource(path, commit, _file_text(api, repo, path, commit)))
-            except GitHubUnreadable as e:
-                problems.append(f"Could not read {path} at {commit[:12]}: {e}.")
+            except Unusable as e:
+                problems.append(f"Can't check {path} at {commit[:12]}: {e}.")
 
-    comments: tuple[Comment, ...] = ()
-    try:
-        comments = _comments(api, repo, pr_number)
-    except GitHubUnreadable as e:
-        problems.append(f"Could not read PR #{pr_number}'s comments: {e}.")
+    comments = _comments(api, repo, pr_number)
 
-    ci, results, control, pending = None, (), None, False
-    try:
-        ci = _ci_run(api, repo, pr_number, head_sha, policy)
-    except GitHubUnreadable as e:
-        problems.append(f"Could not read CI for {head_sha[:12]}: {e}.")
-    else:
-        # No trusted run for this head yet, or it hasn't finished: judge nothing.
-        pending = ci is None or ci.status != "completed" or ci.verified is None
+    results, control = (), None
+    ci = _ci_run(api, repo, pr_number, head_sha, policy)
+    # No trusted run for this head yet, or it hasn't finished: judge nothing.
+    pending = ci is None or ci.status != "completed" or ci.verified is None
     if ci is not None and not pending:
-        try:
-            results, control, ci_problems = _ci_evidence(api, repo, ci, head_sha, approved)
-        except GitHubUnreadable as e:
-            ci_problems = [f"Could not read the CI run's artifacts: {e}."]
+        results, control, ci_problems = _ci_evidence(api, repo, ci, head_sha, approved)
         problems += ci_problems
         if ci.verified != "success":
             problems.append(
                 f"The trusted CI run ({ci.url}) did not pass: its {VERIFIED_JOB} job"
                 f" concluded {ci.verified}."
             )
+
+    # Everything above was read in several calls. If the worker pushed (or main
+    # moved) meanwhile, the file list and comments may describe another
+    # revision than the head the CI run was matched to: read again later.
+    again = api.json(f"repos/{repo}/pulls/{pr_number}")
+    if _get(again, "head", "sha") != head_sha or _get(again, "base", "sha") != base_sha:
+        raise GitHubUnreadable(f"PR #{pr_number} moved while it was being read")
 
     return Collected(
         **shell,
@@ -366,7 +366,7 @@ def _changed_paths(api: GitHubApi, repo: str, number: int, expected: int) -> tup
     if len(files) != expected:
         # GitHub stops listing at 3000 files; a list shorter than the PR says
         # is not every changed file, so nothing about it can be trusted.
-        raise GitHubUnreadable(f"GitHub listed {len(files)} of the PR's {expected} changed files")
+        raise Unusable(f"GitHub listed {len(files)} of the PR's {expected} changed files")
     out: list[str] = []
     for f in files:
         names = [f.get("filename")]
@@ -374,7 +374,7 @@ def _changed_paths(api: GitHubApi, repo: str, number: int, expected: int) -> tup
             names.append(f.get("previous_filename"))
         for name in names:
             if not isinstance(name, str) or not name or name.startswith("/") or "\0" in name:
-                raise GitHubUnreadable(f"a changed file has no usable name: {name!r}")
+                raise Unusable(f"a changed file has no usable name: {name!r}")
             if name not in out:
                 out.append(name)
     return tuple(out)
@@ -387,11 +387,11 @@ def _file_text(api: GitHubApi, repo: str, path: str, commit: str) -> str | None:
     except NotFound:
         return None
     if len(data) > MAX_FILE_BYTES:
-        raise GitHubUnreadable(f"{len(data)} bytes is over the {MAX_FILE_BYTES}-byte limit")
+        raise Unusable(f"{len(data)} bytes is over the {MAX_FILE_BYTES}-byte limit")
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as e:
-        raise GitHubUnreadable("not UTF-8 text, so it cannot be checked") from e
+        raise Unusable("not UTF-8 text, so it cannot be checked") from e
 
 
 def _comments(api: GitHubApi, repo: str, number: int) -> tuple[Comment, ...]:
@@ -402,17 +402,19 @@ def _comments(api: GitHubApi, repo: str, number: int) -> tuple[Comment, ...]:
             raise GitHubUnreadable("the comments answer is not a list")
         for c in batch:
             cid, author = _get(c, "id"), _get(c, "user", "login")
-            url, body, updated = _get(c, "html_url"), _get(c, "body"), _get(c, "updated_at")
+            url, body = _get(c, "html_url"), _get(c, "body")
+            created, updated = _get(c, "created_at"), _get(c, "updated_at")
             if not (
                 isinstance(cid, int)
                 and isinstance(author, str)
                 and isinstance(url, str)
                 and url.startswith("https://")
                 and isinstance(body, str)
+                and isinstance(created, str)
                 and isinstance(updated, str)
             ):
                 raise GitHubUnreadable("a comment in the answer is malformed")
-            out.append(Comment(cid, author, url, body, updated))
+            out.append(Comment(cid, author, url, body, created, updated))
         if len(batch) < 100:
             break
     return tuple(out)
@@ -544,6 +546,14 @@ def _ci_evidence(
             )
         except (TypeError, ValueError) as e:
             problems.append(f"The control-change report could not be read: {e}.")
+    if control is not None and (control.base_commit, control.head_commit) != (ci.base_sha, head):
+        # The report's commits come from the run's own event payload; GitHub's
+        # pull_requests entry may show the PR's base now rather than then.
+        problems.append(
+            f"The CI run ({ci.url}) checked {control.head_commit[:12]} on base"
+            f" {control.base_commit[:12]}, not {head[:12]} on {ci.base_sha[:12]}:"
+            " its results may be for an older main. Re-run CI on the PR."
+        )
     return results, control, problems
 
 
@@ -565,13 +575,19 @@ def _artifact_json(
     newest = max(found, key=lambda a: (str(a.get("created_at") or ""), a["id"]))
     try:
         blob = api.raw(f"repos/{repo}/actions/artifacts/{newest['id']}/zip")
-        with zipfile.ZipFile(io.BytesIO(blob)) as z:
-            info = z.getinfo(f"{member}.json")
-            if info.file_size > MAX_ARTIFACT_BYTES:
-                return f"{name} in {ci.url} is too large to read."
-            data = json.loads(z.read(info).decode("utf-8"))
+    except NotFound:
+        return f"The CI run's {name} artifact is listed but can't be downloaded ({ci.url})."
+    if len(blob) > MAX_ARTIFACT_BYTES:
+        return f"{name} in {ci.url} is too large to read."
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as z, z.open(f"{member}.json") as f:
+            # Read at most the limit: the size in the zip's header is the
+            # uploader's word, and a small zip can expand to gigabytes.
+            raw = f.read(MAX_ARTIFACT_BYTES + 1)
+        if len(raw) > MAX_ARTIFACT_BYTES:
+            return f"{member}.json in {ci.url} is too large to read."
+        data = json.loads(raw.decode("utf-8"))
     except (
-        GitHubUnreadable,
         zipfile.BadZipFile,
         zipfile.LargeZipFile,
         KeyError,

@@ -25,7 +25,7 @@ from datetime import datetime
 from controller.interfaces import ContractDigest, LedgerEvent, RunId
 from controller.ledger import kinds
 from controller.loop.collect import Collected
-from verify.assertions import AssertionReport, map_assertions
+from verify.assertions import AssertionReport, Coverage, map_assertions
 from verify.assertions import render as render_assertions
 from verify.criteria import Report, Verdict, verify
 from verify.criteria import render as render_criteria
@@ -41,6 +41,8 @@ class Assessment:
     review: Review = field(default_factory=Review)
     criteria: Report | None = None
     assertions: AssertionReport | None = None
+    observable: frozenset[str] = frozenset()
+    """Criteria checked by a person (observable-behavior, human-review)."""
 
     @property
     def ready(self) -> bool:
@@ -70,14 +72,35 @@ class Assessment:
 
     def owed_observations(self, contract: Mapping[str, object]) -> tuple[Mapping, ...]:
         """Observable criteria with no verdict yet, which only Rolando can supply."""
+        owed = self._owed()
+        return tuple(c for c in contract["acceptance_criteria"] if c["id"] in owed)
+
+    def _owed(self) -> frozenset[str]:
         if self.criteria is None:
-            return ()
-        unknown = {c.criterion for c in self.criteria.criteria if c.verdict is Verdict.UNKNOWN}
-        return tuple(
-            c
-            for c in contract["acceptance_criteria"]
-            if c["id"] in unknown
-            and c["evidence"]["type"] in ("observable-behavior", "human-review")
+            return frozenset()
+        return frozenset(
+            c.criterion
+            for c in self.criteria.criteria
+            if c.verdict is Verdict.UNKNOWN and c.criterion in self.observable
+        )
+
+    @property
+    def only_rolando_missing(self) -> bool:
+        """Everything holds except what only Rolando can supply: an observation
+        of a behavior criterion, or his look at a flag. Asking him anything
+        when something else is wrong would waste his time: no answer of his
+        can make such a PR ready."""
+        if not self.collected.usable or self.review.url is None:
+            return False
+        if self.criteria is None or self.assertions is None:
+            return False
+        if not all(g.ok for g in (*self.criteria.gates, *self.assertions.gates)):
+            return False
+        owed = self._owed()
+        return all(
+            c.verdict is Verdict.PASS or c.criterion in owed for c in self.criteria.criteria
+        ) and all(
+            c.status is Coverage.COVERED or c.criterion in owed for c in self.assertions.criteria
         )
 
     def open_flags(self):
@@ -93,11 +116,7 @@ class Assessment:
             return "success"
         if self.collected.pending or self.waiting_on_review:
             return "pending"
-        if self.collected.problems or self.criteria is None or self.assertions is None:
-            return "failure"
-        if any(c.verdict is Verdict.FAIL for c in self.criteria.criteria):
-            return "failure"
-        return "action_required"
+        return "action_required" if self.only_rolando_missing else "failure"
 
     def checks_event(self, run: RunId, now: datetime) -> LedgerEvent | None:
         """The ledger record of this assessment for the candidate commit."""
@@ -163,7 +182,12 @@ def assess(
         control_change=collected.control_change,
         clearances=clearances,
     )
-    return Assessment(collected, review, criteria, assertions)
+    observable = frozenset(
+        c["id"]
+        for c in contract["acceptance_criteria"]
+        if c["evidence"]["type"] in ("observable-behavior", "human-review")
+    )
+    return Assessment(collected, review, criteria, assertions, observable)
 
 
 def render(a: Assessment) -> str:

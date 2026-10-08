@@ -18,8 +18,9 @@ T1 = "2026-10-08T15:00:00Z"
 T2 = "2026-10-08T16:00:00Z"
 
 
-def comment(body, author="rNavarrete", cid=900, updated=T1):
-    return Comment(cid, author, f"{PR_URL}#issuecomment-{cid}", body, updated)
+def comment(body, author="rNavarrete", cid=900, updated=T1, created=None):
+    created = updated if created is None else created
+    return Comment(cid, author, f"{PR_URL}#issuecomment-{cid}", body, created, updated)
 
 
 def block(data) -> str:
@@ -255,11 +256,52 @@ class ReviewTests(unittest.TestCase):
         b = comment(honest_review(), cid=901, updated=T1)
         self.assertEqual(self.read(b, a).url, b.url)
 
-    def test_newest_is_by_update_time_not_id(self):
-        edited = comment(honest_review(), cid=900, updated=T2)
-        later_posted = comment(honest_review(links=[]), cid=901, updated=T1)
-        r = self.read(edited, later_posted)
-        self.assertEqual(r.url, edited.url)
+    def test_newest_is_by_creation_time_not_id(self):
+        posted_later = comment(honest_review(), cid=900, updated=T2)
+        posted_first = comment(honest_review(links=[]), cid=901, updated=T1)
+        r = self.read(posted_later, posted_first)
+        self.assertEqual(r.url, posted_later.url)
+
+    # --- edited comments ---
+
+    def test_edited_review_comment_is_ignored(self):
+        c = comment(honest_review(), created=T1, updated=T2)
+        r = self.read(c)
+        self.assertIsNone(r.url)
+        self.assertEqual(r.links, ())
+        self.assertEqual(len(r.ignored), 1)
+        self.assertTrue(r.ignored[0].startswith("edited:"), r.ignored)
+        self.assertIn(c.url, r.ignored[0])
+
+    def test_worker_editing_rolandos_comment_keeps_his_name_and_still_does_not_count(self):
+        # GitHub keeps the author when someone with write access edits a comment.
+        original = comment(honest_review(), cid=900, created=T1, updated=T1)
+        tampered = comment(
+            honest_review(proofs=[]), author="rNavarrete", cid=900, created=T1, updated=T2
+        )
+        self.assertIsNotNone(self.read(original).url)
+        r = self.read(tampered)
+        self.assertIsNone(r.url)
+        self.assertTrue(r.ignored[0].startswith("edited:"))
+
+    def test_edited_newer_review_leaves_the_older_unedited_one(self):
+        older = comment(honest_review(), cid=900, created=T1, updated=T1)
+        edited = comment(
+            honest_review(links=[]), cid=901, created=T2, updated="2026-10-08T17:00:00Z"
+        )
+        r = self.read(older, edited)
+        self.assertEqual(r.url, older.url)
+        self.assertEqual(len(r.links), 2)
+        self.assertTrue(any(i.startswith("edited:") for i in r.ignored))
+
+    def test_edited_comment_without_a_block_is_not_mentioned(self):
+        r = self.read(comment("thanks!", created=T1, updated=T2))
+        self.assertEqual(r.ignored, ())
+
+    def test_edit_check_comes_before_trust(self):
+        r = self.read(comment(honest_review(), author="someone", created=T1, updated=T2))
+        self.assertIsNone(r.url)
+        self.assertEqual(len(r.ignored), 1)
 
     def test_block_round_trips_through_review_block(self):
         cand = replace(fx.candidate(), head_commit=fx.NEW_HEAD)

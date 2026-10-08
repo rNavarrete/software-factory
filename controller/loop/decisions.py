@@ -184,6 +184,9 @@ class Timer:
     clock: Callable[[], datetime]
     entered_by: str = "controller (timed prompt)"
     task: TaskId | None = None
+    interactive: Callable[[], bool] = lambda: True
+    """Whether a person is at the terminal. With nobody there (a piped or
+    scheduled run) prompts are refused at once, and no minutes are made up."""
 
     def record(
         self, minutes: float, activity: str, reason: str | None = None, *, entered_by=None
@@ -200,6 +203,8 @@ class Timer:
             self.store.append(event)
 
     def timed(self, ask: Callable[[], object], activity: str, reason: str | None = None):
+        if not self.interactive():
+            return ask()
         start = self.clock()
         try:
             return ask()

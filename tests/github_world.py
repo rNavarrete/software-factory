@@ -169,6 +169,7 @@ class World:
                 "user": {"login": "rNavarrete"},
                 "html_url": f"{PR_URL}#issuecomment-900",
                 "body": honest_review(),
+                "created_at": "2026-10-08T15:00:00Z",
                 "updated_at": "2026-10-08T15:00:00Z",
             }
         ]

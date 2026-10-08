@@ -54,6 +54,9 @@ POLL_SECONDS = 60
 DEFAULT_WAIT_MINUTES = 90
 
 EXIT_READY, EXIT_STOPPED, EXIT_WAITING = 0, 1, 3
+MAX_REVIEW_MINUTES = 8 * 60.0
+MIN_NOTE = 8
+_NOT_A_NOTE = frozenset({"y", "yes", "n", "no", "ok", "okay", "skip", "fine", "sure", "lgtm"})
 
 
 class Asker:
@@ -110,6 +113,18 @@ class Loop:
         attempt = result.attempt
         if result.outcome == "launched":
             self.say(result.message)
+        recorded = result.status.digest if result.status is not None else None
+        if recorded and recorded != digest.value:
+            # The attempt on record was approved for another version of this
+            # contract. Its PR is judged against what was approved for it, so
+            # judging it against this file would only report false mismatches.
+            self.say(result.message)
+            self.say(
+                f"{attempt} was started from another version of this contract"
+                f" ({recorded[:12]}), not this file ({digest.short}). Finish or close that"
+                " attempt first; a changed contract needs its own approval and attempt."
+            )
+            return EXIT_STOPPED
         deadline = self.now().timestamp() + wait_minutes * 60
         last_said = None
         try:
@@ -185,19 +200,25 @@ class Loop:
             assessment = self._ask_rolando(contract, digest, attempt, assessment)
         self._record(assessment, status.latest_run, now)
         path = self._write_report(attempt, assessment)
+        head = collected.candidate.head_commit if collected.candidate else "?"
         if assessment.ready:
             self.say(f"Ready for your review: {collected.pr_url}")
+            self.say(f"Checked commit: {head}")
             self.say(f"Full report: {path}")
             self.say(
-                "Review and merge it on GitHub if you're happy. Then run this same command"
-                " again to close the task out."
+                "Before you merge, check the PR's latest commit is still the one above: a"
+                " later push hasn't been checked. Merge on GitHub if you're happy, then run"
+                " this same command again to close the task out."
             )
             return EXIT_READY, ""
-        self.say(f"PR #{number} is not ready for review:")
+        self.say(f"PR #{number} (commit {head[:12]}) is not ready for review:")
         for b in assessment.blockers:
             self.say(f"  - {b}")
         self.say(f"Full report: {path}")
-        self.say(_repair_hint(contract))
+        if assessment.conclusion() == "action_required":
+            self.say("Only your answers are missing: run this same command again to give them.")
+        else:
+            self.say(_repair_hint(contract))
         return EXIT_STOPPED, ""
 
     def _open_prs(self, numbers) -> list[int]:
@@ -274,9 +295,13 @@ class Loop:
                 ),
                 f"looked at flag {f.key} on PR #{a.collected.pr_number}",
             )
-            if answer:
-                self.decisions.clear(attempt, digest, cand, f.key, answer, self.now())
-                asked = True
+            if not answer:
+                continue
+            if answer.lower().strip(" .!") in _NOT_A_NOTE or len(answer) < MIN_NOTE:
+                self.say("Left open: say in a few words what you checked to clear it.")
+                continue
+            self.decisions.clear(attempt, digest, cand, f.key, answer, self.now())
+            asked = True
         if not asked:
             return a
         return self._assess(contract, digest, attempt, a.collected)
@@ -287,15 +312,16 @@ class Loop:
         event = a.checks_event(run, now)
         if event is None:
             return
-        # Record only a change, so polling doesn't grow the ledger.
-        last = None
-        for s in self.store.events(run.attempt.task):
-            e = s.event
-            if e.kind == event.kind and e.data.get("revision") == event.data["revision"]:
-                last = e.data.get("results")
-        if last is not None and _same(last, event.data["results"]):
-            return
+        # Record only a change, so polling doesn't grow the ledger. Checked
+        # under the writer lock so two runs at once can't both append it.
         with self.store.writer_lock():
+            last = None
+            for s in self.store.events(run.attempt.task):
+                e = s.event
+                if e.kind == event.kind and e.data.get("revision") == event.data["revision"]:
+                    last = e.data.get("results")
+            if last is not None and _same(last, event.data["results"]):
+                return
             self.store.append(event)
 
     def _write_report(self, attempt: AttemptId, a: Assessment) -> Path:
@@ -331,15 +357,23 @@ class Loop:
             except RecoveryRefused as e:
                 self.say(f"Not recorded: {e}")
                 return EXIT_STOPPED
-        minutes = self.asker.ask(
-            "Roughly how many minutes did you spend reviewing it on GitHub? (Enter to skip) "
-        )
-        try:
-            value = float(minutes) if minutes else 0.0
-        except ValueError:
-            value = 0.0
-        if value > 0:
+        for _ in range(2):
+            minutes = self.asker.ask(
+                "Roughly how many minutes did you spend reviewing it on GitHub? (Enter to skip) "
+            )
+            if not minutes:
+                break
+            try:
+                value = float(minutes)
+            except ValueError:
+                value = -1.0
+            if not (0 < value <= MAX_REVIEW_MINUTES):  # also refuses nan and inf
+                self.say(
+                    f"A number of minutes above 0 and at most {MAX_REVIEW_MINUTES:.0f}, please."
+                )
+                continue
             self.timer.record(value, f"reviewed and merged {attempt}'s PR", entered_by="Rolando")
+            break
         self.say("Done. The lane is free for the next task.")
         return EXIT_READY
 

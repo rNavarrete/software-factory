@@ -22,7 +22,9 @@ records it, never a name in the JSON, and only logins on ``mappers`` count:
 the pilot repo is public, so anyone can comment. The proofs' link is the
 comment itself. A review names the exact contract digest and revision it was
 made for; the newest valid one for this revision wins, so a corrected review
-replaces an earlier one, and a review of an older push is never reused.
+(always a new comment) replaces an earlier one, and a review of an older push
+is never reused. An edited comment is never read: GitHub lets anyone with write
+access, the worker included, edit a comment without changing its author.
 
 A review comment carries mapping work only. Clearing a flag and observing a
 behavior are Rolando's own decisions; they are typed at his terminal by the
@@ -54,7 +56,11 @@ class Comment:
     author: str
     url: str
     body: str
+    created_at: str
     updated_at: str
+    """Anyone with write access to the repo (the worker too) can edit any
+    comment, and the author GitHub shows stays the same. So a review whose
+    comment was edited is never read: a correction goes in a new comment."""
 
 
 @dataclass(frozen=True)
@@ -84,6 +90,9 @@ def read_review(
         if not blocks:
             continue
         label = f"review comment {c.url} by {c.author!r}"
+        if c.updated_at != c.created_at:
+            ignored.append(f"edited: {label} was changed after it was posted; post a new one")
+            continue
         if c.author.lower() not in allowed:
             ignored.append(f"untrusted: {label}: only {', '.join(sorted(mappers))} may map")
             continue
@@ -98,7 +107,7 @@ def read_review(
         if isinstance(review, str):
             ignored.append(f"stale: {label}: {review}")
             continue
-        valid.append(((c.updated_at, c.id), review))
+        valid.append(((c.created_at, c.id), review))
     if not valid:
         return Review(ignored=tuple(ignored))
     valid.sort(key=lambda v: v[0])

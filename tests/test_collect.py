@@ -7,8 +7,10 @@ injected ``run`` and never starts ``gh``.
 """
 
 import copy
+import io
 import subprocess
 import unittest
+import zipfile
 from unittest import mock
 
 from controller.interfaces import AttemptId, ContractDigest, TaskId
@@ -258,17 +260,15 @@ class PullRequestTests(CollectCase):
                 self.assertIsNone(c.candidate)
                 self.assertProblem(c, "missing", ".".join(field))
 
-    def test_no_merge_base_gives_no_candidate(self):
+    def test_no_merge_base_raises(self):
         self.world.merge_base = "not-a-sha"
-        c = self.collect()
-        self.assertIsNone(c.candidate)
-        self.assertProblem(c, "merge base")
+        with self.assertRaisesRegex(GitHubUnreadable, "merge base"):
+            self.collect()
 
-    def test_unreadable_compare_gives_no_candidate(self):
+    def test_unreadable_compare_raises(self):
         self.world.fail.add(f"repos/{REPO}/compare/")
-        c = self.collect()
-        self.assertIsNone(c.candidate)
-        self.assertProblem(c, "Could not read what PR #7 changes")
+        with self.assertRaises(GitHubUnreadable):
+            self.collect()
 
 
 class FileTests(CollectCase):
@@ -321,11 +321,14 @@ class FileTests(CollectCase):
         with mock.patch.object(collect_mod, "MAX_FILE_BYTES", 10):
             self.assertProblem(self.collect(), "byte limit")
 
-    def test_file_read_failing_is_a_problem(self):
+    def test_file_read_failing_raises(self):
         self.world.fail.add(f"repos/{REPO}/contents/src/main.ts")
-        c = self.collect()
-        self.assertProblem(c, "Could not read src/main.ts")
-        self.assertNeverReady(c)
+        with self.assertRaises(GitHubUnreadable):
+            self.collect()
+
+    def test_unusable_file_names_the_file_and_commit(self):
+        self.world.contents[("src/main.ts", fx.BASE)] = b"\xff"
+        self.assertProblem(self.collect(), f"Can't check src/main.ts at {fx.BASE[:12]}")
 
     def test_new_file_has_no_text_at_base_and_is_fine(self):
         del self.world.contents[("src/main.ts", fx.BASE)]
@@ -335,13 +338,30 @@ class FileTests(CollectCase):
         self.assertIsNone(texts[("src/main.ts", fx.BASE)])
         self.assertEqual(texts[("src/main.ts", fx.HEAD)], "render(); // with a status filter\n")
 
-    def test_unreadable_comments_are_a_problem(self):
+    def test_unreadable_comments_raise(self):
         self.world.fail.add(f"repos/{REPO}/issues/{NUMBER}/comments")
-        self.assertProblem(self.collect(), "comments")
+        with self.assertRaises(GitHubUnreadable):
+            self.collect()
 
-    def test_malformed_comment_is_a_problem(self):
-        self.world.comments[0]["user"] = None
-        self.assertProblem(self.collect(), "comments")
+    def test_malformed_comment_raises(self):
+        for field, value in (("user", None), ("created_at", None), ("updated_at", 5)):
+            with self.subTest(field=field):
+                w = self.world.copy()
+                w.comments[0][field] = value
+                with self.assertRaisesRegex(GitHubUnreadable, "comment"):
+                    self.collect(w)
+
+    def test_comments_carry_created_and_updated_times(self):
+        (c,) = self.collect().comments
+        self.assertEqual(c.created_at, self.world.comments[0]["created_at"])
+        self.assertEqual(c.updated_at, self.world.comments[0]["updated_at"])
+
+    def test_truncated_list_names_the_pr(self):
+        self.world.pr["changed_files"] = 4
+        c = self.collect()
+        self.assertProblem(c, f"Can't judge what PR #{NUMBER} changes")
+        self.assertEqual(c.candidate.changed_paths, ())
+        self.assertNeverReady(c)
 
 
 class CiRunTests(CollectCase):
@@ -408,11 +428,10 @@ class CiRunTests(CollectCase):
         self.assertEqual(c.ci.app, "")
         self.assertNeverReady(c)
 
-    def test_unreadable_check_suite_is_a_problem(self):
+    def test_unreadable_check_suite_raises(self):
         del self.world.suites[SUITE_ID]
-        c = self.collect()
-        self.assertProblem(c, "Could not read CI")
-        self.assertNeverReady(c)
+        with self.assertRaises(GitHubUnreadable):
+            self.collect()
 
     def test_verified_job_failure(self):
         self.world.jobs[RUN_ID][1]["conclusion"] = "failure"
@@ -489,11 +508,61 @@ class CiRunTests(CollectCase):
                 self.assertProblem(c, "which base")
                 self.assertNeverReady(c)
 
-    def test_unreadable_runs_list_is_a_problem(self):
+    def test_unreadable_runs_list_raises(self):
         self.world.fail.add(f"repos/{REPO}/actions/workflows/")
-        c = self.collect()
-        self.assertProblem(c, "Could not read CI")
-        self.assertFalse(c.pending)
+        with self.assertRaises(GitHubUnreadable):
+            self.collect()
+
+
+class ReadFailureTests(CollectCase):
+    def test_any_read_failure_after_the_pr_raises(self):
+        prefixes = {
+            "compare": "compare/",
+            "files": f"pulls/{NUMBER}/files",
+            "contents at head": f"contents/{fx.TEST_FILE}?ref={fx.HEAD}",
+            "contents at base": f"contents/src/books.ts?ref={fx.BASE}",
+            "comments": f"issues/{NUMBER}/comments",
+            "runs": "actions/workflows/",
+            "check suite": "check-suites/",
+            "jobs": f"actions/runs/{RUN_ID}/jobs",
+            "artifact list": f"actions/runs/{RUN_ID}/artifacts",
+            "evidence download": "actions/artifacts/1/",
+            "control-change download": "actions/artifacts/2/",
+        }
+        for label, prefix in prefixes.items():
+            with self.subTest(label):
+                w = self.world.copy()
+                w.fail.add(f"repos/{REPO}/{prefix}")
+                with self.assertRaises(GitHubUnreadable):
+                    self.collect(w)
+
+    def test_the_last_read_failing_raises(self):
+        w = MovingWorld(lambda world: world.fail.add(f"repos/{REPO}/pulls/{NUMBER}"))
+        with self.assertRaises(GitHubUnreadable):
+            self.collect(w)
+
+    def test_head_moving_while_read_raises(self):
+        def push(world):
+            world.pr["head"]["sha"] = fx.NEW_HEAD
+
+        w = MovingWorld(push)
+        with self.assertRaisesRegex(GitHubUnreadable, "moved while it was being read"):
+            self.collect(w)
+        pr_reads = [p for p in w.calls if p == f"repos/{REPO}/pulls/{NUMBER}"]
+        self.assertEqual(len(pr_reads), 2)
+
+    def test_base_moving_while_read_raises(self):
+        def merge_to_main(world):
+            world.pr["base"]["sha"] = fx.NEW_MAIN
+
+        with self.assertRaisesRegex(GitHubUnreadable, "moved"):
+            self.collect(MovingWorld(merge_to_main))
+
+    def test_nothing_moving_is_read_twice_and_usable(self):
+        w = MovingWorld(lambda world: None)
+        self.assertTrue(self.collect(w).usable)
+        self.assertEqual(w.calls[0], w.calls[-1])
+        self.assertEqual(w.calls[-1], f"repos/{REPO}/pulls/{NUMBER}")
 
 
 class ArtifactTests(CollectCase):
@@ -527,9 +596,48 @@ class ArtifactTests(CollectCase):
         self.world.blobs[1] = b"this is not a zip"
         self.assertProblem(self.collect(), "Could not read check-evidence.json")
 
-    def test_artifact_download_fails(self):
+    def test_artifact_download_failing_raises(self):
         self.world.fail.add(f"repos/{REPO}/actions/artifacts/1/")
-        self.assertProblem(self.collect(), "Could not read check-evidence.json")
+        with self.assertRaises(GitHubUnreadable):
+            self.collect()
+
+    def test_artifact_download_404_is_a_problem(self):
+        del self.world.blobs[1]
+        c = self.collect()
+        self.assertProblem(c, "listed but can't be downloaded")
+        self.assertNeverReady(c)
+
+    def test_artifact_blob_over_the_limit_is_a_problem(self):
+        self.world.blobs[1] = zipped("check-evidence", evidence(pad="x" * 5000))
+        with mock.patch.object(collect_mod, "MAX_ARTIFACT_BYTES", 4000):
+            self.assertProblem(self.collect(), "check-evidence-", "too large")
+
+    def test_zip_bomb_member_over_the_limit_is_a_problem(self):
+        # Small on the wire (deflated zeros), over the limit once expanded.
+        limit = collect_mod.MAX_ARTIFACT_BYTES
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("check-evidence.json", b"0" * (limit + 1000))
+        self.assertLess(len(buf.getvalue()), limit // 100)
+        self.world.blobs[1] = buf.getvalue()
+        c = self.collect()
+        self.assertProblem(c, "check-evidence.json", "too large")
+        self.assertNeverReady(c)
+
+    def test_zip_bomb_whose_header_lies_about_its_size_is_a_problem(self):
+        with mock.patch.object(collect_mod, "MAX_ARTIFACT_BYTES", 50_000):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                z.writestr("check-evidence.json", b"0" * 1_000_000)
+            b = bytearray(buf.getvalue())
+            # Claim the member is 10 bytes, in the local and central headers.
+            b[b.find(b"PK\x03\x04") + 22 : b.find(b"PK\x03\x04") + 26] = (10).to_bytes(4, "little")
+            central = b.find(b"PK\x01\x02")
+            b[central + 24 : central + 28] = (10).to_bytes(4, "little")
+            self.world.blobs[1] = bytes(b)
+            c = self.collect()
+        self.assertProblem(c, "check-evidence")
+        self.assertNeverReady(c)
 
     def test_artifact_member_missing(self):
         self.world.blobs[1] = zipped("something-else", evidence())
@@ -626,9 +734,29 @@ class ArtifactTests(CollectCase):
         self.world.blobs[1] = zipped("check-evidence", e)
         self.assertNeverReady(self.collect())
 
-    def test_control_change_for_another_commit_is_never_ready(self):
+    def test_control_change_for_another_commit_is_a_problem(self):
         self.world.blobs[2] = zipped("control-change", control_change(head=fx.NEW_HEAD))
-        self.assertNeverReady(self.collect())
+        c = self.collect()
+        self.assertProblem(c, "may be for an older main")
+        self.assertNeverReady(c)
+
+    def test_control_change_for_an_older_main_is_a_problem(self):
+        self.world.blobs[2] = zipped("control-change", control_change(base=fx.NEW_MAIN))
+        c = self.collect()
+        self.assertProblem(c, "may be for an older main", fx.NEW_MAIN[:12], fx.MAIN[:12])
+        self.assertNeverReady(c)
+
+    def test_control_change_must_match_the_runs_base_not_the_prs(self):
+        # The run says it checked NEW_MAIN; the report says MAIN: they disagree.
+        self.world.runs[0]["pull_requests"] = [{"number": NUMBER, "base": {"sha": fx.NEW_MAIN}}]
+        self.assertProblem(self.collect(), "may be for an older main")
+
+    def test_control_change_matching_a_new_base_still_leaves_results_stale(self):
+        self.world.runs[0]["pull_requests"] = [{"number": NUMBER, "base": {"sha": fx.NEW_MAIN}}]
+        self.world.blobs[2] = zipped("control-change", control_change(base=fx.NEW_MAIN))
+        c = self.collect()
+        self.assertNotIn("older main", "\n".join(c.problems))
+        self.assertNeverReady(c)
 
     def test_control_change_flagged_is_never_ready_without_clearance(self):
         self.world.blobs[2] = zipped(
@@ -641,6 +769,21 @@ class ArtifactTests(CollectCase):
     def test_unreadable_control_change(self):
         self.world.blobs[2] = zipped("control-change", {"flagged": False})
         self.assertProblem(self.collect(), "control-change report could not be read")
+
+
+class MovingWorld(World):
+    """Runs ``change`` on itself once, right after the first read of the PR."""
+
+    def __init__(self, change):
+        super().__init__()
+        self._change = change
+
+    def json(self, path):
+        answer = super().json(path)
+        if self._change is not None and path == f"repos/{REPO}/pulls/{NUMBER}":
+            change, self._change = self._change, None
+            change(self)
+        return answer
 
 
 class FakeRun:
