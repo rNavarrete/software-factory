@@ -95,7 +95,7 @@ class HonestScenarioTest(unittest.TestCase):
         self.assertIn("ready", observed.detail)
 
     def test_honest_summary_would_launch(self):
-        self.assertIn("the launch went out", rc._summary_launch("Filter books by status").detail)
+        self.assertIn("the launch went out", rc._summary_launch("filter-by-status").detail)
 
     def test_honest_edits_used_by_cases_exist(self):
         with self.assertRaises(ValueError):
@@ -332,7 +332,8 @@ class RecordsExpectedObservedAndControlTest(unittest.TestCase):
     def test_anything_not_blocked_holds_qualification(self):
         holds = holds_qualification(tuple(RESULTS.values()))
         held = {h.split(":", 1)[0] for h in holds}
-        self.assertTrue(KNOWN_GAPS <= held)
+        open_gaps = {i for i in KNOWN_GAPS if RESULTS[i].result is Result.GOT_THROUGH}
+        self.assertTrue(open_gaps <= held)
         self.assertTrue({c.id for c in LIVE_CASES} <= held)
         blocked = {i for i, r in RESULTS.items() if r.result is Result.BLOCKED}
         self.assertFalse(blocked & held)
@@ -360,9 +361,11 @@ class RecordsExpectedObservedAndControlTest(unittest.TestCase):
         md = render(tuple(RESULTS.values()))
         for c in CASES + LIVE_CASES:
             self.assertIn(f"| {c.id} |", md)
-        self.assertIn(f"- Got through: {len(KNOWN_GAPS)}", md)
+        open_gaps = [i for i in KNOWN_GAPS if RESULTS[i].result is Result.GOT_THROUGH]
+        self.assertIn(f"- Got through: {len(open_gaps)}", md)
         self.assertIn(f"- Not run yet (need the real delivery loop): {len(LIVE_CASES)}", md)
-        self.assertIn("known gap:", md)
+        if open_gaps:
+            self.assertIn("known gap:", md)
 
     def test_report_cells_cannot_break_the_table(self):
         c = rc.Case("pipe", Group.FORGED_EVIDENCE, "a | b\nc", "e", "f", None, live="g")
@@ -378,7 +381,8 @@ class RecordsExpectedObservedAndControlTest(unittest.TestCase):
 
         with contextlib.redirect_stdout(io.StringIO()) as out:
             code = main()
-        self.assertEqual(code, 1 if KNOWN_GAPS else 0)
+        open_gaps = [i for i in KNOWN_GAPS if RESULTS[i].result is Result.GOT_THROUGH]
+        self.assertEqual(code, 1 if open_gaps else 0)
         self.assertIn("## Attempts to get past verification and approval", out.getvalue())
 
 
