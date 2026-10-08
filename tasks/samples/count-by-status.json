@@ -1,0 +1,60 @@
+{
+  "format": "factory-contract/v1",
+  "task_id": "count-by-status",
+  "version": "1",
+  "goal": "Add the domain function that counts the books in each status, so a later task can show the counts on the page. No page change in this task.",
+  "inputs": [
+    "src/books.ts holds the pure domain functions; add the new one there.",
+    "Put its unit tests in a new file, tests/stats.test.ts, and leave tests/books.test.ts as it is.",
+    "Status and STATUSES in src/books.ts list the three statuses."
+  ],
+  "repository": "rNavarrete/factory-pilot-demo",
+  "base_commit": "6704028a55fcc21a6c99a3002fd5ab91a7cd7420",
+  "permitted_paths": [
+    "src/books.ts",
+    "tests/stats.test.ts"
+  ],
+  "permitted_actions": [
+    "modify-files",
+    "add-files",
+    "add-tests"
+  ],
+  "risk_markers": [],
+  "acceptance_criteria": [
+    {
+      "id": "ac1",
+      "statement": "countByStatus(books) returns an object with one entry for each of 'to-read', 'reading' and 'done', giving how many books have that status.",
+      "evidence": {
+        "type": "automated-check",
+        "command": "npm test"
+      },
+      "status": "ready"
+    },
+    {
+      "id": "ac2",
+      "statement": "countByStatus([]) returns 0 for every status.",
+      "evidence": {
+        "type": "automated-check",
+        "command": "npm test"
+      },
+      "status": "ready"
+    },
+    {
+      "id": "ac3",
+      "statement": "countByStatus does not change the array it is given or any book in it.",
+      "evidence": {
+        "type": "automated-check",
+        "command": "npm test"
+      },
+      "status": "ready"
+    }
+  ],
+  "verification_commands": [
+    "npm run typecheck",
+    "npm test",
+    "npm run build"
+  ],
+  "attempt_budget": 2,
+  "escalate_to": "rNavarrete",
+  "depends_on": []
+}
