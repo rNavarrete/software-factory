@@ -327,6 +327,23 @@ def _payload(
     fields = {n: data[n] for n in names}
     if not all(v is None or isinstance(v, str) for v in fields.values()):
         return None
+    # Optional only for compatibility with old source records. Presence and
+    # value are signed: adding/removing it from a record invalidates the MAC.
+    # A legacy record never grants a repair allowance.
+    if "repair_allowance" in data and kind not in (
+        SOURCE_AUTHORIZATION,
+        ev.SOURCE_REPAIR_AUTHORIZED,
+    ):
+        # Only a Todo move's approval and the signer's repair go-ahead may
+        # carry an allowance; on any other record it would ride unsigned.
+        return None
+    if kind == SOURCE_AUTHORIZATION and "repair_allowance" in data:
+        allowance = data["repair_allowance"]
+        binding = data.get("binding")
+        budget = binding.get("attempt_budget") if isinstance(binding, Mapping) else None
+        if type(allowance) is not int or type(budget) is not int or not 0 <= allowance < budget:
+            return None
+        fields["repair_allowance"] = allowance
     body = {
         "kind": kind,
         "task": None if task is None else str(task),
@@ -680,7 +697,7 @@ class Approvals:
         reserved: dict[AttemptId, str] = {}
         latest_fire: dict[AttemptId, RunId] = {}
         results: set[RunId] = set()
-        terms: dict[tuple[str, str], str] = {}
+        terms: dict[tuple[str, str], int] = {}
         heads = _open_heads(stored)
         withdrawn = _withdrawn_digests(stored)
         out = []
@@ -695,9 +712,12 @@ class Approvals:
                 and self._source_ok(e)
             ):
                 # The terms of the move's first authorization of this contract
-                # are the allowance Rolando's move came with.
+                # are the allowance Rolando's move came with (signed with it;
+                # a record from before allowances carries none).
+                allowance = d.get("repair_allowance", 0)
                 terms.setdefault(
-                    (str(d.get("event_id")), str(d.get("digest"))), str(d.get("policy_sha256"))
+                    (str(d.get("event_id")), str(d.get("digest"))),
+                    allowance if type(allowance) is int else 0,
                 )
             if e.kind == ev.ATTEMPT_RESERVED and e.attempt is not None:
                 reserved.setdefault(e.attempt, str(d.get("digest", "")))
@@ -820,7 +840,7 @@ class Approvals:
         self,
         e: LedgerEvent,
         reserved: Mapping[AttemptId, str],
-        terms: Mapping[tuple[str, str], str],
+        terms: Mapping[tuple[str, str], int],
         heads: Mapping[tuple[AttemptId, int], str | None],
         now: datetime,
     ) -> bool:
@@ -841,13 +861,10 @@ class Approvals:
         prior = AttemptId(a.task, a.number - 1)
         if reserved.get(prior) != d.get("digest"):
             return False
-        policy = terms.get((str(d.get("event_id")), str(d.get("digest"))))
-        if policy is None or policy != d.get("policy_sha256"):
+        allowance = terms.get((str(d.get("event_id")), str(d.get("digest"))))
+        if allowance is None or d.get("repair_allowance") != str(allowance):
             return False
-        allowance = d.get("repair_allowance")
-        if not (isinstance(allowance, str) and allowance.isdigit()):
-            return False
-        if a.number - 1 > int(allowance):
+        if a.number - 1 > allowance:
             return False
         pr = d.get("prior_pr")
         if not (isinstance(pr, str) and pr.isdigit()):

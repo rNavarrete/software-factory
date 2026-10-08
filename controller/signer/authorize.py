@@ -15,14 +15,18 @@ process, decides. It trusts nothing the service sends except as a question:
    entry: repository, routine, actions, checks and attempt budget.
 4. A Todo move authorizes one contract only. Asking again for the same
    contract renews it; a different contract for the same move is refused.
-
-Its second job (ENG-160) is ``use_repair_allowance``: the same checks again,
-then a ``source-repair-authorized`` record for one repair attempt, within the
-repair allowance the project's onboarding entry gives Todo moves.
+   Its repair allowance comes only from onboarding, is bounded by the task's
+   budget, and cannot change on renewal. Positive repair terms also pin the
+   ticket revision and policy, and require a move since policy activation.
 
 Only then does it sign a ``source-authorization``: its own record kind, never
 a ``human-decision``, valid for ``TTL``, for attempt 1, bound to the move, the
 ticket revision, the routine, the onboarding entry and the contract digest.
+
+Its second job (ENG-160) is ``use_repair_allowance``: the same checks on the
+move again, then a ``source-repair-authorized`` record for one repair attempt,
+within the allowance this move was bound to when it was first authorized, and
+only while the project's policy is still the one that move was signed under.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -67,42 +72,117 @@ class Refused(Exception):
 
 
 class OneContractPerMove:
-    """Which contract each Todo move authorized, kept in the signer's own
-    folder (the service can't write it). Also which candidate each repair
-    attempt under that move was for (ENG-160)."""
+    """Contract and repair terms per Todo move, in the signer's own folder.
+
+    Called serially by the single signer server. The service cannot write
+    this file. Legacy digest-only entries carry zero repair allowance.
+    Entries named ``<move>#repair-a<n>`` record which failed commit each
+    repair attempt under that move was for (ENG-160).
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
 
-    def _read(self) -> dict[str, str]:
+    def _read(self) -> dict[str, object]:
         try:
-            return dict(json.loads(self.path.read_text()))
+            seen = json.loads(self.path.read_text())
         except FileNotFoundError:
             return {}
+        if not isinstance(seen, dict):
+            raise ValueError("the signer's move record is not an object")
+        return seen
 
-    def contract_of(self, event_id: str) -> str | None:
-        """The contract this move authorized, if it authorized one."""
-        return self._read().get(event_id)
+    def terms_of(self, event_id: str) -> Mapping[str, object] | None:
+        """What this move was bound to when first authorized, if it was. A
+        legacy digest-only entry has no repair allowance."""
+        bound = self._read().get(event_id)
+        if isinstance(bound, str):
+            return {"digest": bound, "repair_allowance": 0}
+        return bound if isinstance(bound, dict) else None
+
+    def bind_repair(self, event_id: str, attempt: int, candidate: str) -> None:
+        """Repair ``attempt`` under this move is for ``candidate`` (the
+        contract, PR and failed commit) and no other, even after a restart."""
+        key = f"{event_id}#repair-a{attempt}"
+        seen = self._read()
+        if seen.get(key, candidate) != candidate:
+            raise Refused(
+                "this Todo move already allowed this repair attempt for another failed commit",
+                final=True,
+            )
+        if key not in seen:
+            seen[key] = candidate
+            self._save(seen)
+        self._sync_dir()
 
     def bind(
         self,
         event_id: str,
         digest: str,
-        conflict: str = (
-            "this Todo move already authorized a different version of the task; a changed"
-            " task needs a new Todo move"
-        ),
+        *,
+        repair_allowance: int,
+        terms: str,
+        revision: str,
     ) -> None:
+        """``terms`` is ``repair_terms_sha256`` of the project: only the repair
+        settings are pinned, so an unrelated onboarding edit (the next pilot
+        ticket added to ``issues``) never blocks renewing a queued move."""
         seen = self._read()
-        if seen.get(event_id, digest) != digest:
-            raise Refused(conflict, final=True)
+        previous = seen.get(event_id)
+        previous_digest = previous.get("digest") if isinstance(previous, dict) else previous
+        if event_id in seen and previous_digest != digest:
+            raise Refused(
+                "this Todo move already authorized a different version of the task; a changed"
+                " task needs a new Todo move",
+                final=True,
+            )
+        bound = {
+            "digest": digest,
+            "repair_allowance": repair_allowance,
+            "repair_terms_sha256": terms,
+            "revision": revision,
+        }
         if event_id in seen:
-            return
-        seen[event_id] = digest
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(seen, sort_keys=True))
-        os.chmod(tmp, 0o600)
-        tmp.replace(self.path)
+            # Old records contain only a digest; they retain zero repairs.
+            old_allowance = previous.get("repair_allowance") if isinstance(previous, dict) else 0
+            if (
+                type(old_allowance) is not int
+                or old_allowance != repair_allowance
+                or (repair_allowance and previous != bound)
+            ):
+                raise Refused(
+                    "this Todo move already bound different repair terms; move the ticket out"
+                    " of Todo and back to approve the current policy and allowance",
+                    final=True,
+                )
+        else:
+            seen[event_id] = bound
+            # Persist the binding before signing. A lost reply must never let
+            # the same move acquire different repair terms after a restart.
+            self._save(seen)
+        # Also retry this when a previous replace succeeded but its directory
+        # sync failed. No signed answer escapes until the record is durable.
+        self._sync_dir()
+
+    def _save(self, seen: Mapping[str, object]) -> None:
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False) as f:
+                tmp = Path(f.name)
+                json.dump(seen, f, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(self.path)
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+
+    def _sync_dir(self) -> None:
+        fd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def policy_sha256(onboarding: Onboarding, project_id: str) -> str:
@@ -114,6 +194,17 @@ def policy_sha256(onboarding: Onboarding, project_id: str) -> str:
         "skip_labels": sorted(p.skip_labels),
         "protected_paths": sorted(p.protected_paths),
         "approver_linear_user_id": onboarding.approver_linear_user_id,
+    }
+    return hashlib.sha256(contracts.canonical_bytes(body)).hexdigest()
+
+
+def repair_terms_sha256(project) -> str:
+    """The repair settings a Todo move is bound to (ENG-160), and nothing else
+    from the onboarding file."""
+    since = project.repair_allowance_since
+    body = {
+        "repair_allowance": project.repair_allowance,
+        "repair_allowance_since": since.isoformat() if since else None,
     }
     return hashlib.sha256(contracts.canonical_bytes(body)).hexdigest()
 
@@ -141,7 +232,24 @@ class TodoMoveAuthorizer:
         frozen = self._within(contract, project, verdict.task.value)
         bound = contracts.binding(frozen)
         digest = str(bound["digest"])
-        self.seen.bind(event_id, digest)
+        allowance = min(project.repair_allowance, int(frozen["attempt_budget"]) - 1)
+        if allowance and (
+            project.repair_allowance_since is None
+            or verdict.moved_at < project.repair_allowance_since
+        ):
+            raise Refused(
+                "this Todo move predates the repair policy; move the ticket out of Todo and"
+                " back to approve its allowance",
+                final=True,
+            )
+        policy_digest = policy_sha256(config, verdict.project_id)
+        self.seen.bind(
+            event_id,
+            digest,
+            repair_allowance=allowance,
+            terms=repair_terms_sha256(project),
+            revision=revision,
+        )
         data = {
             "identity": APPROVER,
             "os_user": "factory-signer",
@@ -162,7 +270,8 @@ class TodoMoveAuthorizer:
             "revision": verdict.revision,
             "linear_actor_id": policy.approver_id,
             "routine_id": project.routine_id,
-            "policy_sha256": policy_sha256(config, verdict.project_id),
+            "policy_sha256": policy_digest,
+            "repair_allowance": allowance,
         }
         event = LedgerEvent(SOURCE_AUTHORIZATION, now, TaskId(verdict.task.value), data=data)
         return sign_source_authorization(event, self.key)
@@ -194,10 +303,24 @@ class TodoMoveAuthorizer:
         frozen = self._within(contract, project, verdict.task.value)
         bound = contracts.binding(frozen)
         digest = str(bound["digest"])
-        if self.seen.contract_of(event_id) != digest:
+        terms = self.seen.terms_of(event_id)
+        if terms is None or terms.get("digest") != digest:
             raise Refused(
                 "this Todo move did not authorize this contract, so its repair allowance"
                 " doesn't cover it",
+                final=True,
+            )
+        allowance = terms.get("repair_allowance")
+        if type(allowance) is not int or allowance <= 0:
+            raise Refused("this Todo move came with no automatic repairs", final=True)
+        policy_digest = policy_sha256(config, verdict.project_id)
+        if (
+            terms.get("repair_terms_sha256") != repair_terms_sha256(project)
+            or terms.get("revision") != revision
+        ):
+            raise Refused(
+                "the project's repair settings changed since this Todo move; its repair"
+                " allowance lapsed with them, so a repair needs Rolando's go-ahead or a new move",
                 final=True,
             )
         budget = bound["attempt_budget"]
@@ -209,13 +332,10 @@ class TodoMoveAuthorizer:
                 f" {min(budget if isinstance(budget, int) else 0, project.max_attempts)}",
                 final=True,
             )
-        if attempt - 1 > project.repair_allowance:
-            have = project.repair_allowance
+        if attempt - 1 > allowance:
             raise Refused(
-                "this project's Todo moves allow no automatic repairs"
-                if have == 0
-                else f"this project's Todo moves allow {have} automatic repair"
-                f"{'' if have == 1 else 's'}, and this would be repair {attempt - 1}",
+                f"this Todo move came with {allowance} automatic repair"
+                f"{'' if allowance == 1 else 's'}, and this would be repair {attempt - 1}",
                 final=True,
             )
         if isinstance(prior_pr, bool) or not isinstance(prior_pr, int) or prior_pr < 1:
@@ -227,11 +347,7 @@ class TodoMoveAuthorizer:
         plain = repair_findings.plain(findings)
         if not plain or len(plain) > repair_findings.MAX_FINDINGS:
             raise Refused("a repair carries the findings it fixes", final=True)
-        self.seen.bind(
-            f"{event_id}#repair-a{attempt}",
-            f"{digest}:{prior_pr}:{prior_head}",
-            "this Todo move already allowed this repair attempt for another failed commit",
-        )
+        self.seen.bind_repair(event_id, attempt, f"{digest}:{prior_pr}:{prior_head}")
         now = self.now()
         task = TaskId(verdict.task.value)
         data = {
@@ -239,7 +355,7 @@ class TodoMoveAuthorizer:
             "os_user": "factory-signer",
             "by": "the factory, under the repair allowance of Rolando's Todo move",
             "authenticated_by": (
-                f"the repair allowance ({project.repair_allowance}) of Rolando's move of"
+                f"the repair allowance ({allowance}) of Rolando's move of"
                 f" {verdict.issue_key} to Todo (entry {event_id}), checked again in Linear's"
                 " history by the signer. A factory action, not a decision Rolando made."
             ),
@@ -251,8 +367,8 @@ class TodoMoveAuthorizer:
             "issue_key": verdict.issue_key,
             "revision": verdict.revision,
             "routine_id": project.routine_id,
-            "policy_sha256": policy_sha256(config, verdict.project_id),
-            "repair_allowance": str(project.repair_allowance),
+            "policy_sha256": policy_digest,
+            "repair_allowance": str(allowance),
             "prior_pr": str(prior_pr),
             "prior_head": prior_head,
             "findings": plain,
@@ -372,4 +488,5 @@ __all__ = [
     "event_from_json",
     "event_to_json",
     "policy_sha256",
+    "repair_terms_sha256",
 ]

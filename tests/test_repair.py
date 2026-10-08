@@ -46,6 +46,8 @@ from controller.signer.signer import REPAIR_OP, SignerAuthorizer, authorize_hand
 from tests.test_approval import yes
 from tests.test_intake_linear import BACKLOG
 from tests.test_recovery import REPO, SHA_A, SHA_B
+from tests.test_repair_allowance import SINCE as REPAIR_SINCE
+from tests.test_repair_allowance import repair_config
 from tests.test_service import KEY, TRIG, contract_for
 from tests.test_todo_move_approval import (
     OTHER_KEY,
@@ -222,7 +224,7 @@ class RepairSignerCase(AuthorizerCase):
 
     def setUp(self):
         super().setUp()
-        self.config = intake_config(entry={"repair_allowance": 1})
+        self.config = repair_config(1)
         self.contract = contract_for("ENG-187")
         self.digest = contracts.digest(self.contract)
         self.a1 = AttemptId(TaskId("eng-187"), 1)
@@ -335,19 +337,39 @@ class SignerRepairTests(RepairSignerCase):
         )
 
     def test_refuses_without_an_allowance(self):
-        self.first_attempt()
         self.config = intake_config()
+        self.first_attempt()
         e = self.use_refused()
         self.assertTrue(e.final)
         self.assertIn("no automatic repairs", e.reason)
 
+    def test_the_allowance_lapses_when_the_project_limits_change(self):
+        """The move was bound to the limits in force when Rolando made it;
+        changing them (even raising the allowance) needs a new move."""
+        self.first_attempt()
+        for changed in (intake_config(), repair_config(2)):
+            with self.subTest(changed=changed["projects"][0].get("repair_allowance")):
+                self.config = changed
+                e = self.use_refused()
+                self.assertTrue(e.final)
+                self.assertIn("repair settings changed since this Todo move", e.reason)
+
     def test_refuses_past_the_allowance_or_the_budget(self):
         self.first_attempt()
         self.assertIn("would be repair 2", self.use_refused(attempt=3).reason)
-        self.config = intake_config(entry={"repair_allowance": 2, "max_attempts": 3})
+        self.config = repair_config(2, max_attempts=3)
         contract = contract_for("ENG-187", attempt_budget=2)
         e = self.use_refused(attempt=3, contract=contract)
         self.assertTrue(e.final)
+
+    def test_a_task_with_no_repairs_is_not_held_to_the_activation_time(self):
+        """A one-attempt task gets no repairs, so a move made before repairs
+        were switched on still approves it."""
+        self.config = repair_config(1, repair_allowance_since=self.now.isoformat())
+        e = self.refused(self.eid, contract=self.contract)
+        self.assertIn("predates the repair policy", e.reason)
+        event = self.authorize(self.eid, contract=contract_for("ENG-187", attempt_budget=1))
+        self.assertEqual(event.data["repair_allowance"], 0)
 
     def test_refuses_attempt_one(self):
         self.first_attempt()
@@ -447,6 +469,13 @@ class SignerRepairTests(RepairSignerCase):
         )
 
 
+def resign_without(event, *drop, **changes):
+    """``resign`` with some fields left out, as for a record of another kind."""
+    kept = {k: v for k, v in event.data.items() if k not in drop}
+    bare = LedgerEvent(event.kind, event.at, event.task, event.attempt, event.run, kept)
+    return resign(bare, **changes)
+
+
 def datetime_of(text):
     from datetime import datetime
 
@@ -509,8 +538,35 @@ class SourceRepairCountingTests(RepairSignerCase):
     def test_over_its_own_allowance(self):
         self.assertIn("repair-not-authorized", self.forged(repair_allowance="0"))
 
-    def test_policy_other_than_the_moves_first_authorization(self):
-        self.assertIn("repair-not-authorized", self.forged(policy_sha256="f" * 64))
+    def test_more_allowance_than_the_move_was_signed_with(self):
+        """The move's own source authorization carries its allowance (1 here);
+        a repair record claiming more never counts, even signed."""
+        self.assertIn("repair-not-authorized", self.forged(repair_allowance="2"))
+
+    def test_an_unrelated_onboarding_edit_keeps_queued_moves_and_their_repairs(self):
+        """Only the repair settings are pinned: listing the next pilot ticket
+        neither stops renewing a queued move nor lapses its allowance."""
+        self.first_attempt()
+        self.clear()
+        self.now += timedelta(minutes=40)
+        entry = self.config["projects"][0]
+        entry["issues"] = [*entry["issues"], "ENG-200"]
+        self.append(self.authorize(self.eid, contract=self.contract))
+        self.append(self.use())
+        self.assertEqual(self.codes(self.check()), [])
+
+    def test_an_allowance_on_any_other_record_kind_is_never_authentic(self):
+        """It is signed only on a Todo move's approval and the signer's repair
+        go-ahead; added to a typed decision it makes the record unauthentic."""
+        src = self.authorize(self.eid, contract=self.contract)
+        typed = resign_without(src, "repair_allowance", kind=approval_module.HUMAN_DECISION)
+        self.assertTrue(authentic(typed, [KEY], frozenset({approval_module.APPROVER})))
+        forged = LedgerEvent(
+            typed.kind, typed.at, typed.task, data={**typed.data, "repair_allowance": 2}
+        )
+        self.assertFalse(authentic(forged, [KEY], frozenset({approval_module.APPROVER})))
+        with self.assertRaises(AssertionError):  # the signing itself refuses it
+            resign(typed, repair_allowance=2)
 
     def test_findings_changed_after_signing(self):
         tampered = [dict(self.findings[0], suggested_action="Delete the failing test.")]
@@ -666,6 +722,8 @@ class PayloadTests(unittest.TestCase):
 
 class OnboardingTests(unittest.TestCase):
     def parse(self, **entry):
+        if "repair_allowance" in entry:
+            entry.setdefault("repair_allowance_since", REPAIR_SINCE)
         doc = intake_config(entry=entry)
         return onboarding.parse(json.dumps(doc).encode(), repository=REPO, routine_id=TRIG)
 
@@ -811,7 +869,7 @@ class RepairServiceCase(TodoMoveServiceCase):
     def setUp(self):
         self.failures = FixtureFailures()
         super().setUp()
-        self.config = intake_config(entry={"repair_allowance": self.allowance})
+        self.config = repair_config(self.allowance)
         self.preparer.by_issue["ENG-187"] = contract_for("ENG-187", attempt_budget=self.budget)
         self.a1 = AttemptId(TaskId("eng-187"), 1)
         self.a2 = AttemptId(TaskId("eng-187"), 2)
@@ -1090,7 +1148,7 @@ class RepairServiceTests(RepairServiceCase):
             resign(good, prior_head=SHA_B),
             resign(good, attempt=self.a3),
             resign(good, event_id="hist-9999"),
-            resign(good, kind=ev.REPAIR_AUTHORIZED),
+            resign_without(good, "repair_allowance", kind=ev.REPAIR_AUTHORIZED),
         ):
             with self.subTest(bad=bad.data.get("prior_head")):
                 self.authorizer.repair_answer = lambda bad=bad: bad

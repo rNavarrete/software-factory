@@ -75,6 +75,7 @@ The service never approves, merges or releases anything, and it never signs a de
 - `linear_project_id`, `name`
 - `repository` and `routine_id`. In v1 these must be the pilot repo and the factory routine, and any other value refuses the whole file.
 - `allowed_actions`, `checks` and `max_attempts`. These are the most a drafted contract may ask for. A contract that names another repository, another task, a new action, a new check or a bigger budget is refused before dispatch.
+- `repair_allowance` (default zero) records how many of those attempts may be corrections. A positive value needs `repair_allowance_since`, the policy activation timestamp; only later Todo moves may acquire it. This is signed groundwork for ENG-160 and does not enable automatic repair. See [repair terms](intake.md#repair-allowance-recorded-with-the-move-eng-160-first-part).
 - `status_issue_id`: a Linear ticket for notices that concern the whole factory, such as outages and pause.
 - `intake_enabled` (top level). This is off unless set. While it is off, every Todo move is refused, and only work already queued continues. It stays off until the full path is qualified (ENG-163).
 
