@@ -1,5 +1,8 @@
 # Per-control check (parked for the final go/no-go)
 
+For the current Linear path, use the [ENG-158 failure qualification checklist](linear-failure-qualification.md).
+The terminal-era snapshot below is historical evidence, not the current pilot verdict.
+
 - Linear: [ENG-163](https://linear.app/rolando-projects/issue/ENG-163), now the one consolidated go/no-go of the Linear Todo-to-reviewed-change path
 - Checks every row of the [governance map](governance-map.md) against evidence: `python3 -m controller.audit`
 - The full table, one row per control with its evidence: [control-audit-table.md](control-audit-table.md) (regenerate with `python3 -m controller.audit --out docs/control-audit-table.md`)
