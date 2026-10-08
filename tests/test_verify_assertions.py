@@ -109,6 +109,7 @@ AC1_ASSERT = "expect(result.map((b) => b.id)).toEqual(['2', '4'])"
 AC2_TEST = "filterByStatus > returns every book for 'all'"
 AC2_ASSERT = "expect(filterByStatus(books, 'all')).toEqual(books)"
 FILE_FLAG = f"changed-test:{TEST_FILE}"
+SETUP_FLAG = f"changed-setup:{TEST_FILE}"
 
 PROBE = "probe > checks it"
 SHELF = """
@@ -269,6 +270,9 @@ def clearance(flag=FILE_FLAG, **changes):
     )
     return replace(c, **changes)
 
+
+BOTH_CLEARED = (clearance(), clearance(SETUP_FLAG))
+"""Clears the import change and a setup change, for tests about something else."""
 
 _DEFAULT = object()
 
@@ -1088,9 +1092,10 @@ class FlagsForHumanReviewTest(unittest.TestCase):
         head = BASE_TEST.replace("import { addBook,", "import { addBook as add, addBook,")
         report = run(head, links=[], proofs=[], clearances=[])
         self.assertIn(FILE_FLAG, open_keys(report))
-        self.assertIn(
-            "outside its tests", next(f for f in report.flags if f.key == FILE_FLAG).detail
-        )
+        detail = next(f for f in report.flags if f.key == FILE_FLAG).detail
+        self.assertIn("changes the imports", detail)
+        self.assertIn("+import { addBook as add, addBook, type Book } from '../src/books';", detail)
+        self.assertNotIn(SETUP_FLAG, {f.key for f in report.flags})
 
     def test_change_outside_tests_is_flagged_even_when_a_test_also_changed(self):
         # Review found: the file-level "outside its tests" flag is only raised when no test-level
@@ -1100,13 +1105,16 @@ class FlagsForHumanReviewTest(unittest.TestCase):
         )
         report = run(head)
         self.assertIn(f"changed-test:{TEST_FILE} > {ADD_TEST}", open_keys(report))
-        self.assertIn(FILE_FLAG, {f.key for f in report.flags})
+        self.assertIn(SETUP_FLAG, {f.key for f in report.flags})
         self.assertIn(
             "-const NOW = 1_767_225_600_000;",
-            next(f for f in report.flags if f.key == FILE_FLAG).detail,
+            next(f for f in report.flags if f.key == SETUP_FLAG).detail,
         )
-        cleared = run(head, clearances=[clearance(f"changed-test:{TEST_FILE} > {ADD_TEST}")])
-        self.assertIn(FILE_FLAG, open_keys(cleared))
+        cleared = run(
+            head,
+            clearances=[clearance(), clearance(f"changed-test:{TEST_FILE} > {ADD_TEST}")],
+        )
+        self.assertIn(SETUP_FLAG, open_keys(cleared))
         self.assertFalse(cleared.ready)
 
     def test_missing_base_or_head_source_for_a_changed_test_file(self):
@@ -1165,7 +1173,7 @@ class FlagsForHumanReviewTest(unittest.TestCase):
                 src("export const n = 1;\n", BASE, path=path),
             ],
         )
-        self.assertIn(f"changed-test:{path}", open_keys(report))
+        self.assertIn(f"changed-setup:{path}", open_keys(report))
 
     # Fixture-only and mirrored expectations.
 
@@ -1259,6 +1267,7 @@ class FlagsForHumanReviewTest(unittest.TestCase):
                         link("ac2"),
                     ],
                     proofs=[proof("ac1", test=PROBE), proof("ac2")],
+                    clearances=BOTH_CLEARED,
                 )
                 self.assertNotIn(FlagKind.FIXTURE_ONLY, open_kinds(report))
                 self.assertTrue(report.ready, report.blockers)
@@ -1527,6 +1536,7 @@ class IndependentOfWriterTest(unittest.TestCase):
         allowed = {
             "__future__",
             "bisect",
+            "difflib",
             "posixpath",
             "re",
             "collections",
@@ -2041,7 +2051,8 @@ class SecondReviewTest(ProbeCase):
                     self.assertEqual(weak, [])
 
     def test_html_in_supplied_text_cannot_hide_the_report(self):
-        head = HEAD_TEST.replace("const NOW", "// <!-- hide\nconst NOW", 1)
+        # A string, not a comment: comments are left out of the setup diff.
+        head = HEAD_TEST.replace("const NOW", "const NOTE = '<!-- hide';\nconst NOW", 1)
         out = render(run(head, clearances=[]))
         self.assertNotIn("<!--", out)
         self.assertIn("&lt;\\!-- hide", out)
@@ -2074,7 +2085,8 @@ class SecondReviewTest(ProbeCase):
             "const settings = { test: 1, it: 2 };\n",
         ):
             with self.subTest(setup=setup):
-                report = self.status(self.prefixed(setup))
+                # The added top-level line is a setup change, which Rolando clears too.
+                report = self.status(self.prefixed(setup), clearances=BOTH_CLEARED)
                 self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
                 self.assertTrue(report.ready, report.blockers)
 
@@ -2132,7 +2144,8 @@ class ThirdReviewTest(ProbeCase):
             "const first = [() => 1][0]();\n",
         ):
             with self.subTest(setup=setup):
-                report = self.status(self.prefixed(setup))
+                # The added top-level line is a setup change, which Rolando clears too.
+                report = self.status(self.prefixed(setup), clearances=BOTH_CLEARED)
                 self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
                 self.assertTrue(report.ready, report.blockers)
 
@@ -2141,6 +2154,292 @@ class ThirdReviewTest(ProbeCase):
         report = self.status(probe_file(probe_test(f"    {quote};")), quote=quote)
         self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
         self.assertNotIn(FlagKind.WEAK_ASSERTION, open_kinds(report))
+
+
+class BypassFollowUpTest(ProbeCase):
+    """Gaps the seeded bypass attempts (ENG-158) found, using the same scenarios."""
+
+    HOOK = (
+        "\nbeforeEach(() => {\n"
+        "  vi.spyOn(Array.prototype, 'filter').mockImplementation(function () { return this; });\n"
+        "});\n"
+    )
+
+    def with_ac1(self, assertion):
+        return run(
+            HEAD_TEST.replace(AC1_ASSERT, assertion),
+            links=[link("ac1", assertion=assertion), link("ac2")],
+        )
+
+    # Changes outside tests: the import change keeps its own flag.
+
+    def test_honest_change_raises_only_the_import_flag(self):
+        report = run(clearances=[])
+        self.assertEqual(open_keys(report), {FILE_FLAG})
+        self.assertTrue(run().ready, run().blockers)
+
+    def test_new_hook_is_not_hidden_by_the_routine_import_clearance(self):
+        report = run(HEAD_TEST + self.HOOK)
+        self.assertEqual(open_keys(report), {SETUP_FLAG})
+        detail = next(f for f in report.open_flags if f.key == SETUP_FLAG).detail
+        self.assertIn("+beforeEach(() => {", detail)
+        self.assertIn("vi.spyOn(Array.prototype, 'filter')", detail)
+        imports = next(f for f in report.flags if f.key == FILE_FLAG).detail
+        self.assertNotIn("beforeEach", imports)
+        self.assertFalse(report.ready)
+        self.assertTrue(run(HEAD_TEST + self.HOOK, clearances=BOTH_CLEARED).ready)
+
+    def test_changed_shared_value_is_not_hidden_by_the_routine_import_clearance(self):
+        report = run(HEAD_TEST.replace("1_767_225_600_000", "0", 1))
+        self.assertEqual(open_keys(report), {SETUP_FLAG})
+        detail = next(f for f in report.open_flags if f.key == SETUP_FLAG).detail
+        self.assertIn("-const NOW = 1_767_225_600_000;", detail)
+        self.assertIn("+const NOW = 0;", detail)
+
+    def test_hook_or_patch_inside_a_new_suite_is_still_setup(self):
+        for setup in (
+            "  beforeEach(() => {\n    books.length = 0;\n  });\n",
+            "  vi.spyOn(Array.prototype, 'filter');\n",
+            "  Object.defineProperty(globalThis, 'x', { value: 1 });\n",
+        ):
+            with self.subTest(setup=setup):
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + setup + "  it('returns only"
+                )
+                report = run(head)
+                self.assertIn(SETUP_FLAG, open_keys(report))
+                first = setup.strip().splitlines()[0].rstrip(";")
+                detail = next(f for f in report.open_flags if f.key == SETUP_FLAG).detail
+                self.assertIn(first, detail)
+
+    def test_plain_fixtures_in_a_new_suite_are_not_setup(self):
+        report = self.status(probe_file(probe_test(self.BODY)))
+        self.assertNotIn(SETUP_FLAG, {f.key for f in report.flags})
+        self.assertTrue(report.ready, report.blockers)
+
+    def test_setup_flag_lists_every_changed_line(self):
+        lines = "".join(f"const extra{i} = {i};\n" for i in range(6))
+        report = run(HEAD_TEST.replace("\nconst NOW", "\n" + lines + "const NOW", 1))
+        detail = next(f for f in report.open_flags if f.key == SETUP_FLAG).detail
+        for i in range(6):
+            self.assertIn(f"+const extra{i} = {i};", detail)
+
+    def test_very_long_setup_change_says_how_much_is_not_shown(self):
+        lines = "".join(f"const extra{i} = {i};\n" for i in range(50))
+        report = run(HEAD_TEST.replace("\nconst NOW", "\n" + lines + "const NOW", 1))
+        detail = next(f for f in report.open_flags if f.key == SETUP_FLAG).detail
+        self.assertIn("and 10 more changed line(s)", detail)
+
+    # Check suppressions.
+
+    def suppressed(self, path, head, base=None):
+        paths = candidate().changed_paths
+        cand = candidate(changed_paths=paths if path in paths else (*paths, path))
+        sources = [src(HEAD_TEST), src(BASE_TEST, BASE), src(head, path=path)]
+        if base is not None:
+            sources.append(src(base, BASE, path=path))
+        return run(cand=cand, sources=sources)
+
+    def test_ts_nocheck_added_in_product_code_is_flagged(self):
+        report = self.suppressed(
+            "src/main.ts", "// @ts-nocheck\nimport { filterByStatus } from './books';\n"
+        )
+        key = "check-suppression:src/main.ts"
+        self.assertIn(key, open_keys(report))
+        self.assertIn(
+            "line 1: // @ts-nocheck", next(f for f in report.flags if f.key == key).detail
+        )
+        self.assertFalse(report.ready)
+
+    def test_each_kind_of_suppression_is_flagged(self):
+        for comment in (
+            "// @ts-ignore",
+            "// @ts-expect-error",
+            "/* eslint-disable */",
+            "// eslint-disable-next-line no-console",
+            "/* istanbul ignore next */",
+            "/* c8 ignore next */",
+            "// prettier-ignore",
+        ):
+            with self.subTest(comment=comment):
+                report = self.suppressed("src/books.ts", f"{comment}\nexport const x = 1;\n", "")
+                self.assertIn("check-suppression:src/books.ts", open_keys(report))
+
+    def test_suppression_already_in_the_base_is_not_flagged(self):
+        text = "// @ts-expect-error legacy\nexport const x = 1;\n"
+        report = self.suppressed("src/books.ts", text + "export const y = 2;\n", text)
+        self.assertNotIn(FlagKind.SUPPRESSION, open_kinds(report))
+        report = self.suppressed("src/books.ts", text + "// @ts-expect-error\n", text)
+        self.assertIn("check-suppression:src/books.ts", open_keys(report))
+
+    def test_suppression_added_in_a_test_file_is_flagged(self):
+        report = run(HEAD_TEST.replace("const NOW", "// @ts-nocheck\nconst NOW", 1))
+        self.assertIn(f"check-suppression:{TEST_FILE}", open_keys(report))
+
+    # Weak or mirrored assertions.
+
+    def test_bound_on_a_length_is_weak(self):
+        for matcher in ("toBeGreaterThan(0)", "toBeGreaterThanOrEqual(1)", "toBeLessThan(5)"):
+            with self.subTest(matcher=matcher):
+                report = self.with_ac1(f"expect(result.length).{matcher}")
+                key = f"weak-assertion:{TEST_FILE} > {AC1_TEST}"
+                self.assertIn(key, open_keys(report))
+                detail = next(f for f in report.open_flags if f.key == key).detail
+                self.assertIn("only checks a bound", detail)
+
+    def test_expected_value_built_with_the_same_filter_mirrors_the_code(self):
+        key = f"mirrors-code:{TEST_FILE} > {AC1_TEST}"
+        report = self.with_ac1(
+            "expect(result).toEqual(books.filter((b) => b.status === 'reading'))"
+        )
+        self.assertIn(key, open_keys(report))
+        self.assertIn("`.filter(...)`", next(f for f in report.open_flags if f.key == key).detail)
+        self.assertFalse(report.ready)
+
+    def test_expected_value_built_in_a_variable_mirrors_the_code(self):
+        body = (
+            "    const result = filterByStatus(shelf, 'reading');\n"
+            "    const want = shelf.filter((b) => b.status === 'reading');\n"
+            "    expect(result).toEqual(want);"
+        )
+        report = self.status(probe_file(probe_test(body)), quote="expect(result).toEqual(want)")
+        self.assertIn(f"mirrors-code:{TEST_FILE} > {PROBE}", open_keys(report))
+
+    def test_written_out_expected_value_is_not_mirrored(self):
+        report = run()
+        self.assertNotIn(FlagKind.MIRRORS_CODE, open_kinds(report))
+        self.assertNotIn(FlagKind.WEAK_ASSERTION, open_kinds(report))
+
+    # Second review round.
+
+    def test_patches_in_a_new_suite_body_are_setup(self):
+        for setup in (
+            "  const A = Array;\n  A['proto' + 'type'].filter = function () { return this; };\n",
+            "  Date.now = () => 0;\n",
+            "  structuredClone = ((x) => x) as typeof structuredClone;\n",
+            "  books.push({ id: 'x' } as Book);\n",
+            "  const n = books.push({ id: 'x' } as Book);\n",
+            "  const p = Object.assign?.(Array.prototype, { filter: Array.prototype.slice });\n",
+            "  const gone = books.splice?.(0);\n",
+            "  const q = Object.assign<any, any>({}, {});\n",
+            "  const r = (books as any).sort!((a: Book, b: Book) => 0);\n",
+            "  const s = helper()(books);\n",
+        ):
+            with self.subTest(setup=setup):
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + setup + "  it('returns only"
+                )
+                report = run(head)
+                self.assertIn(SETUP_FLAG, open_keys(report), report.blockers)
+
+    def test_plain_fixtures_and_product_calls_in_a_new_suite_are_not_setup(self):
+        for setup in (
+            "  const shelf2: Book[] = [{ id: '9', title: 'X', author: 'Y', status: 'done', "
+            "addedAt: 9 }];\n",
+            "  const empty = filterByStatus([], 'done');\n",
+            "  const pick = (b: Book) => b.id;\n",
+            "  const wrap = () => ({ id: '1' });\n",
+            "  const before = structuredClone(books);\n",
+            "  const ids = books\n    .map((b) => b.id)\n    .filter((id) => id !== '1');\n",
+            "  const now = new Date(2026, 0, 1).getTime();\n",
+            "  // a comment\n",
+        ):
+            with self.subTest(setup=setup):
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + setup + "  it('returns only"
+                )
+                self.assertTrue(run(head).ready, run(head).blockers)
+
+    def test_new_test_that_patches_globals_is_setup(self):
+        for patch in (
+            "Array.prototype.filter = function () { return this; };",
+            "vi.spyOn(Array.prototype, 'filter').mockImplementation(function () { return this; });",
+            "Date.now = () => 0;",
+            "Object.defineProperty(globalThis, 'x', { value: 1 });",
+        ):
+            with self.subTest(patch=patch):
+                warm = f"  it('warms up', () => {{\n    {patch}\n  }});\n"
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + warm + "\n  it('returns only"
+                )
+                report = run(head)
+                self.assertIn(SETUP_FLAG, open_keys(report), report.blockers)
+                detail = next(f for f in report.open_flags if f.key == SETUP_FLAG).detail
+                self.assertIn("filterByStatus > warms up", detail)
+
+    def test_added_comment_outside_tests_is_not_setup(self):
+        report = run(HEAD_TEST.replace("const NOW", "// fixed clock\nconst NOW", 1))
+        self.assertTrue(report.ready, report.blockers)
+
+    def test_moved_suppression_is_flagged(self):
+        base = "// @ts-ignore\nexport const a = 1;\n"
+        head = "export const a = 1;\n// @ts-ignore\nexport const b: number = 'x';\n"
+        report = self.suppressed("src/books.ts", head, base)
+        self.assertIn("check-suppression:src/books.ts", open_keys(report))
+
+    def test_other_linters_suppressions_are_flagged(self):
+        for comment in ("// tslint:disable", "// deno-lint-ignore-file", "// biome-ignore x"):
+            with self.subTest(comment=comment):
+                report = self.suppressed("src/books.ts", f"{comment}\nexport const x = 1;\n", "")
+                self.assertIn("check-suppression:src/books.ts", open_keys(report))
+
+    def test_large_files_with_repeated_lines_stay_fast(self):
+        import time
+
+        lines = "".join(f"const v{i % 7} = [\n  {i % 3},\n];\n" for i in range(3000))
+        base = BASE_TEST + lines
+        head = HEAD_TEST + lines.replace("1,", "2,")
+        started = time.monotonic()
+        report = run(head, base_text=base)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn(SETUP_FLAG, open_keys(report))
+        many = "".join(f"// @ts-ignore\nexport const x{i} = {i};\n" for i in range(5000))
+        started = time.monotonic()
+        self.suppressed("src/books.ts", many, "")
+        self.assertLess(time.monotonic() - started, 5)
+
+    # Third review round.
+
+    def test_new_test_writes_to_shared_values_or_globals_are_setup(self):
+        for patch in (
+            "Array['proto' + 'type'].filter = function () { return this; };",
+            "structuredClone = (x: any) => x;",
+            "books.push({ id: 'x' } as Book);",
+            "books.length = 0;",
+            "window.matchMedia = () => null as any;",
+            "process.env.TZ = 'UTC';",
+        ):
+            with self.subTest(patch=patch):
+                warm = f"  it('warms up', () => {{\n    {patch}\n  }});\n"
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + warm + "\n  it('returns only"
+                )
+                self.assertIn(SETUP_FLAG, open_keys(run(head)), run(head).blockers)
+
+    def test_new_test_that_only_reads_or_writes_its_own_values_is_fine(self):
+        for body in (
+            "const list = [...books];\n    list.push(books[0]);\n    let n = 0;\n    n += 1;",
+            "const keys = Object.keys(books[0]);\n    expect(keys).toContain('id');",
+            "const v = window.localStorage.getItem('x');\n    expect(v).toBeNull();",
+            "for (let i = 0; i < 2; i++) {\n      expect(i).toBeLessThan(2);\n    }",
+            "const el = document.createElement('p');\n    el.textContent = 'x';",
+            "[1, 2].forEach((x) => {\n      x = x + 1;\n    });",
+            "const b: Book = { ...books[0], id: '9' };\n    expect(b.id).toBe('9');",
+            "const [first] = filterByStatus(books, 'done');\n    expect(first.id).toBe('3');",
+        ):
+            with self.subTest(body=body):
+                warm = f"  it('reads', () => {{\n    {body}\n  }});\n"
+                head = HEAD_TEST.replace(
+                    "\n  it('returns only", "\n" + warm + "\n  it('returns only"
+                )
+                self.assertTrue(run(head).ready, run(head).blockers)
+
+    def test_reordered_setup_lines_say_what_moved(self):
+        base = BASE_TEST.replace("const NOW", "const A = 1;\nconst B = 2;\nconst NOW", 1)
+        head = HEAD_TEST.replace("const NOW", "const B = 2;\nconst A = 1;\nconst NOW", 1)
+        report = run(head, base_text=base)
+        detail = next(f for f in report.open_flags if f.key == SETUP_FLAG).detail
+        self.assertIn("moved: const B = 2;", detail)
 
 
 if __name__ == "__main__":
