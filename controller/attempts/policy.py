@@ -22,6 +22,10 @@ from controller.interfaces import (
     TaskId,
 )
 
+# controller.review.events.REVIEW_JOB_INTENT, named here so the gate doesn't
+# import the reviewer (a test keeps the two the same).
+REVIEW_JOB_INTENT = "review-job-intent"
+
 
 @dataclass(frozen=True)
 class Notice:
@@ -91,6 +95,9 @@ class LedgerView:
     holds: dict[str, Mapping[str, object]] = field(default_factory=dict)
     """Open holds by reason. Each reason is cleared on its own."""
     retry_not_before: datetime | None = None
+    review_fires: list[datetime] = field(default_factory=list)
+    """When each independent review job was claimed (ENG-156). Review launches
+    use the same weekly fire allowance as workers."""
     snapshot: Snapshot | None = None
     repairs: set[AttemptId] = field(default_factory=set)
     refires: set[RunId] = field(default_factory=set)
@@ -191,6 +198,8 @@ class LedgerView:
                 self.snapshot = snap
         elif e.kind == ev.ESCALATION:
             self.escalations.add(str(d["dedup"]))
+        elif e.kind == REVIEW_JOB_INTENT and e.attempt is not None:
+            self.review_fires.append(e.at)
 
     def task_attempts(self, task: TaskId) -> list[AttemptState]:
         return sorted((s for a, s in self.attempts.items() if a.task == task), key=_number_of)
@@ -352,6 +361,7 @@ def _check_window(
 ) -> None:
     since = now - limits.fire_window
     recent = sum(1 for f in view.all_fires if f.at > since)
+    recent += sum(1 for at in view.review_fires if at > since)
     if recent >= limits.fires_per_window:
         blocks.append(
             Notice("window-fire-cap", f"{recent} of {limits.fires_per_window} fires in 7 days.")

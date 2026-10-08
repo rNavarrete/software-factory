@@ -14,8 +14,13 @@ PR, holding a fenced block::
                 "why": "..."}],
      "proofs": [{"criterion": "ac1", "path": "...", "test": "...",
                  "outcome": "failed-assertion", "output_excerpt": "..."}],
-     "limits": [{"criterion": "ac2", "reason": "..."}]}
+     "limits": [{"criterion": "ac2", "reason": "..."}],
+     "findings": [{"category": "code", "severity": "blocking", "criterion": "ac1",
+                   "summary": "...", "evidence": "...", "suggested_action": "..."}]}
     ```
+
+``findings`` is optional: anything the reviewer found beyond the mapping
+(``verify.findings.from_reviewer`` says how each is routed).
 
 Who made the mapping and ran the proofs is the comment's author as GitHub
 records it, never a name in the JSON, and only logins on ``mappers`` count:
@@ -42,6 +47,7 @@ from dataclasses import dataclass
 
 from verify.assertions import AssertionLink, FailureProof, FailureProofLimit, ProofOutcome
 from verify.criteria import Candidate
+from verify.findings import Finding, from_reviewer
 
 MARKER = "factory-review/v1"
 DEFAULT_MAPPERS = frozenset({"rNavarrete"})
@@ -72,6 +78,10 @@ class Review:
     """The comment the review came from; None if there is none."""
     ignored: tuple[str, ...] = ()
     """Review comments not used, and why."""
+    findings: tuple[Finding, ...] = ()
+    """What the reviewer found beyond the mapping."""
+    author: str | None = None
+    """Who posted the review, as GitHub records it."""
 
 
 def read_review(
@@ -114,7 +124,7 @@ def read_review(
     for _, older in valid[:-1]:
         ignored.append(f"replaced: review comment {older.url} has a newer review")
     r = valid[-1][1]
-    return Review(r.links, r.proofs, r.limits, r.url, tuple(ignored))
+    return Review(r.links, r.proofs, r.limits, r.url, tuple(ignored), r.findings, r.author)
 
 
 def _parse(text: str, c: Comment, want: str, candidate: Candidate) -> Review | str:
@@ -168,7 +178,8 @@ def _parse(text: str, c: Comment, want: str, candidate: Candidate) -> Review | s
         )
         for x in _items(data, "limits")
     )
-    return Review(links, proofs, limits, c.url)
+    findings = from_reviewer(_items(data, "findings"), reviewer=c.author, commit=head)
+    return Review(links, proofs, limits, c.url, (), findings, c.author)
 
 
 def _items(data: Mapping[str, object], key: str) -> list[Mapping[str, object]]:
@@ -191,6 +202,7 @@ def review_block(
     links: Iterable[Mapping[str, str]] = (),
     proofs: Iterable[Mapping[str, str]] = (),
     limits: Iterable[Mapping[str, str]] = (),
+    findings: Iterable[Mapping[str, object]] = (),
 ) -> str:
     """The fenced block a mapper posts, for the verifier's procedure."""
     body = {
@@ -202,4 +214,7 @@ def review_block(
         "proofs": list(proofs),
         "limits": list(limits),
     }
+    findings = list(findings)
+    if findings:
+        body["findings"] = findings
     return f"```{MARKER}\n{json.dumps(body, indent=2, ensure_ascii=False)}\n```"

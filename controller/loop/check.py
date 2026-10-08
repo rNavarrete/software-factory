@@ -184,11 +184,16 @@ def assess(
     *,
     observations=(),
     clearances=(),
+    mappers: frozenset[str] | None = None,
 ) -> Assessment:
     if collected.candidate is None or collected.pending:
         return Assessment(collected)
     candidate = collected.candidate
-    review = read_review(collected.comments, digest.value, candidate)
+    review = (
+        read_review(collected.comments, digest.value, candidate)
+        if mappers is None
+        else read_review(collected.comments, digest.value, candidate, mappers=mappers)
+    )
     criteria = verify(
         contract,
         digest,
