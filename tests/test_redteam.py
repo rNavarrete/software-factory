@@ -19,7 +19,16 @@ from unittest import mock
 
 import redteam
 from controller.approval import approval as approval_module
-from redteam import CASES, LIVE_CASES, Group, Result, holds_qualification, render, run_all
+from redteam import (
+    CASES,
+    LIVE_CASES,
+    Group,
+    Result,
+    every_case,
+    holds_qualification,
+    render,
+    run_all,
+)
 from redteam import cases as rc
 from redteam import fixtures as fx
 from redteam import records as rec
@@ -455,7 +464,7 @@ class RecordsExpectedObservedAndControlTest(unittest.TestCase):
         self.assertTrue(holds_qualification((), required=()))
 
     def test_every_required_case_blocked_once_clears_qualification(self):
-        all_blocked = tuple(rc.CaseResult(c, Result.BLOCKED, "stopped") for c in CASES + LIVE_CASES)
+        all_blocked = tuple(rc.CaseResult(c, Result.BLOCKED, "stopped") for c in every_case())
         self.assertEqual(holds_qualification(all_blocked), [])
         self.assertIn(
             f"{CASES[0].id}: 2 results, expected one",
@@ -463,7 +472,7 @@ class RecordsExpectedObservedAndControlTest(unittest.TestCase):
         )
 
     def test_altered_or_unknown_cases_hold_qualification(self):
-        all_blocked = [rc.CaseResult(c, Result.BLOCKED, "stopped") for c in CASES + LIVE_CASES]
+        all_blocked = [rc.CaseResult(c, Result.BLOCKED, "stopped") for c in every_case()]
         swapped = rc.CaseResult(rc.replace(CASES[0], expected="anything"), Result.BLOCKED, "")
         extra = rc.CaseResult(
             rc.Case("made-up", Group.FORGED_EVIDENCE, "a", "b", "c", None, live="d"),
@@ -499,7 +508,8 @@ class RecordsExpectedObservedAndControlTest(unittest.TestCase):
             self.assertIn(f"| {c.id} |", md)
         open_gaps = [i for i in KNOWN_GAPS if RESULTS[i].result is Result.GOT_THROUGH]
         self.assertIn(f"- Got through: {len(open_gaps)}", md)
-        self.assertIn(f"- Not run yet (need the real delivery loop): {len(LIVE_CASES)}", md)
+        not_run = sum(c.check is None for c in every_case())
+        self.assertIn(f"- Not run yet (need the real delivery loop): {not_run}", md)
         if open_gaps:
             self.assertIn("known gap:", md)
 
@@ -519,7 +529,9 @@ class RecordsExpectedObservedAndControlTest(unittest.TestCase):
             code = main()
         open_gaps = [i for i in KNOWN_GAPS if RESULTS[i].result is Result.GOT_THROUGH]
         self.assertEqual(code, 1 if open_gaps else 0)
-        self.assertIn("## Attempts to get past verification and approval", out.getvalue())
+        self.assertIn(
+            "## Attempts to get past verification, approval and the Linear path", out.getvalue()
+        )
 
 
 class LiveResultsStillOwedTest(unittest.TestCase):

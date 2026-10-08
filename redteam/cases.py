@@ -2082,13 +2082,20 @@ def run_case(case: Case) -> CaseResult:
     return CaseResult(case, Result.GOT_THROUGH, observed.detail)
 
 
-def run_all(cases: tuple[Case, ...] = CASES + LIVE_CASES) -> tuple[CaseResult, ...]:
-    return tuple(run_case(c) for c in cases)
+def every_case() -> tuple[Case, ...]:
+    """The whole checklist: these cases and the Linear path's (``redteam.linear_path``)."""
+    from redteam.linear_path import LINEAR_CASES, LINEAR_LIVE_CASES
+
+    return CASES + LIVE_CASES + LINEAR_CASES + LINEAR_LIVE_CASES
+
+
+def run_all(cases: tuple[Case, ...] | None = None) -> tuple[CaseResult, ...]:
+    return tuple(run_case(c) for c in (every_case() if cases is None else cases))
 
 
 def holds_qualification(
     results: tuple[CaseResult, ...],
-    required: tuple[Case, ...] = CASES + LIVE_CASES,
+    required: tuple[Case, ...] | None = None,
 ) -> list[str]:
     """Why the full control-path qualification can't pass yet; empty when it can.
 
@@ -2096,6 +2103,8 @@ def holds_qualification(
     blocked. A missing, repeated, altered or unexpected case holds it, so an
     incomplete result set can never clear qualification.
     """
+    if required is None:
+        required = every_case()
     holds = []
     wanted = {c.id: c for c in required}
     seen: dict[str, int] = {}
@@ -2128,7 +2137,7 @@ def render(results: tuple[CaseResult, ...]) -> str:
     """The results as Markdown, grouped by the ticket's criteria."""
     count = {r: sum(1 for x in results if x.result is r) for r in Result}
     lines = [
-        "## Attempts to get past verification and approval",
+        "## Attempts to get past verification, approval and the Linear path",
         "",
         f"- Blocked: {count[Result.BLOCKED]}",
         f"- Got through: {count[Result.GOT_THROUGH]}",
@@ -2138,7 +2147,9 @@ def render(results: tuple[CaseResult, ...]) -> str:
         "",
         "Anything not blocked holds the full control-path qualification.",
     ]
-    for group in Group:
+    others = (r.case.group for r in results if not isinstance(r.case.group, Group))
+    groups = [*Group, *dict.fromkeys(others)]
+    for group in groups:
         mine = [r for r in results if r.case.group is group]
         if not mine:
             continue
