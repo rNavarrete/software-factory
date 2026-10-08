@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from controller.attempts import events as ev
@@ -81,11 +83,19 @@ class AttemptGate:
         *,
         refire_of: RunId | None = None,
         automated: bool = False,
+        precondition: Callable[[RunId], Sequence[Notice]] | None = None,
     ) -> RunId:
         """Count the attempt and the fire before launching (G-C1).
 
         Returns the run to fire. If anything blocks it, records the refusal (and,
         at a cap, one escalation) and raises DispatchRefused.
+
+        ``precondition`` runs under the writer lock once the gate's own checks
+        pass, with the run it would reserve. Any notices it returns block the
+        reservation like the gate's own. Dispatch passes the approval and
+        recovery checks here, so nothing can be recorded between those checks
+        and the reservation (no other writer can append while the lock is held).
+        It must only read.
         """
         with self._store.writer_lock():
             stored = self._store.events()
@@ -98,6 +108,11 @@ class AttemptGate:
                 automated=automated,
                 limits=self._limits,
             )
+            if decision.allowed and precondition is not None:
+                assert decision.run is not None
+                extra = tuple(precondition(decision.run))
+                if extra:
+                    decision = replace(decision, blocks=decision.blocks + extra)
             if not decision.allowed:
                 self._store.append(*self._refusal(stored, decision, now))
                 raise DispatchRefused(decision)
