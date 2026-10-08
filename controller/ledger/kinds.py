@@ -249,6 +249,13 @@ def _repair_authorized(event: LedgerEvent, errors: list[str]) -> None:
     _text(errors, event.data, "by")
 
 
+def _source_repair_authorized(event: LedgerEvent, errors: list[str]) -> None:
+    _repair_authorized(event, errors)
+    _match(errors, event.data, "digest", _DIGEST_RE, "64 lowercase hex chars")
+    _time(errors, event.data, "decided_at")
+    _time(errors, event.data, "expires_at")
+
+
 def _refire_authorized(event: LedgerEvent, errors: list[str]) -> None:
     _needs(errors, event, "run")
     _text(errors, event.data, "by")
@@ -277,6 +284,7 @@ _RULES: dict[str, Callable[[LedgerEvent, list[str]], None]] = {
     HUMAN_TIME: _human_time,
     METRIC: _metric,
     gate.REPAIR_AUTHORIZED: _repair_authorized,
+    gate.SOURCE_REPAIR_AUTHORIZED: _source_repair_authorized,
     gate.REFIRE_AUTHORIZED: _refire_authorized,
     gate.ATTEMPT_CLEARED: _attempt_cleared,
 }

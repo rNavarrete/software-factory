@@ -29,6 +29,10 @@ Todo intake (ENG-174) reads three more things from it:
 - per project, ``protected_paths``: paths a contract approved by a Todo move
   alone may not touch (workflows, agent instructions, build config). Such a
   change still needs Rolando's typed approval.
+
+Bounded repairs (ENG-160) read one more, per project: ``repair_allowance``,
+how many repair attempts a Todo move lets the factory start on its own
+(0 unless set, always less than ``max_attempts``).
 """
 
 from __future__ import annotations
@@ -61,6 +65,7 @@ _KEYS = {
     "issues",
     "skip_labels",
     "protected_paths",
+    "repair_allowance",
 }
 _ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-[1-9][0-9]*$")
 
@@ -88,6 +93,11 @@ class Project:
     """Tickets with any of these labels never start (ENG-174)."""
     protected_paths: frozenset[str] = frozenset()
     """Paths a Todo move alone can't approve a change to (ENG-174)."""
+    repair_allowance: int = 0
+    """How many repair attempts a Todo move in this project allows the factory
+    to start on its own after an independently found failure (ENG-160). Zero
+    unless set: every repair then needs Rolando's typed go-ahead. Always less
+    than ``max_attempts``, and counted inside it."""
 
     def as_mapping(self) -> Mapping[str, object]:
         return {
@@ -99,6 +109,7 @@ class Project:
             "allowed_actions": sorted(self.allowed_actions),
             "checks": sorted(self.checks),
             "max_attempts": self.max_attempts,
+            "repair_allowance": self.repair_allowance,
         }
 
     def contract_problems(self, contract: Mapping[str, object], task: str) -> list[str]:
@@ -250,6 +261,15 @@ def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
         cap = PILOT_LIMITS.attempts_per_task
         if isinstance(budget, bool) or not isinstance(budget, int) or not 1 <= budget <= cap:
             raise OnboardingError(f"{where}: max_attempts must be 1..{cap}")
+        allowance = e.get("repair_allowance", 0)
+        if (
+            isinstance(allowance, bool)
+            or not isinstance(allowance, int)
+            or not 0 <= allowance < budget
+        ):
+            raise OnboardingError(
+                f"{where}: repair_allowance must be 0..{budget - 1} (less than max_attempts)"
+            )
         status = e.get("status_issue_id")
         if status is not None and (not isinstance(status, str) or not status.strip()):
             raise OnboardingError(f"{where}: status_issue_id must be text")
@@ -281,6 +301,7 @@ def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
             issues,
             skip or frozenset(),
             protected or frozenset(),
+            allowance,
         )
     return Onboarding(projects, hashlib.sha256(raw).hexdigest(), enabled, approver, since)
 

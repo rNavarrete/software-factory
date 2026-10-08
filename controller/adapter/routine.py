@@ -38,6 +38,7 @@ from controller.interfaces import (
     LaunchRequest,
     LaunchResult,
 )
+from controller.repair import findings as repair_findings
 
 FIRE_URL = "https://api.anthropic.com/v1/claude_code/routines/{}/fire"
 API_VERSION = "2023-06-01"
@@ -50,6 +51,12 @@ KEYCHAIN_SERVICE = "software-factory"
 ENVELOPE_VERSION = 1
 ENVELOPE_KEYS = frozenset(
     {"factory_payload", "contract", "contract_digest", "attempt", "branch", "pr_title"}
+)
+REPAIR_KEY = "repair"
+"""Optional, attempts 2 and up only (ENG-160): what failed on the attempt
+before, for an automatic repair. Data for the worker, never instructions."""
+REPAIR_KEYS = frozenset(
+    {"previous_attempt", "previous_branch", "previous_pr", "previous_head", "findings"}
 )
 CONTRACT_REQUIRED = ("task_id", "base_commit", "permitted_paths", "acceptance_criteria")
 MAX_ATTEMPT = 3  # docs/limits.md section 3
@@ -79,8 +86,15 @@ def envelope_errors(envelope: object, digest: ContractDigest, attempt: AttemptId
     if not isinstance(envelope, dict):
         return ["fire text is not a JSON object"]
     errors = []
-    if set(envelope) != ENVELOPE_KEYS:
-        errors.append(f"envelope keys must be exactly {sorted(ENVELOPE_KEYS)}")
+    keys = set(envelope)
+    if REPAIR_KEY in keys and attempt.number >= 2:
+        keys.discard(REPAIR_KEY)
+        errors += repair_errors(envelope[REPAIR_KEY], attempt)
+    if keys != ENVELOPE_KEYS:
+        errors.append(
+            f"envelope keys must be exactly {sorted(ENVELOPE_KEYS)}"
+            f" (and {REPAIR_KEY!r} from attempt 2 on)"
+        )
     if envelope.get("factory_payload") != ENVELOPE_VERSION:
         errors.append(f"factory_payload must be {ENVELOPE_VERSION}")
     if envelope.get("contract_digest") != digest.value:
@@ -109,6 +123,45 @@ def envelope_errors(envelope: object, digest: ContractDigest, attempt: AttemptId
     return errors
 
 
+def repair_brief(prior: AttemptId, pr: int, head: str, findings: object) -> dict[str, object]:
+    """The ``repair`` entry for the attempt after ``prior``: which PR and
+    commit failed, and the open findings on it, exactly as signed."""
+    plain = repair_findings.plain(findings)
+    if plain is None:
+        raise PayloadRejected(["the repair's findings are not a finding list"])
+    return {
+        "previous_attempt": prior.number,
+        "previous_branch": prior.branch,
+        "previous_pr": pr,
+        "previous_head": head,
+        "findings": plain,
+    }
+
+
+def repair_errors(repair: object, attempt: AttemptId) -> list[str]:
+    if not isinstance(repair, dict) or set(repair) != REPAIR_KEYS:
+        return [f"repair must be an object with exactly {sorted(REPAIR_KEYS)}"]
+    errors = []
+    prior = AttemptId(attempt.task, attempt.number - 1)
+    if repair.get("previous_attempt") != prior.number:
+        errors.append(f"repair.previous_attempt must be {prior.number}")
+    if repair.get("previous_branch") != prior.branch:
+        errors.append(f"repair.previous_branch must be {prior.branch}")
+    pr = repair.get("previous_pr")
+    if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1:
+        errors.append("repair.previous_pr must be a pull request number")
+    head = repair.get("previous_head")
+    if not (isinstance(head, str) and _COMMIT_RE.match(head)):
+        errors.append("repair.previous_head must be a 40-character commit id")
+    findings = repair_findings.plain(repair.get("findings"))
+    if not findings or len(findings) > repair_findings.MAX_FINDINGS:
+        errors.append(
+            f"repair.findings must be 1 to {repair_findings.MAX_FINDINGS} findings, each with"
+            f" exactly {list(repair_findings.FIELDS)} as text"
+        )
+    return errors
+
+
 def pr_title(attempt: AttemptId, digest: ContractDigest) -> str:
     """The worker's PR title: the marker, then the task id.
 
@@ -124,9 +177,12 @@ def build_fire_text(
     attempt: AttemptId,
     *,
     validate_contract: ContractValidator = contract_format.validate,
+    repair: Mapping[str, object] | None = None,
 ) -> str:
     """The fire text for one attempt. Raises PayloadRejected rather than return
-    anything the adapter or the worker would refuse.
+    anything the adapter or the worker would refuse. ``repair`` (attempt 2 and
+    up, from ``repair_brief``) says what failed on the attempt before; if it
+    makes the text too long, nothing is cut: the fire is refused.
 
     ``contract`` may be a plain dict or the read-only form that
     ``controller.contract.loads`` and ``freeze`` return."""
@@ -142,6 +198,8 @@ def build_fire_text(
         "branch": attempt.branch,
         "pr_title": pr_title(attempt, digest),
     }
+    if repair is not None:
+        envelope[REPAIR_KEY] = dict(repair)
     text = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
     errors = _text_errors(text, digest, attempt, validate_contract)
     if errors:
@@ -353,6 +411,8 @@ __all__ = [
     "PayloadRejected",
     "RoutineAdapter",
     "build_fire_text",
+    "repair_brief",
+    "repair_errors",
     "envelope_errors",
     "keychain_key",
     "parse_retry_after",

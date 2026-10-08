@@ -56,7 +56,9 @@ from controller.interfaces import (
     LedgerStore,
 )
 from controller.ledger.redact import redact
-from controller.recovery import FINISHED, Recovery, State
+from controller.recovery import FINISHED, PR_OBSERVED, Recovery, State
+from controller.repair import findings as repair_findings
+from controller.repair import policy as repair_policy
 from controller.report import messages as m
 from controller.report.messages import Stage
 from controller.report.reporter import QUESTION_PREFIX
@@ -473,7 +475,7 @@ class Service:
             status = self._recovery.attempt_status(mine[-1].attempt, now)
             if status.state in _WATCHED and not _waiting_to_refire(status, mine[-1]):
                 self._watch(item, status, now)
-                return False
+                return self._after_watch(item, status.attempt, r, may_fire=may_fire)
             if status.state is State.MERGED:
                 self._close_merged(item, status, now)
                 r.closed.append(item.issue_key)
@@ -490,8 +492,9 @@ class Service:
                     )
                     r.closed.append(item.issue_key)
                     return False
-                advice = self._x.repair.advise(status.attempt, status.detail)
-                if advice is None:
+                if not self._repair_stands(item, status.attempt, now):
+                    # Rolando closed the attempt himself; only his own go-ahead
+                    # for the next attempt (typed) starts anything more.
                     self._close(
                         item,
                         status.state.value,
@@ -502,25 +505,194 @@ class Service:
                     )
                     r.closed.append(item.issue_key)
                     return False
-                # The repair needs Rolando's signed go-ahead (ENG-160); the item
-                # closes so the queue isn't held waiting for it.
-                self._close(
-                    item,
-                    "repair-suggested",
-                    now,
-                    f"Attempt {status.attempt} ended as {status.state.value}. A repair is"
-                    f" suggested: {advice}. It needs your go-ahead before it starts.",
-                    stage=Stage.NEEDS_DECISION,
-                )
-                r.closed.append(item.issue_key)
-                return False
+        return self._try_dispatch(item, r, may_fire=may_fire)
+
+    def _try_dispatch(self, item: q.Item, r: TickReport, *, may_fire: bool) -> bool:
         if not may_fire:
             return False
+        now = self._now()
         last = self._last_try.get(item.event_id)
         if last is not None and now - last < self._s.retry_every:
             return False
         self._last_try[item.event_id] = now
         return self._dispatch(item, r)
+
+    # --- bounded repairs (ENG-160) ---------------------------------------------------
+
+    def _after_watch(
+        self, item: q.Item, attempt: AttemptId, r: TickReport, *, may_fire: bool
+    ) -> bool:
+        """Once the attempt has a PR, start the next attempt if a repair
+        go-ahead for it stands: Rolando's typed one,
+        or one the signer gave under the Todo move's repair allowance, asked
+        for here when the failure is routine. Everything else waits."""
+        now = self._now()
+        if item.withdrawn is not None:
+            return False
+        if not self._repair_stands(item, attempt, now):
+            status = self._recovery.attempt_status(attempt, now)
+            if status.state not in (State.VERIFYING, State.AWAITING_HUMAN):
+                return False  # no PR to judge yet
+            self._consider_repair(item, attempt, status, now)
+            if not self._repair_stands(item, attempt, self._now()):
+                return False
+        return self._try_dispatch(item, r, may_fire=may_fire)
+
+    def _item_contract(self, item: q.Item) -> Mapping[str, object] | None:
+        if item.digest is None:
+            return None
+        return self._contracts.load(ContractDigest(item.digest))
+
+    def _repair_stands(self, item: q.Item, attempt: AttemptId, now: datetime) -> bool:
+        """Whether a repair go-ahead for the attempt after ``attempt`` counts
+        now, as dispatch will judge it."""
+        contract = self._item_contract(item)
+        if contract is None:
+            return False
+        digest = contracts.digest(contract)
+        trusted = self._dispatcher.approvals.trusted_events(self._store.events(), digest, now=now)
+        nxt = AttemptId(attempt.task, attempt.number + 1)
+        return nxt in LedgerView.build(trusted).repairs
+
+    def _consider_repair(self, item: q.Item, attempt: AttemptId, status, now: datetime) -> None:
+        """Decide on an automatic repair of ``attempt``'s failure, and if it is
+        routine and within the allowance, ask the signer for the go-ahead.
+        Every outcome Rolando must act on is posted once."""
+        contract = self._item_contract(item)
+        project = self._config.project(item.project_id) if self._config else None
+        if contract is None or project is None:
+            return
+        try:
+            report = self._x.repair.failure(attempt)
+        except Exception as e:  # GitHub or the review busy: next round
+            log.warning("%s: failure report: %s", item.issue_key, _error(e))
+            return
+        if report is None or report.attempt != attempt:
+            return
+        if _open_head(self._store.events(attempt.task), attempt, report.pr) != report.head:
+            return  # the PR moved on since the verdict; the review checks the new commit
+        stored = self._store.events(attempt.task)
+        reserved = {s.event.attempt for s in stored if s.event.kind == gate_events.ATTEMPT_RESERVED}
+        automatic = {
+            s.event.attempt
+            for s in stored
+            if s.event.kind == gate_events.SOURCE_REPAIR_AUTHORIZED and s.event.attempt in reserved
+        }
+        budget = contract["attempt_budget"]
+        decision = repair_policy.plan(
+            report.findings,
+            attempts_used=attempt.number,
+            contract_budget=budget if isinstance(budget, int) else 1,
+            project_max=project.max_attempts,
+            allowance=project.repair_allowance,
+            automatic_used=len(automatic),
+        )
+        what = _failed_on(report)
+        base = f"repair:{attempt}:{report.head[:12]}"
+        if isinstance(decision, repair_policy.Stop):
+            self._notice(
+                item,
+                f"{base}:stop:{decision.code}",
+                m.progress(
+                    Stage.NEEDS_DECISION if not decision.capped else Stage.FAILED,
+                    f"{what} The factory won't repair it on its own: {decision.reason}."
+                    f" Your decision: {decision.decision}",
+                    pr_url=self._pr_url(item, report.pr),
+                ),
+                now,
+            )
+            return
+        if not status.writer_cleared:
+            self._notice(
+                item,
+                f"{base}:clear",
+                m.progress(
+                    Stage.WAITING,
+                    f"{what} The factory will start repair attempt {decision.attempt} on its own"
+                    f" ({_repairs_left(decision)}), but first it needs to know the earlier worker"
+                    " has stopped, so two workers never write at once. "
+                    + _clear_step(attempt, status.session_urls),
+                    pr_url=self._pr_url(item, report.pr),
+                ),
+                now,
+            )
+            return
+        use = getattr(self._x.authorizer, "use_repair_allowance", None)
+        if use is None:
+            self._notice(
+                item,
+                f"{base}:no-signer",
+                m.progress(
+                    Stage.NEEDS_DECISION,
+                    f"{what} Automatic repairs need the signer, which this service isn't"
+                    " connected to. Allow the next attempt by hand, or close this one.",
+                    pr_url=self._pr_url(item, report.pr),
+                ),
+                now,
+            )
+            return
+        # Read GitHub again right before asking: a push since the last read
+        # makes the verdict stale, and the signed go-ahead names this commit.
+        self._dispatcher.reconcile(attempt)
+        if _open_head(self._store.events(attempt.task), attempt, report.pr) != report.head:
+            return
+        nxt = AttemptId(attempt.task, decision.attempt)
+        findings = repair_findings.as_data(decision.findings)
+        try:
+            event = use(
+                item.authorization(),
+                contract,
+                nxt,
+                report.pr,
+                report.head,
+                decision.failure,
+                findings,
+            )
+        except AuthorizationRefused as e:
+            stage = Stage.NEEDS_DECISION if e.final else Stage.WAITING
+            tail = (
+                " Allow the next attempt by hand, or close this one."
+                if e.final
+                else " The factory will ask again."
+            )
+            self._notice(
+                item,
+                f"{base}:refused:{'final' if e.final else 'wait'}",
+                m.progress(
+                    stage,
+                    f"{what} The factory can't use the repair allowance of your Todo move:"
+                    f" {e.reason}.{tail}",
+                    pr_url=self._pr_url(item, report.pr),
+                ),
+                now,
+            )
+            return
+        d = event.data
+        if (
+            event.kind != gate_events.SOURCE_REPAIR_AUTHORIZED
+            or event.attempt != nxt
+            or d.get("event_id") != item.event_id
+            or d.get("digest") != contracts.digest(contract).value
+            or d.get("prior_head") != report.head
+            or d.get("prior_pr") != str(report.pr)
+        ):
+            raise RuntimeError("the signer answered for a different repair")
+        self._append(
+            event,
+            q.message(
+                f"{item.event_id}:repairing:{nxt}",
+                item.issue_id,
+                m.progress(
+                    Stage.REPAIRING,
+                    f"{what} The factory is starting repair attempt {decision.attempt} to fix"
+                    f" it, under the repair allowance of your Todo move"
+                    f" ({_repairs_left(decision)}). The task, its acceptance criteria and its"
+                    " checks stay exactly as approved; the new PR gets a fresh review.",
+                    pr_url=self._pr_url(item, report.pr),
+                ),
+                now,
+            ),
+        )
 
     def _dispatch(self, item: q.Item, r: TickReport) -> bool:
         now = self._now()
@@ -899,6 +1071,48 @@ class Service:
                 continue
             self._append(q.sent(msg.key, now))
             r.sent += 1
+
+
+def _open_head(stored, attempt: AttemptId, pr: int) -> str | None:
+    """The head commit of ``attempt``'s PR ``pr`` as last read from GitHub,
+    or None once it was read closed, merged or without the markers."""
+    head = None
+    for s in stored:
+        e = s.event
+        if e.kind != PR_OBSERVED or e.attempt != attempt or e.data.get("number") != pr:
+            continue
+        d = e.data
+        usable = d.get("matches") is True and d.get("state") == "open" and not d.get("merged")
+        head = d.get("head_sha") if usable and isinstance(d.get("head_sha"), str) else None
+    return head
+
+
+def _failed_on(report) -> str:
+    n = len([f for f in report.findings if f.blocking])
+    first = next((f.summary for f in report.findings if f.blocking), "")
+    more = f" (and {n - 1} more)" if n > 1 else ""
+    return (
+        f"Attempt {report.attempt.number}'s PR #{report.pr} failed the independent check on"
+        f" commit {report.head[:12]}: {first}{more}."
+    )
+
+
+def _repairs_left(plan) -> str:
+    return f"automatic repair {plan.used + 1} of {plan.allowance}"
+
+
+def _clear_step(attempt: AttemptId, session_urls) -> str:
+    if len(session_urls) == 1:
+        url = session_urls[0]
+        return (
+            f"Open {url} and check that the session has finished. If it has, run this from"
+            " any folder on your Mac: fly ssh console --app rnavarrete-factory --pty -C"
+            f' "/app/factory clear {attempt.task} {url}"'
+        )
+    return (
+        "Find the worker's session on the factory routine's run page and record that it"
+        " finished (the recovery steps in docs/service.md)."
+    )
 
 
 def _waiting_to_refire(status, attempt_state) -> bool:

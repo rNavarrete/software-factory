@@ -468,7 +468,7 @@ class Dispatcher:
             # A signed go-ahead for the next attempt means Rolando has moved on
             # from this one, whatever state it was left in.
             next_attempt = AttemptId(task, latest.attempt.number + 1)
-            trusted = self._approvals.trusted_events(self._store.events(), digest)
+            trusted = self._approvals.trusted_events(self._store.events(), digest, now=now)
             repaired = next_attempt in LedgerView.build(trusted).repairs
             moved_on = repaired and status.state is not st.State.MERGED
             if status.state in _GOING and not not_launched and not moved_on:
@@ -497,7 +497,9 @@ class Dispatcher:
             self._authorize_refire(contract, digest, refire_of)
 
         def prepare(run: RunId, digest: ContractDigest) -> Callable[[], LaunchResult]:
-            text = routine.build_fire_text(contract, digest, run.attempt)
+            text = routine.build_fire_text(
+                contract, digest, run.attempt, repair=self._repair_brief(contract, run.attempt)
+            )
             key = self._start_key(self._routine)
             adapter = self._adapter(self._routine, lambda _trig: key)
             request = LaunchRequest(run, digest, text)
@@ -607,6 +609,25 @@ class Dispatcher:
             self._approvals.authorize_refire(contract, prior, self._now())
         except ApprovalRefused as e:
             raise Refused([Notice("refire-not-authorized", str(e))]) from None
+
+    def _repair_brief(
+        self, contract: Mapping[str, object], attempt: AttemptId
+    ) -> Mapping[str, object] | None:
+        """For an automatic repair (ENG-160): what failed on the attempt before,
+        from the signed repair record that lets this attempt start. A repair
+        Rolando allowed by hand fires with the contract alone, as before."""
+        if attempt.number < 2:
+            return None
+        record = self._approvals.automatic_repair(contract, attempt, self._now())
+        if record is None:
+            return None
+        prior = AttemptId(attempt.task, attempt.number - 1)
+        return routine.repair_brief(
+            prior,
+            int(str(record["prior_pr"])),
+            str(record["prior_head"]),
+            record["findings"],
+        )
 
     # --- other commands --------------------------------------------------------
 

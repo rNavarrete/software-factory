@@ -81,6 +81,7 @@ from controller.interfaces import (
     StoredEvent,
     TaskId,
 )
+from controller.repair import findings as repair_findings
 
 APPROVER = "rNavarrete"
 """The only person who may approve in v1 (ADR 0001 section 2)."""
@@ -137,7 +138,23 @@ _SIGNED_FIELDS = {
         "policy_sha256",
     ),
 }
+_SIGNED_FIELDS[ev.SOURCE_REPAIR_AUTHORIZED] = (
+    *_COMMON,
+    "expires_at",
+    "event_id",
+    "issue_key",
+    "revision",
+    "routine_id",
+    "policy_sha256",
+    "repair_allowance",
+    "prior_pr",
+    "prior_head",
+    "findings_sha256",
+)
 _APPROVAL_KINDS = (HUMAN_DECISION, SOURCE_AUTHORIZATION)
+_PR_OBSERVED = "pr-observed"
+"""controller.recovery.events.PR_OBSERVED, named here so approval doesn't import
+recovery (which imports approval). A test keeps the two the same."""
 _URL_BASES = (ev.ClearingBasis.COMPLETED, ev.ClearingBasis.TERMINATED)
 
 # Gate blocks that depend on Rolando's decisions; check() reports these, read
@@ -381,6 +398,14 @@ def sign_source_authorization(event: LedgerEvent, key: ApprovalKey) -> LedgerEve
     return _sign(event, key)
 
 
+def sign_source_repair(event: LedgerEvent, key: ApprovalKey) -> LedgerEvent:
+    """Sign a ``source-repair-authorized``. Only the signer process calls this,
+    after its own checks with Linear and the onboarding file (ENG-160)."""
+    if event.kind != ev.SOURCE_REPAIR_AUTHORIZED:
+        raise ValueError("this signs source repair authorizations only")
+    return _sign(event, key)
+
+
 def _time(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -613,7 +638,7 @@ class Approvals:
         if standing is not None:
             blocks.append(standing)
 
-        trusted = self.trusted_events(stored, digest)
+        trusted = self.trusted_events(stored, digest, now=now)
         decision = check_dispatch(trusted, task, digest, now, refire_of=refire_of)
         blocks += [b for b in decision.blocks if b.code in _GATE_CODES]
         run = decision.run
@@ -639,20 +664,41 @@ class Approvals:
         return self._approval_block(self._store.events(), task, digest, now, sources=False) is None
 
     def trusted_events(
-        self, stored: Sequence[StoredEvent], digest: ContractDigest
+        self,
+        stored: Sequence[StoredEvent],
+        digest: ContractDigest,
+        *,
+        now: datetime | None = None,
     ) -> list[StoredEvent]:
         """The ledger with every repair, re-fire and clearing decision left out
         unless it is signed, counted once, bound to the right contract, and made
         after what it decides on. ``digest`` is the contract being dispatched:
-        repairs only count for it."""
+        repairs only count for it.
+
+        A repair under the Todo move's allowance (``source-repair-authorized``)
+        also has to be in force at ``now``; without ``now`` it never counts."""
         reserved: dict[AttemptId, str] = {}
         latest_fire: dict[AttemptId, RunId] = {}
         results: set[RunId] = set()
+        terms: dict[tuple[str, str], str] = {}
+        heads = _open_heads(stored)
+        withdrawn = _withdrawn_digests(stored)
         out = []
         for item, signed in self._signed(stored):
             e = item.event
             d = e.data
             keep = True
+            if (
+                e.kind == SOURCE_AUTHORIZATION
+                and signed
+                and d.get("decision") == APPROVED
+                and self._source_ok(e)
+            ):
+                # The terms of the move's first authorization of this contract
+                # are the allowance Rolando's move came with.
+                terms.setdefault(
+                    (str(d.get("event_id")), str(d.get("digest"))), str(d.get("policy_sha256"))
+                )
             if e.kind == ev.ATTEMPT_RESERVED and e.attempt is not None:
                 reserved.setdefault(e.attempt, str(d.get("digest", "")))
             elif e.kind == ev.FIRE_INTENT and e.run is not None:
@@ -664,6 +710,14 @@ class Approvals:
                 if e.attempt is not None and e.attempt.number >= 2:
                     prior = AttemptId(e.attempt.task, e.attempt.number - 1)
                 keep = signed and prior in reserved and d.get("digest") == digest.value
+            elif e.kind == ev.SOURCE_REPAIR_AUTHORIZED:
+                keep = (
+                    signed
+                    and now is not None
+                    and d.get("digest") == digest.value
+                    and digest.value not in withdrawn
+                    and self._source_repair_ok(e, reserved, terms, heads, now)
+                )
             elif e.kind == ev.REFIRE_AUTHORIZED:
                 keep = (
                     signed
@@ -762,6 +816,67 @@ class Approvals:
             return False
         return key.lower() == e.task.value and e.attempt is None and e.run is None
 
+    def _source_repair_ok(
+        self,
+        e: LedgerEvent,
+        reserved: Mapping[AttemptId, str],
+        terms: Mapping[tuple[str, str], str],
+        heads: Mapping[tuple[AttemptId, int], str | None],
+        now: datetime,
+    ) -> bool:
+        """A signed repair under the Todo move's allowance counts only for this
+        dispatcher's routine, for exactly attempt n on the contract attempt n-1
+        ran, within the allowance the move's first authorization was signed
+        under, on the exact commit the findings were raised on (still the open
+        PR's head), with its findings intact, and while it is in force."""
+        d = e.data
+        if self._source_routine is None or d.get("routine_id") != self._source_routine:
+            return False
+        a = e.attempt
+        if a is None or e.run is not None or a.number < 2 or e.task != a.task:
+            return False
+        key = d.get("issue_key")
+        if not isinstance(key, str) or key.lower() != a.task.value:
+            return False
+        prior = AttemptId(a.task, a.number - 1)
+        if reserved.get(prior) != d.get("digest"):
+            return False
+        policy = terms.get((str(d.get("event_id")), str(d.get("digest"))))
+        if policy is None or policy != d.get("policy_sha256"):
+            return False
+        allowance = d.get("repair_allowance")
+        if not (isinstance(allowance, str) and allowance.isdigit()):
+            return False
+        if a.number - 1 > int(allowance):
+            return False
+        pr = d.get("prior_pr")
+        if not (isinstance(pr, str) and pr.isdigit()):
+            return False
+        head = heads.get((prior, int(pr)))
+        if head is None or head != d.get("prior_head"):
+            return False
+        if repair_findings.digest(d.get("findings")) != d.get("findings_sha256"):
+            return False
+        decided, expires = _time(d.get("decided_at")), _time(d.get("expires_at"))
+        if decided is None or expires is None:
+            return False
+        return timedelta(0) < expires - decided <= MAX_SOURCE_TTL and decided <= now < expires
+
+    def automatic_repair(
+        self, contract: Mapping[str, object], attempt: AttemptId, now: datetime
+    ) -> Mapping[str, object] | None:
+        """The repair record under the Todo move's allowance that counts for
+        ``attempt`` of this contract now, if any: what the worker is handed."""
+        if contracts.approval_errors(contract):
+            return None
+        digest = contracts.digest(contracts.freeze(contract))
+        found = None
+        for item in self.trusted_events(self._store.events(), digest, now=now):
+            e = item.event
+            if e.kind == ev.SOURCE_REPAIR_AUTHORIZED and e.attempt == attempt:
+                found = e.data
+        return found
+
     def _approval_block(
         self,
         stored: Sequence[StoredEvent],
@@ -854,6 +969,47 @@ class Approvals:
                 " so it will never count. Change that text and decide again."
             )
         return stored
+
+
+def _open_heads(stored: Sequence[StoredEvent]) -> dict[tuple[AttemptId, int], str | None]:
+    """The head commit of each attempt's PR as last read from GitHub, or None
+    once it was read closed, merged or without the attempt's markers."""
+    heads: dict[tuple[AttemptId, int], str | None] = {}
+    for item in sorted(stored, key=lambda s: s.seq):
+        e = item.event
+        if e.kind != _PR_OBSERVED or e.attempt is None:
+            continue
+        d = e.data
+        try:
+            number = int(d["number"])  # type: ignore[call-overload]
+        except (KeyError, TypeError, ValueError):
+            continue
+        head = d.get("head_sha")
+        usable = (
+            d.get("matches") is True
+            and d.get("state") == "open"
+            and d.get("merged") is not True
+            and isinstance(head, str)
+        )
+        heads[(e.attempt, number)] = head if usable else None  # type: ignore[assignment]
+    return heads
+
+
+def _withdrawn_digests(stored: Sequence[StoredEvent]) -> set[str]:
+    """Contracts Rolando rejected or revoked, signed or not: a withdrawal can
+    only stop work, so an automatic repair never outlives one."""
+    out = set()
+    for item in stored:
+        e = item.event
+        d = e.data
+        if (
+            e.kind in _APPROVAL_KINDS
+            and d.get("scope") == SCOPE
+            and d.get("decision") in (REJECTED, REVOKED)
+            and isinstance(d.get("digest"), str)
+        ):
+            out.add(str(d["digest"]))
+    return out
 
 
 def _extend(event: LedgerEvent, extra: Mapping[str, object]) -> LedgerEvent:
