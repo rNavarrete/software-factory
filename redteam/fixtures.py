@@ -255,7 +255,7 @@ def clearance(flag: str = FILE_FLAG, **changes) -> Clearance:
 class Scenario:
     """Every input the controller's checking step gets for one candidate."""
 
-    contract: object = CONTRACT
+    contract: object = field(default_factory=lambda: CONTRACT)
     approved: ContractDigest = DIGEST
     """From Rolando's approval record, never from the PR."""
     candidate: Candidate = field(default_factory=candidate)
