@@ -65,6 +65,7 @@ from controller.report import messages as m
 from controller.report.messages import Stage
 from controller.report.reporter import QUESTION_PREFIX
 from controller.review.report import review_messages
+from controller.review.reviewer import ReviewStatus
 from controller.service import queue as q
 from controller.service.onboarding import Onboarding, OnboardingError
 from controller.service.seams import (
@@ -186,10 +187,12 @@ class Service:
         """The ledger's last seq at the last successful backup; None until the
         first one, so a fresh start always backs up once."""
         self._config: Onboarding | None = None
+        self._checked_reviews: dict[AttemptId, ReviewStatus] = {}
 
     # --- the round ---------------------------------------------------------------
 
     def tick(self) -> TickReport:
+        self._checked_reviews.clear()
         r = TickReport()
         now = self._now()
         before = self._last_seq()
@@ -987,12 +990,30 @@ class Service:
         except Exception as e:  # GitHub or the ledger busy: next round
             log.warning("%s: review check: %s", item.issue_key, _error(e))
             return
-        queued = self._view().queued_keys
-        events = [
-            q.message(key, item.issue_id, text, now)
-            for key, text in review_messages(status, self._pr_url(item, status.pr))
-            if key not in queued
-        ]
+        self._checked_reviews[attempt] = status
+        view = self._view()
+        previous = view.review_statuses.get(attempt)
+        review_key = status.key or ""
+        current = (status.state.value, review_key)
+        generation = previous[2] if previous else 0
+        events = []
+        if previous is None or previous[:2] != current:
+            generation += 1
+            events.append(q.review_status(attempt, *current, generation, now))
+        for key, text in review_messages(status, self._pr_url(item, status.pr)):
+            key = f"{key}:report{generation}"
+            if key not in view.queued_keys:
+                events.append(
+                    q.message(
+                        key,
+                        item.issue_id,
+                        text,
+                        now,
+                        review_attempt=attempt,
+                        review_key=review_key,
+                        review_generation=generation,
+                    )
+                )
         if events:
             self._append(*events)
 
@@ -1117,6 +1138,35 @@ class Service:
 
     # --- 4. outbox --------------------------------------------------------------------
 
+    def _ready_delivery(self, msg: q.Message) -> str:
+        """Send a ready report only if this round freshly checked its review.
+        Return send, wait, or a durable discard reason. No new review is launched
+        by delivery; unknown evidence waits for the ordinary work round."""
+        if not msg.key.startswith("ready:"):
+            return "send"
+        if msg.review_attempt is None or not msg.review_key or not msg.review_generation:
+            return "legacy readiness has no revision binding"
+        view = self._view()
+        item = view.open_item_for_issue(msg.issue_id)
+        if item is None or item.task != msg.review_attempt.task or item.withdrawn is not None:
+            return "task is closed or its authorization was withdrawn"
+        attempts = LedgerView.build(self._store.events(item.task)).task_attempts(item.task)
+        if not attempts or attempts[-1].attempt != msg.review_attempt:
+            return "a newer attempt replaced this review"
+        if self._recovery.attempt_status(msg.review_attempt, self._now()).state in FINISHED:
+            return "the reviewed attempt is finished"
+        status = self._checked_reviews.get(msg.review_attempt)
+        if status is None:
+            return "wait"
+        current = view.review_statuses.get(msg.review_attempt)
+        if (
+            not status.passed
+            or status.key != msg.review_key
+            or current != (status.state.value, msg.review_key, msg.review_generation)
+        ):
+            return "review was superseded"
+        return "send"
+
     def _flush(self, r: TickReport) -> None:
         # The comments on a ticket are its status board, so they go out in the
         # order they were written: while an older message for a ticket waits to
@@ -1125,6 +1175,13 @@ class Service:
         for msg in sorted(self._view().outbox.values(), key=lambda x: x.seq):
             now = self._now()
             if msg.issue_id in held:
+                continue
+            delivery = self._ready_delivery(msg)
+            if delivery == "wait":
+                held.add(msg.issue_id)
+                continue
+            if delivery != "send":
+                self._append(q.discarded(msg.key, delivery, now))
                 continue
             if msg.last_failed_at is not None:
                 wait = min(

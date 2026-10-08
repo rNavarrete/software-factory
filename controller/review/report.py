@@ -14,7 +14,8 @@ or a new verdict is. Built on ENG-178's message texts (controller/report).
   (his ``Observation:`` reply is bound to that commit), and one note listing
   anything else only he can settle.
 - not reviewable, blocked, unknown: one plain notice each.
-- waiting for CI: nothing; the earlier "Reviewing" entry stands.
+- waiting for CI: explain that this revision is not ready and earlier readiness
+  does not apply, including when a new push follows a passing review.
 
 A message is a report, never an approval.
 """
@@ -45,9 +46,16 @@ def review_messages(status: ReviewStatus, pr_url: str = "") -> list[tuple[str, s
     who = "Codex review" if codex else "Independent review"
     name = "Codex review" if codex else "independent review"
     verified = status.pass_kind == "verify"
+    if s is ReviewState.WAITING_CI:
+        text = (
+            f"PR #{n} at `{m.short_sha(commit)}` is not ready for your review."
+            " CI checks are pending for the current revision. Any earlier ready report"
+            " does not apply; the factory will report again when the checks and review pass."
+        )
+        return [(f"{base}:waiting-ci", m.progress(Stage.REVIEWING, text, pr_url=pr_url))]
     if s is ReviewState.RUNNING and status.pass_kind:
         text = (
-            f"PR #{n} is ready at `{m.short_sha(commit)}` and the {name} is running"
+            f"PR #{n} at `{m.short_sha(commit)}` is being checked; the {name} is running"
             f" ({'verification pass on the corrected version' if verified else 'full review'})."
         )
         return [(f"{base}:running", m.progress(Stage.REVIEWING, text, pr_url=pr_url))]
@@ -69,7 +77,7 @@ def review_messages(status: ReviewStatus, pr_url: str = "") -> list[tuple[str, s
             checks=checks,
             limitations=advisory,
         )
-        return [(f"ready:{status.attempt}:{commit}", m.ready(r))]
+        return [(f"ready:{status.attempt}:{status.key}", m.ready(r))]
     if s is ReviewState.FAILED:
         count = len([f for f in open_ if f.route is Route.REPAIR])
         text = (

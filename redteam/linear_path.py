@@ -768,18 +768,27 @@ def _merge_without_ready(reviewed: str, passed: bool, reason: str) -> Callable[[
     exception, never verified work."""
 
     def run(attack: bool) -> Observed:
-        from types import SimpleNamespace
+        from dataclasses import replace
 
         from controller.interfaces import AttemptId
+        from controller.review.reviewer import ReviewState
         from controller.service.fixtures import RecordingReviewer
         from tests.test_repair import SHA_B
+        from tests.test_report_service import status
 
         head = SHA_B
 
         class Reviewed(RecordingReviewer):
-            def evidence(self, attempt):
+            def check(self, attempt):
                 commit, ok = (reviewed, passed) if attack else (head, True)
-                return SimpleNamespace(reviewed_commit=commit, passed=ok, unresolved=lambda: ())
+                state = (
+                    ReviewState.RUNNING
+                    if not commit
+                    else ReviewState.PASSED
+                    if ok
+                    else ReviewState.FAILED
+                )
+                return replace(status(state, head=commit), attempt=attempt)
 
             def merged_head(self, attempt):
                 return head
