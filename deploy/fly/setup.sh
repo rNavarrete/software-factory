@@ -2,10 +2,9 @@
 # One-time setup of the factory's background service on Fly.io (ENG-194).
 # Run from the root of the software-factory checkout, on main, after
 # `fly auth signup` (or `fly auth login`). Safe to run again: steps already
-# done are skipped. It stops and asks only where you must act:
+# done are skipped. It stops only where you must act:
 #   1. pasting the read-only GitHub token (hidden, never shown or saved),
-#   2. typing the approval code for the qualification contract,
-#   3. typing your current usage numbers.
+#   2. typing the approval code for the qualification contract.
 set -eu
 # flyctl's own installer puts it here; Homebrew's folders are usually on PATH.
 PATH="$HOME/.fly/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -51,16 +50,11 @@ echo "== Approve the qualification contract (type the code it shows)"
 fly ssh console --app "$APP" --pty \
     -C "/app/factory approve /app/deploy/qualification/contracts/QUAL-1.json"
 
-echo "== Usage reading (claude.ai usage page of the factory account)"
-printf "Current session usage %%: "
-read -r SESSION </dev/tty
-printf "Weekly usage %%: "
-read -r WEEKLY </dev/tty
-case "$SESSION$WEEKLY" in
-    *[!0-9.]* | "") echo "Numbers only, please. Run this script again." >&2; exit 1 ;;
-esac
-# 0 credits spent: usage credits are turned off on the factory account.
-fly ssh console --app "$APP" -C "/app/factory snapshot $SESSION $WEEKLY 0"
+echo "== Usage reading for the practice run"
+# The practice run's worker is fake and spends nothing, and its ledger
+# (HOME=/data/qualification) is separate from the real one, so it records a
+# zero reading instead of asking. Real workers will need a real reading.
+fly ssh console --app "$APP" -C "/app/factory snapshot 0 0 0"
 
 echo
 echo "Done. You can close the laptop. The service picks up the qualification"
