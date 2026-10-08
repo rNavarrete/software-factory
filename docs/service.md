@@ -111,7 +111,7 @@ The service posts this on the ticket: "It is unclear whether worker … started"
 | Protocol | Ticket | Contract |
 |---|---|---|
 | `AuthorizationSource.poll(cursor)` / `.revalidate(authorization)` | ENG-174 | Returns only Todo moves it has proved were made by Rolando on an exact ticket revision. Each has a stable `event_id`, so a replay is ignored. Also returns the moves it refused, and pause/resume controls. `revalidate` is checked again right before the first fire. |
-| `ContractPreparer.prepare(authorization, project)` | ENG-175 | Returns a contract, or a product question. A question closes the item, and moving the ticket to Todo again starts a new one. |
+| `ContractPreparer.prepare(authorization, project)` | ENG-175 | Returns a contract with a plain summary the service posts once, or a question with its kind (product, split, scope, changed, factory). A question closes the item, and moving the ticket to Todo again starts a new one. Built in `controller/prepare/`, see docs/prepare.md. |
 | `Reporter.post(issue_id, key, text)` | ENG-178 | Posts on Linear. Must be idempotent per `key`, because the service retries when it can't tell a failure from a lost answer. |
 | `ReviewStarter.start(pr, key)` | ENG-156 | Called when an attempt's PR first appears. The request and its key are saved in the ledger before the call, and after a crash the same key is sent again, so the reviewer must treat a repeated key as the review it already started. Runs under the reviewer's own identity. |
 | `RepairAdvisor.advise(attempt, detail)` | ENG-160 | Suggests a repair. The service only posts the suggestion; a repair still needs its signed go-ahead. |
