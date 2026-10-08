@@ -597,7 +597,15 @@ class Service:
                 now,
             )
             return
-        if not status.writer_cleared:
+        writer_blocks = self._recovery.blocks(now, automatic_repair=True)
+        if not status.writer_cleared or writer_blocks:
+            clearing_step = (
+                _clear_step(attempt, status.session_urls)
+                if not status.writer_cleared
+                else " ".join(b.detail for b in writer_blocks)
+                + " Confirm that each named worker finished or stopped, or verify its"
+                " write access was removed."
+            )
             self._notice(
                 item,
                 f"{base}:clear",
@@ -605,8 +613,7 @@ class Service:
                     Stage.WAITING,
                     f"{what} The factory will start repair attempt {decision.attempt} on its own"
                     f" ({_repairs_left(decision)}), but first it needs to know the earlier worker"
-                    " has stopped, so two workers never write at once. "
-                    + _clear_step(attempt, status.session_urls),
+                    " has stopped, so two workers never write at once. " + clearing_step,
                     pr_url=self._pr_url(item, report.pr),
                 ),
                 now,

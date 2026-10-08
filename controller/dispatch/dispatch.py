@@ -210,8 +210,12 @@ class Launcher:
         self, contract: Mapping[str, object], now: datetime, refire_of: RunId | None = None
     ) -> tuple[RunId | None, ContractDigest | None, tuple[Notice, ...]]:
         """Recovery's blocks plus Rolando's decisions, read from the ledger now."""
-        blocks = list(self._recovery.blocks(now))
         verdict = self._approvals.check(contract, now, refire_of=refire_of)
+        automatic = (
+            verdict.run is not None
+            and self._approvals.automatic_repair(contract, verdict.run.attempt, now) is not None
+        )
+        blocks = list(self._recovery.blocks(now, automatic_repair=automatic))
         blocks += verdict.blocks
         if verdict.run is None and not blocks:
             blocks.append(Notice("no-run", "There is no attempt to fire."))

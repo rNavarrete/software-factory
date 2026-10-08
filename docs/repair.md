@@ -49,3 +49,19 @@ The signer writes the allowance into the move's signed approval and keeps it in 
 - The factory never stops a running worker and never clears one itself.
 - Native auto-fix stays off. ADR 0001 §7 and the governance map (G-C2, G-C9) still describe every repair as typed. Reconciling them is ENG-163's job.
 - A repair go-ahead is a factory action under Rolando's allowance, not a decision he made. The record says so.
+
+## An accepted unknown writer stays a manual exception
+
+Accepting the risk that a lost worker might still exist does not establish
+that it finished. Automatic repair checks therefore ignore
+`unresolved-accepted` clearings and require qualified writer clearing across
+all tasks in the shared lane. This is checked before asking for a repair
+permission and again inside the existing locked launch reservation, including
+when a signed repair permission was already saved before a restart.
+
+A later completed/terminated clearing covering the known sessions, or verified
+removal of write access, can release the automatic repair. Rolando can still
+explicitly authorize a particular repair through the existing typed flow;
+that manual decision takes precedence over a saved automatic permission and
+retains the existing exception rules. The automatic path never makes that
+decision for him.

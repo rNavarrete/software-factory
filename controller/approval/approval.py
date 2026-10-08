@@ -892,13 +892,19 @@ class Approvals:
         self, contract: Mapping[str, object], attempt: AttemptId, now: datetime
     ) -> Mapping[str, object] | None:
         """The repair record under the Todo move's allowance that counts for
-        ``attempt`` of this contract now, if any: what the worker is handed."""
+        ``attempt`` of this contract now, if any: what the worker is handed.
+        An explicit typed repair takes precedence as the manual fallback."""
         if contracts.approval_errors(contract):
             return None
         digest = contracts.digest(contracts.freeze(contract))
         found = None
         for item in self.trusted_events(self._store.events(), digest, now=now):
             e = item.event
+            if e.kind == ev.REPAIR_AUTHORIZED and e.attempt == attempt:
+                # An explicit typed repair is the human-directed fallback,
+                # even if an automatic go-ahead is also present. It retains
+                # the existing human exception rules for writer clearing.
+                return None
             if e.kind == ev.SOURCE_REPAIR_AUTHORIZED and e.attempt == attempt:
                 found = e.data
         return found
