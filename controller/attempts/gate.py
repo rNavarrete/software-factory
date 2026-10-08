@@ -84,6 +84,7 @@ class AttemptGate:
         refire_of: RunId | None = None,
         automated: bool = False,
         precondition: Callable[[RunId], Sequence[Notice]] | None = None,
+        with_intent: Callable[[RunId], Sequence[LedgerEvent]] = lambda _run: (),
     ) -> RunId:
         """Count the attempt and the fire before launching (G-C1).
 
@@ -96,6 +97,10 @@ class AttemptGate:
         recovery checks here, so nothing can be recorded between those checks
         and the reservation (no other writer can append while the lock is held).
         It must only read.
+
+        ``with_intent`` gives events to append in the same transaction as the
+        fire intent (dispatch's run context), so they can't be lost between
+        the reservation and the send.
         """
         with self._store.writer_lock():
             stored = self._store.events()
@@ -134,6 +139,7 @@ class AttemptGate:
                     },
                 )
             )
+            new.extend(with_intent(run))
             self._store.append(*new)
             return run
 

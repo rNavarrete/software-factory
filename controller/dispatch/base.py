@@ -64,7 +64,7 @@ class GhBaseCheck:
         except (OSError, subprocess.SubprocessError) as e:
             raise BaseUnreadable(f"gh api {path} did not run: {e}") from e
         if result.returncode != 0:
-            if "404" in result.stderr or "No commit found" in result.stderr:
+            if "No commit found" in result.stderr or "No common ancestor" in result.stderr:
                 return False
             raise BaseUnreadable(f"gh api {path} failed: {result.stderr.strip()[:500]}")
         try:

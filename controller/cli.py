@@ -46,6 +46,7 @@ from controller.attempts.events import ClearingBasis
 from controller.attempts.policy import LedgerView
 from controller.dispatch import Dispatcher, Refused
 from controller.interfaces import AttemptId, LedgerLocked, LedgerStore, TaskId
+from controller.ledger import LedgerError
 from controller.recovery import Finding, GitHubUnreadable, Recovery, RecoveryRefused, State
 
 
@@ -137,15 +138,22 @@ def main(argv: list[str] | None = None, make: Callable[[], Controller] = _real) 
     except (OSError, ValueError) as e:
         print(f"Can't read the contract: {e}")
         return 2
-    c = make()
     try:
-        return _run(c, args, contract)
+        return _run(make(), args, contract)
     except Refused as e:
         print("Nothing sent:")
         for b in e.blocks:
             print(f"  - {b.detail} [{b.code}]")
         return 1
-    except (ApprovalRefused, RecoveryRefused, GitHubUnreadable, LedgerLocked) as e:
+    except (
+        ApprovalRefused,
+        RecoveryRefused,
+        GitHubUnreadable,
+        LedgerLocked,
+        LedgerError,
+        LookupError,
+        OSError,
+    ) as e:
         print(f"Not done: {e}")
         return 1
     except ValueError as e:

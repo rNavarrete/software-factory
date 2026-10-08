@@ -39,6 +39,7 @@ the Keychain or the operator key that signs decisions.
 from __future__ import annotations
 
 import hashlib
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ from controller.interfaces import (
     LaunchOutcome,
     LaunchRequest,
     LaunchResult,
+    LedgerEvent,
     LedgerLocked,
     LedgerStore,
     RunId,
@@ -76,7 +78,7 @@ RUNTIME = "cloud-routine"
 PROMPT_FILE = Path(__file__).resolve().parent.parent / "adapter" / "routine_prompt.md"
 
 _PROMPT_SEPARATOR = b"\n---\n\n"
-_LOCK_TRIES = 10
+_LOCK_TRIES = 50
 _LOCK_WAIT_SECONDS = 0.2
 
 # Approval blocks Rolando can settle by approving the contract in front of him.
@@ -110,6 +112,9 @@ class Refused(Exception):
 class Fired:
     run: RunId
     result: LaunchResult
+    late: bool = False
+    """The answer came after recovery had marked the run unknown; the run stays
+    recorded as launch-outcome-unknown."""
 
 
 Prepare = Callable[[RunId, ContractDigest], Callable[[], LaunchResult]]
@@ -141,6 +146,7 @@ class Launcher:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         backup: Callable[[datetime], object] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        warn: Callable[[str], None] = lambda text: print(text, file=sys.stderr),
     ) -> None:
         if not model_config_version.strip():
             raise ValueError("say which routine and prompt revision fires")
@@ -152,6 +158,7 @@ class Launcher:
         self._now = now
         self._backup = backup
         self._sleep = sleep
+        self._warn = warn
 
     def check(
         self, contract: Mapping[str, object], now: datetime, refire_of: RunId | None = None
@@ -197,9 +204,28 @@ class Launcher:
                 )
             return out
 
+        def context(reserved: RunId) -> list[LedgerEvent]:
+            return [
+                records.run_context(
+                    reserved,
+                    digest,
+                    str(frozen["version"]),
+                    str(frozen["base_commit"]),
+                    RUNTIME,
+                    self._config,
+                    int(frozen["attempt_budget"]),  # type: ignore[call-overload]
+                    now,
+                )
+            ]
+
         try:
             reserved = self._gate.reserve(
-                run.attempt.task, digest, now, refire_of=refire_of, precondition=still_allowed
+                run.attempt.task,
+                digest,
+                now,
+                refire_of=refire_of,
+                precondition=still_allowed,
+                with_intent=context,
             )
         except GateRefused as e:
             raise Refused(e.decision.blocks) from None
@@ -210,18 +236,6 @@ class Launcher:
         assert reserved == run
 
         try:
-            self._write(
-                records.run_context(
-                    run,
-                    digest,
-                    str(frozen["version"]),
-                    str(frozen["base_commit"]),
-                    RUNTIME,
-                    self._config,
-                    int(frozen["attempt_budget"]),  # type: ignore[call-overload]
-                    now,
-                )
-            )
             result = send()
         except routine.LaunchInterrupted as e:
             self._record(run, e.result)
@@ -236,43 +250,54 @@ class Launcher:
                 ),
             )
             raise
-        self._record(run, result)
+        late = self._record(run, result)
         self.backup()
-        return Fired(run, result)
+        return Fired(run, result, late)
 
     def backup(self) -> None:
-        if self._backup is not None:
+        """Back up the ledger. A failed backup is reported, never fatal: what it
+        would copy is already safely in the ledger."""
+        if self._backup is None:
+            return
+        try:
             self._backup(self._now())
+        except Exception as e:
+            self._warn(f"Warning: the ledger backup failed ({type(e).__name__}: {e}).")
 
-    def _write(self, event) -> None:
-        def append() -> None:
-            with self._store.writer_lock():
-                self._store.append(event)
+    def _record(self, run: RunId, result: LaunchResult) -> bool:
+        """Record ``result``; True if it arrived after recovery had already marked
+        the run unknown. If it can't be recorded at all, it is printed, so a
+        session URL is never lost with it."""
+        late = False
 
-        self._with_lock(append)
-
-    def _record(self, run: RunId, result: LaunchResult) -> None:
         def record() -> None:
+            nonlocal late
             now = self._now()
             try:
                 self._gate.record_launch(run, result, now)
             except ValueError:
                 # Recovery already marked it unknown; keep the late answer beside it.
                 self._recovery.record_late_result(run, result, now)
+                late = True
 
-        self._with_lock(record)
-
-    def _with_lock(self, write: Callable[[], None]) -> None:
-        """A launch result must not be lost to another command holding the lock
-        for a moment, so wait briefly for it."""
-        for i in range(_LOCK_TRIES):
-            try:
-                write()
-                return
-            except LedgerLocked:
-                if i == _LOCK_TRIES - 1:
-                    raise
-                self._sleep(_LOCK_WAIT_SECONDS)
+        try:
+            for i in range(_LOCK_TRIES):
+                try:
+                    record()
+                    return late
+                except LedgerLocked:
+                    if i == _LOCK_TRIES - 1:
+                        raise
+                    self._sleep(_LOCK_WAIT_SECONDS)
+        except BaseException:
+            self._warn(
+                f"The answer to {run} could NOT be recorded: {result.outcome.value},"
+                f" HTTP {result.http_status}, session {result.session_url or 'none'}"
+                f" ({result.detail or 'no detail'}). Keep this; recovery will mark the run"
+                " unknown and the session URL is needed to clear it."
+            )
+            raise
+        return late
 
 
 @dataclass(frozen=True)
@@ -314,6 +339,7 @@ class Dispatcher:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         backup: Callable[[datetime], object] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        warn: Callable[[str], None] | None = None,
     ) -> None:
         self._store = store
         self._approvals = approvals
@@ -338,6 +364,7 @@ class Dispatcher:
             now=now,
             backup=backup,
             sleep=sleep,
+            **({} if warn is None else {"warn": warn}),
         )
 
     def dispatch(self, contract: Mapping[str, object]) -> DispatchResult:
@@ -350,7 +377,6 @@ class Dispatcher:
         contract = contracts.freeze(contract)
         digest = contracts.digest(contract)
         task = TaskId(str(contract["task_id"]))
-        self._check_target(contract)
 
         refire_of = None
         latest = self._latest(task)
@@ -363,8 +389,16 @@ class Dispatcher:
                 and status.state is st.State.AWAITING_HUMAN
                 and not status.pull_requests
             )
-            if status.state in _GOING and not not_launched:
+            # A signed go-ahead for the next attempt means Rolando has moved on
+            # from this one, whatever state it was left in.
+            next_attempt = AttemptId(task, latest.attempt.number + 1)
+            trusted = self._approvals.trusted_events(self._store.events(), digest)
+            repaired = next_attempt in LedgerView.build(trusted).repairs
+            moved_on = repaired and status.state is not st.State.MERGED
+            if status.state in _GOING and not not_launched and not moved_on:
                 return self._on_record(status, digest)
+            if moved_on:
+                not_launched = False
             if not_launched:
                 assert last is not None
                 if latest.digest != digest.value:
@@ -380,6 +414,7 @@ class Dispatcher:
                     )
                 refire_of = last.run
 
+        self._check_target(contract)
         self._preview(contract, digest, now, refire_of)
         self._approve_if_needed(contract, now, refire_of)
         if refire_of is not None:
@@ -509,6 +544,12 @@ class Dispatcher:
 
 def _fired_message(fired: Fired) -> str:
     r = fired.result
+    if fired.late:
+        return (
+            f"{fired.run} answered late ({r.outcome.value}, session {r.session_url or 'none'})"
+            " after the controller had already marked it unknown. Its session is on record;"
+            " the single lane stays held until you check it and record a clearing."
+        )
     if r.outcome is LaunchOutcome.LAUNCHED:
         return (
             f"Started {fired.run}: {r.session_url}. A worker is running; this is not a"
