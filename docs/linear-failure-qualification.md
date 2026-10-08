@@ -10,7 +10,8 @@ need their own incremental qualification, not extra prerequisites for this pilot
 
 ## Revision and results
 
-- Controller base: `df1c598d501c606697399fe15f871e8443f6700c` plus this ENG-158 change.
+- Controller base: `4fcf42ac64cb2128723765509da48cb537ff4600` (including PR #37's
+  real review-to-repair connection) plus this ENG-158 change.
   Use the containing PR's tested head SHA to identify the complete patch.
 - Configuration: existing synthetic GitHub and Linear fixtures; SQLite and real
   controller components where those tests use them. No production configuration
@@ -23,6 +24,9 @@ need their own incremental qualification, not extra prerequisites for this pilot
   reviewer restart. Six tests cover this boundary through the real workflow
   result reader, reviewer, ledger, service closeout and Linear reporter.
 - Real launches during this qualification: **0 workers, 0 reviewers**.
+- Local verification: 2,236 tests, passing with 40 expected macOS platform skips;
+  Ruff lint and format checks passed. Linux CI on the containing PR is the
+  evidence for the platform-specific cases and must pass before merging.
 - This does not qualify model judgement, deployed permissions or the full hosted
   service. API fixtures cannot establish those properties.
 
@@ -54,8 +58,8 @@ increase a test count.
    dispatch count and resulting PR. Include a meaningful product-question flow.
 2. **Protected Codex review and bounded repair:** observe actual review provenance,
    one permitted repair after the old writer is cleared, and a verification pass
-   on the changed commit. The real review-to-repair connection is PR #37, separate
-   from this patch; rerun qualification against the revision that includes it.
+   on the changed commit. PR #37's real review-to-repair connection is included
+   in this tested base; `test_repair_from_review.py` exercises that bridge offline.
    Record all worker and reviewer launches, including failed/unknown responses.
 3. **Authority and release boundaries:** reuse dated ENG-142/143/180 evidence only
    after confirming the installation, collaborators, ruleset, workflow permissions,
