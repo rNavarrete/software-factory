@@ -65,7 +65,7 @@ A merge is recorded as fully verified only when the independent review passed on
    fly ssh console --app rnavarrete-factory -C "sh -c 'cd /app && FACTORY_SECRETS_DIR=/run/factory-secrets python3 -m controller.report probe ENG-178'"
    ```
 
-3. Start the service with `--reporter linear` (`deploy/fly/entrypoint.sh`).
+3. Run the service in live mode (`FACTORY_MODE=live`, see `docs/service.md`). Live mode posts with this reporter.
 
 These belong to the qualification run in ENG-163.
 

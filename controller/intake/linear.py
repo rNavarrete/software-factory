@@ -47,7 +47,7 @@ import http.client
 import json
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -528,7 +528,7 @@ class HttpTransport:
         key: Callable[[], str],
         opener: Callable[..., object] | None = None,
         *,
-        forbidden_user: Callable[[], str | None] | None = None,
+        forbidden_user: Callable[[], str | Collection[str] | None] | None = None,
     ):
         self._key = key
         self._open = opener or urllib.request.build_opener(_NoRedirect()).open
@@ -556,7 +556,9 @@ class HttpTransport:
             vid = str(viewer["id"])
             self._viewers[fp] = vid
         forbidden = self._forbidden() if self._forbidden is not None else None
-        if forbidden is not None and vid == forbidden:
+        if isinstance(forbidden, str):
+            forbidden = (forbidden,)
+        if forbidden is not None and vid in forbidden:
             raise IntakeBlocked(_ACTS_AS_APPROVER)
         return vid
 
