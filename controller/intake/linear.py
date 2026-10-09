@@ -26,6 +26,15 @@ ticket text is pinned as ``revision``: the sha256 of the ticket's title,
 description, labels, project, team and parent at the time it is read, which
 is the text at the time of the move because nothing changed since.
 
+Linear folds one person's quick changes into a single history entry and
+keeps only the net result, so a quick trip out of Todo and back shows as no
+state change at all. Intake also reads the ticket's state spans
+(``stateHistory``: when it entered and left each state). A span in Todo that
+follows a span elsewhere is a move into Todo; the history entry that was
+being written at that moment (created at or before it, last updated at or
+after it) says who made it, with the same checks as above. Linear only folds
+changes by the same actor, so that entry's actor made the move.
+
 A ticket created straight in Todo, or imported there, has no move and does
 not start; intake says so once on the ticket. A move by anyone or anything
 else is refused with the reason, once.
@@ -48,7 +57,7 @@ import json
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
 from controller.ledger.redact import redact
@@ -60,6 +69,9 @@ PAUSE_LABEL = "factory-pause"
 """Added by Rolando to a project's status ticket: pause. Removed: resume."""
 SETTLE = timedelta(minutes=2)
 OVERLAP = timedelta(minutes=15)
+CLOCK = timedelta(seconds=5)
+"""How far a state span's start may sit from its history entry's times:
+both come from Linear's clock, but not from the same write."""
 """How far back each poll reaches before its cursor. Overlap is harmless:
 the service ignores event ids it has already recorded."""
 _DONE_TYPES = frozenset({"completed", "canceled"})
@@ -108,6 +120,19 @@ class Change:
     project, team, parent."""
     added_labels: tuple[str, ...] = ()
     removed_labels: tuple[str, ...] = ()
+    updated_at: datetime | None = None
+    """When Linear last folded a change into this entry (None: never)."""
+    span_id: str | None = None
+    """For a move read from the state spans: the Todo span it started."""
+
+
+@dataclass(frozen=True)
+class Span:
+    """A stretch of time the ticket spent in one state (``IssueStateSpan``)."""
+
+    id: str
+    state: State
+    started_at: datetime
 
 
 @dataclass(frozen=True)
@@ -129,6 +154,8 @@ class Ticket:
     """(key, state type) of each ticket that blocks this one."""
     changes: tuple[Change, ...]
     """Oldest first."""
+    spans: tuple[Span, ...] = ()
+    """Oldest first. Empty if Linear sent none."""
 
 
 def revision(t: Ticket) -> str:
@@ -201,12 +228,67 @@ def attribution_problem(c: Change, approver_id: str) -> str | None:
     return None
 
 
+def _last_write(c: Change) -> datetime:
+    return c.updated_at or c.at
+
+
+def _covers(c: Change, at: datetime) -> bool:
+    """Was this entry being written at ``at`` (a change folded into it then)?"""
+    return c.at - CLOCK <= at <= _last_write(c) + CLOCK
+
+
+def todo_moves(t: Ticket, policy: IntakePolicy) -> list[Change]:
+    """Every move into Todo since onboarding, oldest first: the history
+    entries that record one, plus each Todo span whose move Linear folded
+    into an entry with no net state change (out of Todo and back)."""
+    moves = [c for c in t.changes if _is_move_into(c, policy.todo) and c.at >= policy.since]
+    for before, span in zip(t.spans, t.spans[1:], strict=False):
+        if span.state.name != policy.todo or before.state.name == policy.todo:
+            continue
+        if span.started_at < policy.since or any(_covers(m, span.started_at) for m in moves):
+            continue
+        covering = [c for c in t.changes if _covers(c, span.started_at)]
+        if len({(c.actor_id, c.bot) for c in covering}) != 1:
+            continue  # not written yet (the poll waits), or no single author to name
+        entry = covering[-1]
+        if entry.to_state is not None:
+            continue  # an entry that shows another state change: not this move
+        moves.append(
+            replace(
+                entry,
+                id=f"{entry.id}_{span.id}",
+                at=span.started_at,
+                from_state=before.state,
+                to_state=span.state,
+                content=(),
+                span_id=span.id,
+            )
+        )
+    return sorted(moves, key=lambda c: (c.at, c.id))
+
+
+def _todo_span_unread(t: Ticket, policy: IntakePolicy, now: datetime) -> bool:
+    """The ticket entered Todo but no history entry covers it yet."""
+    if len(t.spans) < 2 or t.state.name != policy.todo:
+        return False
+    before, span = t.spans[-2], t.spans[-1]
+    return (
+        span.state.name == policy.todo
+        and before.state.name != policy.todo
+        and span.started_at >= policy.since
+        and now - span.started_at < OVERLAP
+        and not any(_covers(c, span.started_at) for c in t.changes)
+    )
+
+
 def changed_after(t: Ticket, at: datetime) -> list[str]:
     """What defines the work changed at or after ``at`` (the move's own entry
-    included: Linear may fold a quick edit into it)."""
+    included: Linear may fold a quick edit into it). An earlier entry that
+    Linear was still folding changes into after ``at`` counts too: its edits
+    may have come after the move."""
     parts: list[str] = []
     for c in t.changes:
-        if c.at >= at:
+        if c.at >= at or _last_write(c) > at + CLOCK:
             parts += [p for p in c.content if p not in parts]
     return parts
 
@@ -217,6 +299,9 @@ def left_after(t: Ticket, at: datetime, policy: IntakePolicy) -> str | None:
     for c in t.changes:
         if c.at > at and c.to_state is not None and not _stands_in(c.to_state, policy):
             return c.to_state.name
+    for span in t.spans:
+        if span.started_at > at + CLOCK and not _stands_in(span.state, policy):
+            return span.state.name
     return None
 
 
@@ -235,7 +320,7 @@ def judge(t: Ticket, policy: IntakePolicy, now: datetime) -> Authorization | Ref
     excluded = (rule.issues is not None and t.key not in rule.issues) or bool(
         set(t.labels) & rule.skip_labels
     )
-    moves = [c for c in t.changes if _is_move_into(c, policy.todo) and c.at >= policy.since]
+    moves = todo_moves(t, policy)
     if not moves:
         if excluded:
             return None
@@ -254,8 +339,14 @@ def judge(t: Ticket, policy: IntakePolicy, now: datetime) -> Authorization | Ref
             )
         return None
     move = moves[-1]
-    if t.state.name != policy.todo or any(
-        c.at > move.at and c.to_state is not None for c in t.changes
+    if (
+        t.state.name != policy.todo
+        or any(c.at > move.at and c.to_state is not None for c in t.changes)
+        or (
+            t.spans
+            and t.spans[-1].started_at > move.at
+            and not _covers(move, t.spans[-1].started_at)
+        )
     ):
         return None  # it left Todo again; a later move back is a new event
     problem = attribution_problem(move, policy.approver_id)
@@ -301,6 +392,12 @@ def judge(t: Ticket, policy: IntakePolicy, now: datetime) -> Authorization | Ref
             f"Linear history entry {move.id}: {move.from_state.name if move.from_state else '?'}"
             f" to {policy.todo} by user {move.actor_id}, no bot, integration, import or"
             " automation; nothing that defines the work changed after it."
+            + (
+                f" Read from state span {move.span_id} at {move.at.isoformat()}: Linear folded"
+                " the move into that entry."
+                if move.span_id
+                else ""
+            )
         ),
     )
 
@@ -325,9 +422,15 @@ def standing(t: Ticket | None, a: Authorization, policy: IntakePolicy) -> Standi
         what = ", ".join(edited) if edited else "its text"
         changed = f"the ticket changed after it was moved to Todo ({what})"
     waiting = tuple(sorted(k for k, kind in t.blockers if kind not in _DONE_TYPES))
-    stayed = t.state.name == policy.todo and not any(
-        c.at > a.moved_at and c.to_state is not None and c.to_state.name != policy.todo
-        for c in t.changes
+    stayed = (
+        t.state.name == policy.todo
+        and not any(
+            c.at > a.moved_at and c.to_state is not None and c.to_state.name != policy.todo
+            for c in t.changes
+        )
+        and not any(
+            s.started_at > a.moved_at + CLOCK and s.state.name != policy.todo for s in t.spans
+        )
     )
     return Standing(changed=changed, waiting_on=waiting, in_todo=stayed)
 
@@ -353,7 +456,7 @@ def controls(t: Ticket, policy: IntakePolicy) -> list[Control]:
 # --- Reading Linear's answers ------------------------------------------------------
 
 _HISTORY_FIELDS = """
-  id createdAt
+  id createdAt updatedAt
   actor { id name app }
   botActor { type name }
   issueImport { id }
@@ -372,6 +475,7 @@ _ISSUE_FIELDS = f"""
   labels(first: 20) {{ nodes {{ name }} }}
   inverseRelations(first: 20) {{ nodes {{ type issue {{ identifier state {{ type }} }} }} }}
   history(first: 25) {{ nodes {{ {_HISTORY_FIELDS} }} pageInfo {{ hasNextPage endCursor }} }}
+  stateHistory(first: 50) {{ nodes {{ id startedAt state {{ id name type }} }} }}
 """
 
 ISSUES_QUERY = f"""
@@ -455,6 +559,7 @@ def parse_change(raw: Mapping[str, object]) -> Change:
             or raw.get("triageResponsibilityAutoAssigned")
         ),
         imported=raw.get("issueImport") is not None,
+        updated_at=_when(raw["updatedAt"]) if raw.get("updatedAt") else None,
         from_state=_state(raw.get("fromState")),
         to_state=_state(raw.get("toState")),
         content=tuple(content),
@@ -479,6 +584,13 @@ def parse_ticket(raw: Mapping[str, object], history: Iterable[Mapping[str, objec
     if state is None:
         raise ValueError("ticket without a state")
     changes = sorted((parse_change(h) for h in history), key=lambda c: (c.at, c.id))
+    spans_raw = raw.get("stateHistory")
+    spans = []
+    for n in (spans_raw or {}).get("nodes", ()) if isinstance(spans_raw, Mapping) else ():
+        st = _state(n.get("state")) if isinstance(n, Mapping) else None
+        if st is not None:
+            spans.append(Span(str(n["id"]), st, _when(n["startedAt"])))
+    spans.sort(key=lambda s: (s.started_at, s.id))
     return Ticket(
         id=str(raw["id"]),
         key=str(raw["identifier"]),
@@ -494,6 +606,7 @@ def parse_ticket(raw: Mapping[str, object], history: Iterable[Mapping[str, objec
         gone=bool(raw.get("trashed") or raw.get("archivedAt")),
         blockers=tuple(blockers),
         changes=tuple(changes),
+        spans=tuple(spans),
     )
 
 
@@ -720,8 +833,9 @@ def _cursor_time(cursor: str | None) -> datetime | None:
 
 
 def _settling(t: Ticket, policy: IntakePolicy, now: datetime) -> bool:
-    moves = [c for c in t.changes if _is_move_into(c, policy.todo) and c.at >= policy.since]
-    return bool(moves) and now - moves[-1].at < policy.settle and t.state.name == policy.todo
+    moves = todo_moves(t, policy)
+    recent = bool(moves) and now - moves[-1].at < policy.settle
+    return t.state.name == policy.todo and (recent or _todo_span_unread(t, policy, now))
 
 
 def policy_from(onboarding: object) -> IntakePolicy:

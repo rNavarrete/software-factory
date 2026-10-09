@@ -571,6 +571,179 @@ class JudgeTests(LinearCase):
             self.assertEqual(judge(ticket(shuffled), self.policy, NOW), expected)
 
 
+def spans(*states):
+    """``stateHistory`` nodes: (state, entered) pairs, oldest first."""
+    return {
+        "nodes": [
+            {"id": f"span-{i}", "startedAt": iso(at), "state": st}
+            for i, (st, at) in enumerate(states)
+        ]
+    }
+
+
+class FoldedMoveTests(LinearCase):
+    """Linear folds one person's quick changes into one history entry and keeps
+    only the net result. Seen live on 2026-10-09: Backlog at 01:31, Todo at
+    01:37, recorded as one entry with no state change. The state spans show
+    the move; the entry being written at that moment shows who made it."""
+
+    def node(self, history, states, **kw):
+        n = issue_node("ENG-187", state=TODO, history=history, **kw)
+        n["stateHistory"] = spans(*states)
+        return n
+
+    def first_move(self):
+        at = NOW - timedelta(hours=1)
+        return entry("h-first", at, fromState=BACKLOG, toState=TODO, updatedAt=iso(at))
+
+    def folded(self, created, updated, **fields):
+        return entry("h-folded", created, updatedAt=iso(updated), **fields)
+
+    def states(self, back):
+        return [
+            (BACKLOG, SINCE - timedelta(hours=1)),
+            (TODO, NOW - timedelta(hours=1)),
+            (BACKLOG, NOW - timedelta(minutes=10)),
+            (TODO, back),
+        ]
+
+    def judge_node(self, n):
+        return judge(ticket(n), self.policy, self.now)
+
+    def test_a_folded_trip_out_of_todo_and_back_is_a_move(self):
+        back = NOW - timedelta(minutes=4)
+        n = self.node(
+            [self.first_move(), self.folded(NOW - timedelta(minutes=10), back)],
+            self.states(back),
+        )
+        a = self.judge_node(n)
+        self.assertIsInstance(a, Authorization)
+        self.assertEqual(a.event_id, "h-folded_span-3")
+        self.assertEqual(a.moved_at, back)
+        self.assertIn("state span span-3", a.evidence)
+        self.assertIn(APPROVER, a.actor)
+
+    def test_an_edit_folded_in_before_the_move_still_counts(self):
+        # Rolando answers a question: edits the text, then out of Todo and back.
+        back = NOW - timedelta(minutes=4)
+        n = self.node(
+            [
+                self.first_move(),
+                self.folded(NOW - timedelta(minutes=12), back, updatedDescription=True),
+            ],
+            self.states(back),
+        )
+        self.assertIsInstance(self.judge_node(n), Authorization)
+
+    def test_an_edit_folded_in_after_the_move_is_refused(self):
+        back = NOW - timedelta(minutes=4)
+        n = self.node(
+            [
+                self.first_move(),
+                self.folded(
+                    NOW - timedelta(minutes=10), NOW - timedelta(minutes=1), updatedDescription=True
+                ),
+            ],
+            self.states(back),
+        )
+        r = self.judge_node(n)
+        self.assertIsInstance(r, Refusal)
+        self.assertIn("changed after it was moved", r.reason)
+
+    def test_a_folded_move_by_anyone_else_is_refused(self):
+        back = NOW - timedelta(minutes=4)
+        for who, fields, words in (
+            ("another user", dict(actor=MARIA), "made by Maria"),
+            ("an integration", dict(botActor=CLAUDE_BOT), "integration or app"),
+        ):
+            with self.subTest(who):
+                folded = self.folded(NOW - timedelta(minutes=10), back, **fields)
+                r = self.judge_node(self.node([self.first_move(), folded], self.states(back)))
+                self.assertIsInstance(r, Refusal)
+                self.assertIn(words, r.reason)
+
+    def test_entries_by_two_people_covering_the_move_name_no_one(self):
+        back = NOW - timedelta(minutes=4)
+        hers = entry("h-maria", NOW - timedelta(minutes=6), actor=MARIA, updatedAt=iso(back))
+        n = self.node(
+            [self.first_move(), self.folded(NOW - timedelta(minutes=10), back), hers],
+            self.states(back),
+        )
+        # Neither the folded trip nor the hour-old move (it left Todo since) counts.
+        self.assertIsNone(self.judge_node(n))
+
+    def test_a_move_linear_kept_as_its_own_entry_is_not_counted_twice(self):
+        # An edit and then the move, folded into one entry that shows the move.
+        moved = NOW - timedelta(minutes=4)
+        e = entry(
+            "h-own",
+            NOW - timedelta(minutes=6),
+            fromState=BACKLOG,
+            toState=TODO,
+            updatedAt=iso(moved),
+        )
+        n = self.node([e], [(BACKLOG, SINCE - timedelta(hours=1)), (TODO, moved)])
+        a = self.judge_node(n)
+        self.assertIsInstance(a, Authorization)
+        self.assertEqual(a.event_id, "h-own")
+
+    def test_a_trip_not_yet_in_history_waits_and_holds_the_cursor(self):
+        back = NOW - timedelta(seconds=40)
+        n = self.node([self.first_move()], self.states(back), updated=back)
+        self.assertIsNone(self.judge_node(n))
+        self.assertTrue(linear._settling(ticket(n), self.policy, self.now))
+
+    def test_replayed_polls_give_the_same_event_id(self):
+        back = NOW - timedelta(minutes=4)
+        n = self.node(
+            [self.first_move(), self.folded(NOW - timedelta(minutes=10), back)],
+            self.states(back),
+        )
+        self.world.nodes[n["id"]] = n
+        first = self.source.poll(None)
+        self.assertEqual([a.event_id for a in first.authorizations], ["h-folded_span-3"])
+        self.assertEqual(self.source.poll(first.cursor).authorizations, first.authorizations)
+
+    def test_a_folded_trip_after_acceptance_withdraws_it(self):
+        back = NOW - timedelta(minutes=30)
+        first = self.folded(NOW - timedelta(minutes=35), back)
+        states = [
+            (BACKLOG, SINCE - timedelta(hours=1)),
+            (TODO, NOW - timedelta(hours=1)),
+            (BACKLOG, NOW - timedelta(minutes=35)),
+            (TODO, back),
+        ]
+        n = self.node([self.first_move(), first], states)
+        a = self.judge_node(n)
+        self.assertIsInstance(a, Authorization)
+        # Later, out to Backlog and back again, folded into one entry.
+        later = entry(
+            "h-later", NOW - timedelta(minutes=3), updatedAt=iso(NOW - timedelta(minutes=2))
+        )
+        n2 = self.node(
+            [self.first_move(), first, later],
+            [
+                *self.states(back),
+                (BACKLOG, NOW - timedelta(minutes=3)),
+                (TODO, NOW - timedelta(minutes=2)),
+            ],
+        )
+        s = standing(ticket(n2), a, self.policy)
+        self.assertIsNotNone(s.withdrawn)
+        self.assertIn("Backlog", s.withdrawn)
+
+    def test_without_state_spans_nothing_changes(self):
+        back = NOW - timedelta(minutes=4)
+        n = issue_node(
+            "ENG-187",
+            state=TODO,
+            history=[self.first_move(), self.folded(NOW - timedelta(minutes=10), back)],
+        )
+        # Only the hour-old move is known, and it has been read before.
+        a = judge(ticket(n), self.policy, self.now)
+        self.assertEqual(a.event_id, "h-first")
+
+
 class StatusTicketTests(LinearCase):
     def setUp(self):
         super().setUp()
