@@ -25,6 +25,18 @@ from controller.interfaces import (
 # controller.review.events.REVIEW_JOB_INTENT, named here so the gate doesn't
 # import the reviewer (a test keeps the two the same).
 REVIEW_JOB_INTENT = "review-job-intent"
+# controller.recovery.events.WORKER_IDLE and controller.ledger.kinds.CANDIDATE,
+# named here for the same reason.
+WORKER_IDLE = "worker-idle-confirmed"
+CANDIDATE = "candidate"
+
+PR_QUIET = timedelta(minutes=30)
+"""How long a worker must show no new commit before the factory treats it as
+finished and frees the lane (Rolando's decision, 2026-10-09)."""
+IDLE_FRESH = timedelta(minutes=10)
+"""How recent the factory's own confirmation that a worker is idle must be
+for a launch to rely on it. Recovery writes one only after reading GitHub
+successfully, so a failed read leaves none and the lane stays held."""
 
 
 @dataclass(frozen=True)
@@ -56,6 +68,12 @@ class AttemptState:
     reserved_at: datetime
     fires: list[Fire] = field(default_factory=list)
     cleared: ev.ClearingBasis | None = None
+    activity_at: datetime | None = None
+    """When the factory last saw a new commit for this attempt (a candidate
+    record) since its latest fire."""
+    idle: tuple[datetime, str] | None = None
+    """The factory's latest confirmation, from a successful GitHub read, that
+    the worker is finished: when, and why."""
 
     @property
     def last_fire(self) -> Fire | None:
@@ -76,6 +94,29 @@ class AttemptState:
     def unresolved(self) -> bool:
         """ADR 0002 section 6.1: a session may exist and nothing has cleared it."""
         return not (self.state == "not-launched" or self.cleared is not None)
+
+    def finished_by_pr(self, now: datetime) -> str | None:
+        """Why the worker counts as finished from its PR alone, or None.
+
+        Workers stop once they have opened their PR, and each attempt writes
+        only to its own marker branch, so Rolando chose (2026-10-09) to free
+        the lane without his clearing once the PR is merged or closed with no
+        commit after that, or has had no new commit for ``PR_QUIET``. Recovery
+        decides that from a successful GitHub read and records it
+        (``WORKER_IDLE``); here it counts only while fresh (``IDLE_FRESH``) and
+        only if no newer commit was seen since. A failed read writes nothing,
+        so the confirmation goes stale and the lane is held again."""
+        if self.idle is None:
+            return None
+        at, reason = self.idle
+        if self.activity_at is not None and self.activity_at > at:
+            return None
+        if not timedelta(0) <= now - at <= IDLE_FRESH:
+            return None
+        return reason
+
+    def holds_lane(self, now: datetime) -> bool:
+        return self.unresolved and self.finished_by_pr(now) is None
 
 
 @dataclass(frozen=True)
@@ -131,6 +172,8 @@ class LedgerView:
             fire = Fire(e.run, e.at, None)
             # A clearing record covers the fires before it, never a later re-fire.
             state.cleared = None
+            state.activity_at = None
+            state.idle = None
             fires_by_run[e.run] = len(self.all_fires)
             self.all_fires.append(fire)
             state.fires.append(fire)
@@ -202,6 +245,16 @@ class LedgerView:
             self.escalations.add(str(d["dedup"]))
         elif e.kind == REVIEW_JOB_INTENT and e.attempt is not None:
             self.review_fires.append(e.at)
+        elif e.kind in (CANDIDATE, WORKER_IDLE) and e.attempt in self.attempts:
+            state = self.attempts[e.attempt]
+            last = state.last_fire
+            if last is None or e.run != last.run:
+                return  # only what was seen for the latest fire counts
+            if e.kind == CANDIDATE:
+                if state.activity_at is None or e.at > state.activity_at:
+                    state.activity_at = e.at
+            elif _text(d.get("reason")):
+                state.idle = (e.at, str(d["reason"]))
 
     def task_attempts(self, task: TaskId) -> list[AttemptState]:
         return sorted((s for a, s in self.attempts.items() if a.task == task), key=_number_of)
@@ -304,12 +357,14 @@ def check_dispatch(
     _check_window(view, now, limits, blocks, alerts)
 
     for state in view.attempts.values():
-        if state.unresolved:
+        if state.holds_lane(now):
             blocks.append(
                 Notice(
                     "unresolved-attempt",
-                    f"Attempt {state.attempt} is {state.state}; record a clearing record"
-                    " (ADR 0002 section 6.1) before anything else starts.",
+                    f"The worker for {state.attempt} may still be running ({state.state})."
+                    " The next task starts once its PR is merged or closed, or has had no"
+                    f" change for {_minutes(PR_QUIET)} minutes, or once you record that its"
+                    " session finished.",
                 )
             )
 
@@ -464,7 +519,7 @@ def run_alerts(
     alerts = []
     for state in view.attempts.values():
         last = state.last_fire
-        if last is None or not state.unresolved:
+        if last is None or not state.holds_lane(now):
             continue
         elapsed = now - last.at
         where = last.session_url or "the routine's run list"

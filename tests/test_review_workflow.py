@@ -37,6 +37,7 @@ from controller.review.workflow import (
     WorkflowConfig,
     WorkflowDispatchRuntime,
     WorkflowResults,
+    check_start_permission,
 )
 from redteam import fixtures as fx
 from tests.github_world import ATTEMPT
@@ -818,6 +819,55 @@ def http_error(code, body=b"", **headers):
     return urllib.error.HTTPError("u", code, "x", msg, io.BytesIO(body))
 
 
+class StartPermissionTests(unittest.TestCase):
+    """The setup check: may the review token start the workflow? It must
+    never be able to start a run."""
+
+    def check(self, answer, token=TOKEN):
+        opener = Opener(answer)
+        return check_start_permission(token, opener=opener), opener
+
+    def test_the_check_sends_no_inputs_so_no_run_can_start(self):
+        _, opener = self.check(http_error(422, b'{"message": "Required input key not provided"}'))
+        (req,) = opener.requests
+        self.assertEqual(
+            req.full_url,
+            f"https://api.github.com/repos/{FACTORY_REPO}/actions/workflows/codex-review.yml/dispatches",
+        )
+        self.assertEqual(json.loads(req.data), {"ref": "main", "inputs": {}})
+
+    def test_a_missing_input_answer_means_the_token_may_start_reviews(self):
+        problem, _ = self.check(http_error(422, b'{"message": "Required input key not provided"}'))
+        self.assertIsNone(problem)
+
+    def test_a_read_only_token_is_named_with_the_fix(self):
+        body = b'{"message": "Resource not accessible by personal access token"}'
+        for code in (401, 403, 404):
+            with self.subTest(code=code):
+                problem, _ = self.check(http_error(code, body))
+                self.assertIn(f"HTTP {code}", problem)
+                self.assertIn("Resource not accessible by personal access token", problem)
+                self.assertIn("Actions: Read and write", problem)
+
+    def test_anything_else_is_not_a_pass(self):
+        for answer in (Response(204), http_error(500), TimeoutError("slow")):
+            with self.subTest(answer=answer):
+                problem, _ = self.check(answer)
+                self.assertIsNotNone(problem)
+
+    def test_no_token_is_not_a_pass_and_nothing_is_sent(self):
+        problem, opener = self.check(Response(204), token="")
+        self.assertEqual(problem, "no review token is set")
+        self.assertEqual(opener.requests, [])
+
+    def test_the_token_never_appears_in_the_answer(self):
+        body = json.dumps({"message": f"bad {TOKEN}"}).encode()
+        problem, _ = self.check(http_error(401, body))
+        self.assertNotIn(TOKEN, problem)
+        problem, _ = self.check(OSError(f"reset {TOKEN}"))
+        self.assertNotIn(TOKEN, problem)
+
+
 class DispatchTests(unittest.TestCase):
     def launch(self, answer, text=None, token=TOKEN):
         opener = Opener(answer)
@@ -849,6 +899,26 @@ class DispatchTests(unittest.TestCase):
             with self.subTest(code=code):
                 result, _ = self.launch(http_error(code, b'{"message": "no"}'))
                 self.assertIs(result.outcome, LaunchOutcome.NOT_LAUNCHED)
+
+    def test_a_refusal_keeps_githubs_reason(self):
+        body = b'{"message": "Resource not accessible by personal access token", "status": "403"}'
+        result, _ = self.launch(http_error(403, body))
+        self.assertEqual(
+            result.detail,
+            'HTTP 403, GitHub said "Resource not accessible by personal access token"',
+        )
+
+    def test_a_refusal_without_a_readable_reason_says_only_the_code(self):
+        for body in (b"", b"<html>nope</html>", b'{"message": 5}', b"[1]"):
+            with self.subTest(body=body):
+                result, _ = self.launch(http_error(403, body))
+                self.assertEqual(result.detail, "HTTP 403")
+
+    def test_the_token_never_appears_in_the_reason(self):
+        body = json.dumps({"message": f"bad credentials {TOKEN}\nsecond line"}).encode()
+        result, _ = self.launch(http_error(401, body))
+        self.assertNotIn(TOKEN, result.detail)
+        self.assertNotIn("\n", result.detail)
 
     def test_rate_limits_are_a_429_with_a_wait(self):
         result, _ = self.launch(http_error(429, Retry_After="120"))

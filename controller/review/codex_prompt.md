@@ -33,6 +33,11 @@ and return one JSON object.
 - If the request names something you can't see (a linked document, a design,
   an image, a page that isn't in the repository), list it in
   `unreviewed_context`. Never treat it as reviewed.
+- Some things are left out on purpose, and you must not list them: the
+  Linear ticket itself (the contract's goal and acceptance criteria are its
+  approved text, word for word), the pull request's page, and CI runs (the
+  factory checks CI on the exact commit itself). List them only if the
+  contract says that something in them is needed to judge a criterion.
 - Set `complete` to true only when you examined every area below and judged
   every acceptance criterion. If you couldn't, set it to false.
 

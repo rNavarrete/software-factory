@@ -25,6 +25,12 @@ URL. The gate's own fire result is never replaced."""
 PR_OBSERVED = "pr-observed"
 """A pull request read from GitHub for an attempt, written when it first
 appears and whenever its state, draft flag or head commit changes."""
+WORKER_IDLE = "worker-idle-confirmed"
+"""The factory's own finding, right after a successful GitHub read, that an
+attempt's worker is finished by its PR (Rolando's 2026-10-09 rule): every
+matching PR merged or closed with no commit after that, or no new commit
+for 30 minutes. The gate relies on it only while it is fresh and no newer
+commit was seen; it is not a clearing record and is never signed."""
 RELEASE_STATUS = "release-status"
 """Whether a merged task was released. Kept apart from the task's state: a
 merge is not a release and a release says nothing about the work."""

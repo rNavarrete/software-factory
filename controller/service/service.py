@@ -521,7 +521,16 @@ class Service:
         if last is not None and now - last < self._s.retry_every:
             return False
         self._last_try[item.event_id] = now
+        self._confirm_idle(now)
         return self._dispatch(item, r)
+
+    def _confirm_idle(self, now: datetime) -> None:
+        """Fresh GitHub reads of every worker that holds the lane without a
+        signed clearing, right before a launch could rely on them (Rolando's
+        2026-10-09 rule). A failed read records nothing: the lane stays held."""
+        confirm = getattr(self._recovery, "confirm_idle_all", None)
+        if confirm is not None:
+            confirm(now)
 
     # --- bounded repairs (ENG-160) ---------------------------------------------------
 
@@ -539,6 +548,9 @@ class Service:
             status = self._recovery.attempt_status(attempt, now)
             if status.state not in (State.VERIFYING, State.AWAITING_HUMAN):
                 return False  # no PR to judge yet
+            if not status.writer_cleared:
+                self._confirm_idle(now)
+                status = self._recovery.attempt_status(attempt, now)
             self._consider_repair(item, attempt, status, now)
             if not self._repair_stands(item, attempt, self._now()):
                 return False
@@ -974,7 +986,8 @@ class Service:
                     now,
                 ),
             )
-        if str(attempt) in self._view().reviews:
+        if str(attempt) in self._view().reviews and item.withdrawn is None:
+            # A ticket Rolando moved out of Todo spends no more review starts.
             self._review_round(item, attempt, now)
         if status.state is State.MERGED:
             self._close_merged(item, status, now)

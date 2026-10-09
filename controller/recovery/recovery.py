@@ -35,7 +35,7 @@ from datetime import datetime, timedelta
 from controller.approval import APPROVER, Approvals, Confirm, tty_confirm
 from controller.attempts import AttemptGate
 from controller.attempts import events as gate_events
-from controller.attempts.policy import LedgerView, Notice
+from controller.attempts.policy import PR_QUIET, LedgerView, Notice
 from controller.interfaces import (
     AttemptId,
     ContractDigest,
@@ -255,6 +255,37 @@ class Recovery:
             f"{attempt}'s records kept changing while GitHub was read; nothing recorded."
             " Run reconcile again."
         )
+
+    def confirm_idle(self, attempt: AttemptId, now: datetime) -> str | None:
+        """Read GitHub for ``attempt`` and, if its worker is finished by its
+        PR, record that (``WORKER_IDLE``) and say why. Any failure to read
+        records nothing and returns None, so the lane stays held."""
+        _aware(now)
+        try:
+            self.reconcile(attempt, now)
+        except RecoveryRefused:
+            return None
+        with self._store.writer_lock():
+            stored = self._store.events(attempt.task)
+            reason = _idle_reason(stored, attempt, now)
+            if reason is None:
+                return None
+            run = self.attempt_status(attempt, now).latest_run
+            if run is None:
+                return None
+            self._store.append(
+                LedgerEvent(ev.WORKER_IDLE, now, attempt.task, attempt, run, {"reason": reason})
+            )
+        return reason
+
+    def confirm_idle_all(self, now: datetime) -> None:
+        """``confirm_idle`` for every attempt that holds the lane without a
+        signed clearing, so a launch relies only on fresh reads, previous
+        attempts included."""
+        view = LedgerView.build(self._store.events())
+        for state in view.attempts.values():
+            if state.unresolved and state.last_fire is not None:
+                self.confirm_idle(state.attempt, now)
 
     def _last_seq(self, task: TaskId) -> int:
         stored = self._store.events(task)
@@ -597,3 +628,52 @@ def _thaw(value: object) -> object:
 def _aware(now: datetime) -> None:
     if now.tzinfo is None:
         raise ValueError("times must be timezone-aware")
+
+
+def _idle_reason(stored: Sequence[StoredEvent], attempt: AttemptId, now: datetime) -> str | None:
+    """Why ``attempt``'s worker counts as finished by its PR, from what is on
+    record after its latest fire, or None. Activity is a new commit (a
+    candidate record), on the PR or the marker branch; a PR's state change is
+    not activity."""
+    last_fire: RunId | None = None
+    for s in sorted(stored, key=lambda s: s.seq):
+        if s.event.kind == gate_events.FIRE_INTENT and s.event.run is not None:
+            if s.event.run.attempt == attempt:
+                last_fire = s.event.run
+    if last_fire is None:
+        return None
+    activity: datetime | None = None
+    prs: dict[int, tuple[str, bool, datetime]] = {}
+    for s in sorted(stored, key=lambda s: s.seq):
+        e = s.event
+        if e.run != last_fire:
+            continue
+        try:
+            if e.kind == ledger_kinds.CANDIDATE:
+                activity = e.at if activity is None or e.at > activity else activity
+            elif e.kind == ev.PR_OBSERVED:
+                number = int(e.data["number"])
+                if e.data["matches"] is not True:
+                    prs.pop(number, None)
+                    continue
+                old = prs.get(number)
+                if old is not None and old[1]:
+                    continue  # GitHub never un-merges a PR
+                merged = e.data["merged"] is True
+                state = str(e.data["state"])
+                if old is not None and (old[0], old[1]) == (state, merged):
+                    continue  # same state: keep when it was first seen so
+                prs[number] = (state, merged, e.at)
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not prs:
+        return None
+    done = {n: p for n, p in prs.items() if p[1] or p[0] == "closed"}
+    if len(done) == len(prs) and all(activity is None or activity <= p[2] for p in done.values()):
+        n, p = min(done.items())
+        return f"PR #{n} was {'merged' if p[1] else 'closed'}"
+    if activity is not None and now - activity >= PR_QUIET:
+        minutes = int((now - activity).total_seconds() // 60)
+        numbers = ", ".join(f"#{n}" for n in sorted(prs))
+        return f"PR {numbers} has had no new commit for {minutes} minutes"
+    return None

@@ -90,7 +90,8 @@ Until the review is set up, nothing is started and the factory uses its stand-in
    - creates the `codex-review` environment, which only `main` can use;
    - stores the OpenAI key there, typed at a hidden prompt;
    - stores the review token, the dispatcher (your GitHub login) and the model in Fly's secrets, with the token typed at a hidden prompt;
-   - redeploys.
+   - redeploys;
+   - asks GitHub whether the review token may start the review workflow, without starting it, and stops if it can't (`python3 -m controller.review check-token` on the host). `sh deploy/fly/go-live.sh` runs the same check before it changes anything. A token with Actions set to read-only is refused here instead of at the first worker PR.
 5. **Rolando's answers.** The review needs his recorded observations of behavior only a person can check, and his clearances of protected-control changes. Until it is given a source for them (the Linear observation replies from the progress-reporting work), a task with either stays at "needs Rolando".
 
 The model is a setting (`FACTORY_REVIEW_MODEL`, default `gpt-6.1-sol`, which OpenAI's Codex model list showed with API access on 2026-10-08). Check the list again before turning the review on. The Codex CLI version is pinned in the workflow.

@@ -232,7 +232,7 @@ def _apply(item, facts, checks, releases) -> None:
 # --- The writer ---------------------------------------------------------------
 
 
-def _writer(f: _Facts) -> tuple[str, bool, str | None]:
+def _writer(f: _Facts, now: datetime) -> tuple[str, bool, str | None]:
     """(plain words, cleared, problem with a clearing on record)."""
     last = f.gate.last_fire
     if f.not_launched and not f.work_seen:
@@ -258,6 +258,9 @@ def _writer(f: _Facts) -> tuple[str, bool, str | None]:
             True,
             None,
         )
+    finished = f.gate.finished_by_pr(now)
+    if finished is not None and not f.not_launched:
+        return f"finished: {finished}", True, None
     if not f.clearings:
         if f.not_launched:
             return (
@@ -385,7 +388,7 @@ def attempt_statuses(
 
 
 def _status(f: _Facts, led: _Ledger, now: datetime, wait: timedelta) -> AttemptStatus:
-    words, cleared, problem = _writer(f)
+    words, cleared, problem = _writer(f, now)
     state, detail = _state(f, led.checks, now, wait)
     return AttemptStatus(
         attempt=f.gate.attempt,
@@ -440,7 +443,7 @@ def blocks(
     led = _build(stored)
     for a in sorted(led.facts):
         f = led.facts[a]
-        words, cleared, problem = _writer(f)
+        words, cleared, problem = _writer(f, now)
         if problem is not None:
             out.append(Notice("clearing-invalid", f"Attempt {a}: {problem}."))
         elif not cleared and f.not_launched:
