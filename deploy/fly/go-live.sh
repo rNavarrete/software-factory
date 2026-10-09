@@ -19,7 +19,7 @@ ROUTINE=trig_01CHWbQ267i1CMLGUym1kGd9
 ROLANDO=cd9ec650-f957-4f25-b5f0-9c14bcae49c8
 WORK=ENG-200   # the real sample ticket: one worker starts for it
 EDITED=ENG-202 # edited after its Todo move: it must never start
-PROBED=ENG-201 # changed only through the Linear connector: never counts as yours
+PROBED=ENG-201 # changed only through the Linear connector, to see how Linear records it
 RECORD=/data/go-live
 # How often to look at the service, and how long to watch after a restart.
 POLL=${POLL:-30}
@@ -197,7 +197,11 @@ else
     fi
     printf '%s\n' "$OUT" | grep -q "^  20" || stop "Couldn't read $PROBED's history. Tell Claude in the thread."
     if printf '%s\n' "$OUT" | grep -q "counts as Rolando's own action"; then
-        stop "Linear recorded a change made through the connector as yours. Tell Claude in the thread."
+        # Known limit Rolando accepted (2026-10-08, docs/go-live.md): the
+        # connector signs in as him, so Linear can't tell its changes from his.
+        # Claude sessions never move pilot tickets to Todo.
+        echo "Known limit: Linear records the Linear connector's changes as yours."
+        echo "Claude sessions never move pilot tickets to Todo."
     fi
     OUT=$(on_host "sh -c 'cd /app && FACTORY_SECRETS_DIR=/run/factory-secrets python3 -s -m controller.report probe ENG-178'")
     printf '%s\n' "$OUT"

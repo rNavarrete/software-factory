@@ -28,6 +28,12 @@ It is safe to run again: each finished step is skipped, and an interrupted run p
 
 Between those it deploys once in practice mode with the new keys, runs the two read and post checks (`controller.intake probe` on a ticket only the Linear connector has changed, and `controller.report probe`), and switches to live only if both pass. If a check fails, the factory stays in practice mode.
 
+## Known limit: changes made through the Linear connector look like Rolando's
+
+The first live run of the intake check (2026-10-08 23:57 UTC, "Qualification check: a Todo move made by an app") showed that Linear records a change made through Claude's Linear connector as Rolando's own, with no app marker. The connector signs in as him. So the factory can't tell a Todo move made by a Claude session from one he made himself, and any Claude session with his Linear connector could start work on a listed ticket.
+
+Rolando chose to go live with a rule instead of waiting for a redesign: **Claude sessions never move or edit pilot tickets through the Linear connector.** What still holds: only listed tickets can start, the ticket text must be unchanged since the move, one worker at a time, the weekly cap, and his merge. The factory's own Linear key can only read and comment, so the factory itself can't move a ticket. The script prints this limit when it sees it and goes on. An empty history still stops it.
+
 ## The live run
 
 The run uses three new, ordinary tickets in the pilot's Linear project, so the eight pilot tickets stay untouched:
@@ -39,9 +45,8 @@ The run uses three new, ordinary tickets in the pilot's Linear project, so the e
 | (same) | The Codex review starts on its own when the draft PR appears. | An authenticated review bound to the exact commit, base and contract | 0 (1 review) |
 | (same) | If the review fails it: after Rolando confirms the first worker finished (the ticket gives the exact command), one repair starts on its own, and its PR gets a fresh review. If that fails too, the budget is spent and the ticket says so. | One bounded repair and a fresh review after a correction; the cap | 0 or 1 (0 or 1 review) |
 | "Qualification check: edited after the Todo move" | Moved to Todo while the first worker holds the lane, then edited. | An edit after the move withdraws the task before it starts | 0 |
-| "Qualification check: a Todo move made by an app" | Moved to Todo through the Linear connector (by Claude, acting for Rolando) while the first worker holds the lane. | Linear records it as an app's move and the factory refuses it | 0 |
 
-At most two worker starts and two review runs, against a weekly cap of 12. The two check tickets only run while the first worker holds the one lane, so even a wrong acceptance couldn't start a second worker before it was caught; if one were queued, moving that ticket out of Todo closes it.
+At most two worker starts and two review runs, against a weekly cap of 12. The check ticket only runs while the first worker holds the one lane, so even a wrong acceptance couldn't start a second worker before it was caught; if one were queued, moving that ticket out of Todo closes it. (The app-move check was planned here too; the limit above replaced it.)
 
 If the first review passes, no repair happens. The run then shows the review and the merge record but not a live repair; whether to spend another ticket on that is Rolando's call.
 
@@ -53,7 +58,7 @@ Things to watch that offline tests can't settle:
 ## Offline rehearsal
 
 - `tests/test_go_live_rehearsal.py`: the shipped settings, the three ticket texts through the real drafting code (the open question is asked, the answered ticket becomes a tested task), and the run's order of events on the offline harness with the pilot's terms: one start, a restart that starts nothing, a failed review, the clearing, one repair, a restart during it, the cap; a bot move and an edit while the lane is busy; the ticket leaving Todo after the start; the empty live ledger.
-- `tests/test_go_live_script.py`: the command against stand-ins for Fly, GitHub, Linear and Keychain: a full first run, a re-run that does nothing twice, no switch without the Codex review, a refused or unknown launch never counted as a started worker, another ticket's launch never counted for the sample, an interrupted switch finished on the next run, saved markers read through a shell as Fly runs commands, untracked files kept out of the image, secrets never on a command line or in output, Rolando's own Linear key refused, wrong branch, stale `main`, local changes, red CI, a failed check staying in practice mode and then resuming, a connector change counted as his, a second worker after the restart, a worker for the edited ticket, a refused first ticket and an open hold.
+- `tests/test_go_live_script.py`: the command against stand-ins for Fly, GitHub, Linear and Keychain: a full first run, a re-run that does nothing twice, no switch without the Codex review, a refused or unknown launch never counted as a started worker, another ticket's launch never counted for the sample, an interrupted switch finished on the next run, saved markers read through a shell as Fly runs commands, untracked files kept out of the image, secrets never on a command line or in output, Rolando's own Linear key refused, wrong branch, stale `main`, local changes, red CI, a failed check staying in practice mode and then resuming, a connector change counted as his (printed as the known limit) and an empty history (stops), a second worker after the restart, a worker for the edited ticket, a refused first ticket and an open hold.
 - Earlier offline cases still hold: `python3 -m redteam` (the Linear path) and `python3 -m controller.audit`.
 
 ## Pause and recovery
