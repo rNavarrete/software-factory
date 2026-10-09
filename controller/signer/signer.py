@@ -201,7 +201,10 @@ def call(path: Path, request: Mapping[str, object], timeout: float = 30) -> Mapp
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect(str(path))
-            s.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+            try:
+                s.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # it may have answered and closed first (a refused caller): read that
             answer = _receive(s)
     except (OSError, ValueError) as e:
         raise SignerUnavailable(f"the signer did not answer ({type(e).__name__})") from None
