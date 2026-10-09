@@ -151,5 +151,15 @@ ENG-174 settled how a verified Todo move becomes the approval: Rolando chose it 
 
 - **Only the signer holds the approval key (ENG-174).** The key is HMAC, so whoever can check a signature can also make one. On the machine it therefore lives only in a small signer process running as its own user (`factory-signer`). The service runs as `factory`, can't read the key file, and can only ask the signer whether a signature is good. Code that reads Linear text, model output or GitHub data can't forge an approval. Rolando's own commands over `fly ssh console` run as root and sign as before. If the signer or the service stops, the start script stops the other and exits, and Fly starts the machine again with both. See docs/intake.md.
 - **Each ticket gets one task and one attempt budget for its whole life.** If a ticket the factory already worked on is moved to Todo again, the service says so and does nothing. New work needs a new ticket.
-- **A repair waits for Rolando to confirm the earlier worker finished.** The factory can't read or stop a session, so the ticket note gives him the exact clearing command. After that the repair goes on by itself if the move's allowance covers it; otherwise his typed go-ahead starts it, and the queued ticket stays open for it. See [repair.md](repair.md).
+- **A repair waits until the earlier worker counts as finished.** That happens on its own when the worker's PR is merged or closed, or has had no change for 30 minutes (see "When the next worker may start" below). Rolando can also record it himself with the clearing command. After that the repair goes on by itself if the move's allowance covers it; otherwise his typed go-ahead starts it, and the queued ticket stays open for it. See [repair.md](repair.md).
 - **The GitHub token expires.** Fine-grained tokens last at most a year. When it expires, the service can't read GitHub and says so every round. Renewing it is one `fly secrets import` (see the setup steps in the PR).
+
+## When the next worker may start
+
+Only one worker runs at a time. The factory can't see or stop a worker's session, so it frees the lane when one of these is true for the last worker:
+
+- **Its PR was merged or closed.**
+- **Its PR has had no change for 30 minutes.** Workers stop once they have opened their PR. A change means a new head commit, a new state or a new draft flag, as the factory last read them from GitHub.
+- **Rolando recorded that its session finished**, with `/app/factory clear <task> <session link>`. This is still needed when a worker opened no PR, for example when it stopped to ask him something.
+
+Rolando chose this on 2026-10-09 so that routine runs don't wait on him. The accepted risk: a worker that keeps going after 30 quiet minutes can still push. It can only push to its own branch, though, so that push shows up as a new revision of its own PR. The lane is then held again until the PR goes quiet, and the review checks the new revision. Giving the bot's push access back after it was removed still needs his clearing records, as before (ADR 0002 section 6.1).

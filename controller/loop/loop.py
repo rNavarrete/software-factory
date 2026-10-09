@@ -431,10 +431,16 @@ class Loop:
     def _finish(self, attempt: AttemptId, status) -> int:
         self.say(f"{attempt}: {status.detail}")
         self._merged_before_ready(attempt, status)
-        if status.writer_cleared:
+        activity = f"reviewed and merged {attempt}'s PR"
+        freed_by_pr = status.writer.startswith("finished: ")
+        if status.writer_cleared and (not freed_by_pr or self._minutes_recorded(attempt, activity)):
             self.say("This task is already closed out. The lane is free.")
             return EXIT_READY
-        if not status.writer_cleared:
+        if freed_by_pr:
+            # The merge itself freed the lane (no clearing needed); still ask
+            # for the review minutes once, as a clearing would have.
+            self.say(f"The lane is free: {status.writer.removeprefix('finished: ')}.")
+        elif not status.writer_cleared:
             if not status.session_urls:
                 self.say(f"Next: {status.next_step}")
                 return EXIT_STOPPED
@@ -467,10 +473,16 @@ class Loop:
                     f"A number of minutes above 0 and at most {MAX_REVIEW_MINUTES:.0f}, please."
                 )
                 continue
-            self.timer.record(value, f"reviewed and merged {attempt}'s PR", entered_by="Rolando")
+            self.timer.record(value, activity, entered_by="Rolando")
             break
         self.say("Done. The lane is free for the next task.")
         return EXIT_READY
+
+    def _minutes_recorded(self, attempt: AttemptId, activity: str) -> bool:
+        return any(
+            s.event.kind == kinds.HUMAN_TIME and s.event.data.get("activity") == activity
+            for s in self.store.events(attempt.task)
+        )
 
     def _merged_before_ready(self, attempt: AttemptId, status) -> None:
         """Say so, every time, when the merged commit never got the loop's ready.

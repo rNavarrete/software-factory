@@ -952,8 +952,9 @@ class RecoverySpecTests(unittest.TestCase):
         self.assertEqual(abandoned[0].data["outcome"], "failed")
         st = self.status(NOW + timedelta(hours=6))
         self.assertEqual(st.state, State.FAILED)
-        self.assertFalse(st.writer_cleared)  # closing does not clear the writer
-        self.assert_replacement_refused(NOW + timedelta(hours=6))
+        # A closed PR frees the lane by itself (Rolando's rule, 2026-10-09).
+        self.assertTrue(st.writer_cleared)
+        self.assertIn("PR #7 was closed", st.writer)
 
     def test_ac5_close_attempt_canceled(self):
         self.dispatch(launched(1))
@@ -985,8 +986,9 @@ class RecoverySpecTests(unittest.TestCase):
         self.assertEqual(rec.status.state, State.MERGED)
         task = self.recovery.status(self.task, NOW + timedelta(minutes=31))
         self.assertEqual(task.state, State.MERGED)
-        # A merge says nothing about whether the session stopped.
-        self.assertFalse(rec.status.writer_cleared)
+        # A merged PR frees the lane by itself (Rolando's rule, 2026-10-09).
+        self.assertTrue(rec.status.writer_cleared)
+        self.assertIn("PR #7 was merged", rec.status.writer)
         with self.writes_nothing(), self.assertRaises(RecoveryRefused):
             self.recovery.close_attempt(self.a1, State.FAILED, "oops", NOW + timedelta(hours=1))
 
@@ -1005,8 +1007,45 @@ class RecoverySpecTests(unittest.TestCase):
         self.publish(self.pr(7, state="closed", merged=True, merge_commit=SHA_MERGE))
         rec = self.recovery.reconcile(self.a1, NOW + timedelta(minutes=30))
         self.assertEqual(rec.status.state, State.MERGED)
-        self.assertFalse(rec.status.writer_cleared)
-        self.assert_replacement_refused(NOW + timedelta(minutes=30))
+        self.assertTrue(rec.status.writer_cleared)
+        self.assert_replacement_allowed(NOW + timedelta(minutes=30))
+
+    # --- Rolando's 2026-10-09 rule: the worker's PR frees the lane ------------
+
+    def test_an_open_pr_frees_the_lane_after_30_quiet_minutes(self):
+        self.dispatch(launched(1))
+        self.publish(self.pr(7))
+        self.recovery.reconcile(self.a1, NOW + timedelta(minutes=5))
+        self.assertFalse(self.status(NOW + timedelta(minutes=34)).writer_cleared)
+        self.assert_replacement_refused(NOW + timedelta(minutes=34))
+        st = self.status(NOW + timedelta(minutes=35))
+        self.assertTrue(st.writer_cleared)
+        self.assertIn("no change for 30 minutes", st.writer)
+        self.assert_replacement_allowed(NOW + timedelta(minutes=35))
+
+    def test_a_new_push_holds_the_lane_again(self):
+        self.dispatch(launched(1))
+        self.publish(self.pr(7))
+        self.recovery.reconcile(self.a1, NOW + timedelta(minutes=5))
+        self.assertTrue(self.status(NOW + timedelta(minutes=40)).writer_cleared)
+        self.publish(self.pr(7, head_sha=SHA_B), branch_sha=SHA_B)
+        self.recovery.reconcile(self.a1, NOW + timedelta(minutes=41))
+        self.assertFalse(self.status(NOW + timedelta(minutes=42)).writer_cleared)
+        self.assert_replacement_refused(NOW + timedelta(minutes=42))
+        self.assertTrue(self.status(NOW + timedelta(minutes=71)).writer_cleared)
+
+    def test_no_pr_never_frees_the_lane_by_itself(self):
+        self.dispatch(launched(1))
+        self.publish()
+        self.recovery.reconcile(self.a1, NOW + timedelta(minutes=5))
+        self.assertFalse(self.status(NOW + timedelta(days=3)).writer_cleared)
+        self.assert_replacement_refused(NOW + timedelta(days=3))
+
+    def test_a_pr_without_the_markers_does_not_free_the_lane(self):
+        self.dispatch(launched(1))
+        self.publish(self.pr(7, title="Filter books by status", state="closed"))
+        self.recovery.reconcile(self.a1, NOW + timedelta(minutes=5))
+        self.assertFalse(self.status(NOW + timedelta(hours=2)).writer_cleared)
 
     def test_ac5_pr_state_changes_are_observed_once_each(self):
         self.dispatch(launched(1))

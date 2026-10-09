@@ -25,6 +25,12 @@ from controller.interfaces import (
 # controller.review.events.REVIEW_JOB_INTENT, named here so the gate doesn't
 # import the reviewer (a test keeps the two the same).
 REVIEW_JOB_INTENT = "review-job-intent"
+# controller.recovery.events.PR_OBSERVED, named here for the same reason.
+PR_OBSERVED = "pr-observed"
+
+PR_QUIET = timedelta(minutes=30)
+"""How long a worker's open PR must go unchanged before the factory treats the
+worker as finished and frees the lane (Rolando's decision, 2026-10-09)."""
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,14 @@ class Fire:
     session_url: str | None = None
 
 
+@dataclass(frozen=True)
+class PrSeen:
+    state: str
+    merged: bool
+    changed_at: datetime
+    """When the factory first saw it in this state, draft flag and head."""
+
+
 @dataclass
 class AttemptState:
     attempt: AttemptId
@@ -56,6 +70,9 @@ class AttemptState:
     reserved_at: datetime
     fires: list[Fire] = field(default_factory=list)
     cleared: ev.ClearingBasis | None = None
+    prs: dict[int, PrSeen] = field(default_factory=dict)
+    """The attempt's PRs (carrying its markers) as GitHub showed them after
+    the latest fire, from the factory's own reads."""
 
     @property
     def last_fire(self) -> Fire | None:
@@ -76,6 +93,30 @@ class AttemptState:
     def unresolved(self) -> bool:
         """ADR 0002 section 6.1: a session may exist and nothing has cleared it."""
         return not (self.state == "not-launched" or self.cleared is not None)
+
+    def finished_by_pr(self, now: datetime) -> str | None:
+        """Why the worker counts as finished from its PR alone, or None.
+
+        Workers stop once they have opened their PR, and each attempt writes
+        only to its own marker branch, so Rolando chose (2026-10-09) to free
+        the lane without his clearing once the PR is merged or closed, or has
+        been open with no change for ``PR_QUIET``. A push after that shows as a
+        new head: the PR counts as changed again and holds the lane again."""
+        if not self.prs:
+            return None
+        for number, pr in sorted(self.prs.items()):
+            if pr.merged:
+                return f"PR #{number} was merged"
+            if pr.state == "closed":
+                return f"PR #{number} was closed"
+        last = max(pr.changed_at for pr in self.prs.values())
+        if now - last >= PR_QUIET:
+            numbers = ", ".join(f"#{n}" for n in sorted(self.prs))
+            return f"PR {numbers} has had no change for {_minutes(now - last)} minutes"
+        return None
+
+    def holds_lane(self, now: datetime) -> bool:
+        return self.unresolved and self.finished_by_pr(now) is None
 
 
 @dataclass(frozen=True)
@@ -131,6 +172,7 @@ class LedgerView:
             fire = Fire(e.run, e.at, None)
             # A clearing record covers the fires before it, never a later re-fire.
             state.cleared = None
+            state.prs = {}
             fires_by_run[e.run] = len(self.all_fires)
             self.all_fires.append(fire)
             state.fires.append(fire)
@@ -202,6 +244,20 @@ class LedgerView:
             self.escalations.add(str(d["dedup"]))
         elif e.kind == REVIEW_JOB_INTENT and e.attempt is not None:
             self.review_fires.append(e.at)
+        elif e.kind == PR_OBSERVED and e.attempt in self.attempts:
+            state = self.attempts[e.attempt]
+            last = state.last_fire
+            if last is None or e.at < last.at:
+                return
+            number = int(d["number"])
+            if d["matches"] is not True:
+                # No longer carries the markers: it says nothing about the worker.
+                state.prs.pop(number, None)
+                return
+            old = state.prs.get(number)
+            if old is not None and old.merged:
+                return  # GitHub never un-merges a PR: a later "open" is an older snapshot
+            state.prs[number] = PrSeen(str(d["state"]), d["merged"] is True, e.at)
 
     def task_attempts(self, task: TaskId) -> list[AttemptState]:
         return sorted((s for a, s in self.attempts.items() if a.task == task), key=_number_of)
@@ -304,12 +360,14 @@ def check_dispatch(
     _check_window(view, now, limits, blocks, alerts)
 
     for state in view.attempts.values():
-        if state.unresolved:
+        if state.holds_lane(now):
             blocks.append(
                 Notice(
                     "unresolved-attempt",
-                    f"Attempt {state.attempt} is {state.state}; record a clearing record"
-                    " (ADR 0002 section 6.1) before anything else starts.",
+                    f"The worker for {state.attempt} may still be running ({state.state})."
+                    " The next task starts once its PR is merged or closed, or has had no"
+                    f" change for {_minutes(PR_QUIET)} minutes, or once you record that its"
+                    " session finished.",
                 )
             )
 
@@ -464,7 +522,7 @@ def run_alerts(
     alerts = []
     for state in view.attempts.values():
         last = state.last_fire
-        if last is None or not state.unresolved:
+        if last is None or not state.holds_lane(now):
             continue
         elapsed = now - last.at
         where = last.session_url or "the routine's run list"
