@@ -427,7 +427,9 @@ class RefusalTests(GoLiveScriptCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(self.st()["mode"], "live")
 
-    def test_connector_change_counted_as_rolandos_stops(self):
+    def test_connector_change_counted_as_rolandos_is_the_accepted_limit(self):
+        # Seen live: the connector signs in as Rolando and Linear marks no app.
+        # He chose to go live with the rule that Claude never moves pilot tickets.
         self.set_state(
             intake_probe=GOOD_INTAKE_PROBE.replace(
                 "made through an integration (oauthClient: Claude), not by Rolando himself",
@@ -435,7 +437,16 @@ class RefusalTests(GoLiveScriptCase):
             )
         )
         out = self.run_script(FIRST_RUN)
-        self.assertStoppedBeforeLive(out, "recorded a change made through the connector as yours")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(
+            "Known limit: Linear records the Linear connector's changes as yours.", out.stdout
+        )
+        self.assertEqual(self.st()["mode"], "live")
+
+    def test_an_empty_history_still_stops(self):
+        self.set_state(intake_probe=GOOD_INTAKE_PROBE.split("  2026")[0])
+        out = self.run_script(FIRST_RUN)
+        self.assertStoppedBeforeLive(out, "Couldn't read ENG-201's history")
 
     def test_linear_key_acting_as_rolando_on_the_host_stops(self):
         self.set_state(intake_probe="  PROBLEM: that is Rolando.\n" + GOOD_INTAKE_PROBE)
