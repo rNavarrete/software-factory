@@ -78,6 +78,8 @@ elif args[:2] == ["ssh", "console"]:
     elif cmd.startswith("sh -c 'mkdir -p /data/go-live && echo "):
         value, name = cmd.split("echo ")[1].split(" > /data/go-live/")
         st["records"][name.rstrip("'")] = value
+    elif "controller.review check-token" in cmd:
+        out = st.get("token_check", "review token: ok\n")
     elif "controller.intake probe" in cmd:
         out = st["intake_probe"]
     elif "controller.report probe" in cmd:
@@ -490,6 +492,24 @@ class RefusalTests(GoLiveScriptCase):
 
 class ReviewFindingTests(GoLiveScriptCase):
     """Cases from Rolando's review of the first version."""
+
+    def test_a_review_token_that_cant_start_reviews_stops_before_anything(self):
+        self.set_state(
+            token_check="review token: not ok: GitHub refused it (HTTP 403). The token needs"
+            " Actions: Read and write on rNavarrete/software-factory.\n"
+        )
+        out = self.run_script(FIRST_RUN)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("The Codex review can't start: GitHub refused it", out.stderr)
+        self.assertIn('Set Actions to "Read and write"', out.stderr)
+        self.assertEqual(self.fly_calls("deploy"), [])
+        self.assertEqual(self.st()["staged"], {})
+
+    def test_an_image_without_the_token_check_is_not_stopped_by_it(self):
+        self.set_state(token_check="unknown command\n")
+        out = self.run_script(FIRST_RUN)
+        self.assertNotIn("The Codex review can't start", out.stderr)
+        self.assertIn("FACTORY_MODE", self.st()["secrets"])
 
     def test_no_live_switch_without_the_codex_review(self):
         for name in ("FACTORY_REVIEW_DISPATCHER", "FACTORY_REVIEW_MODEL", "FACTORY_REVIEW_TOKEN"):

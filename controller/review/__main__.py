@@ -1,5 +1,8 @@
 """``python3 -m controller.review dry-run <contract.json> <pr-number>``
 
+(``check-token``, run on the host, checks the review token may start the
+review workflow without starting it; see ``check_start_permission``.)
+
 Runs the automatic review's checks on a real pilot PR without starting
 anything: GitHub is only read, the ledger is a throwaway one in a temporary
 folder, and the review job is never sent (a stand-in records what would have
@@ -198,6 +201,24 @@ def qualify_identity(api: GitHubApi, login: str, repo: str = PILOT_REPO) -> list
     return problems
 
 
+def check_token() -> int:
+    """Prints ``review token: ok`` or ``review token: not ok: <why>``; always
+    exits 0 so a caller over SSH reads the line instead of retrying."""
+    import os
+
+    from controller.review.workflow import check_start_permission
+    from controller.service.secrets import FileSecrets, SecretMissing
+
+    try:
+        token = FileSecrets(os.environ.get("FACTORY_SECRETS_DIR", "")).get("review-token")
+    except SecretMissing as e:
+        print(f"review token: not ok: {e}")
+        return 0
+    problem = check_start_permission(token)
+    print("review token: ok" if problem is None else f"review token: not ok: {problem}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python3 -m controller.review")
     sub = p.add_subparsers(dest="command", required=True)
@@ -209,7 +230,12 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--as-open", action="store_true")
     q = sub.add_parser("qualify-identity", help="check an account can be the reviewer")
     q.add_argument("login")
+    sub.add_parser(
+        "check-token", help="on the host: check the review token can start reviews (starts none)"
+    )
     args = p.parse_args(argv)
+    if args.command == "check-token":
+        return check_token()
     api: GitHubApi = GhApi()
     if args.command == "qualify-identity":
         try:

@@ -37,6 +37,7 @@ from controller.review.workflow import (
     WorkflowConfig,
     WorkflowDispatchRuntime,
     WorkflowResults,
+    check_start_permission,
 )
 from redteam import fixtures as fx
 from tests.github_world import ATTEMPT
@@ -816,6 +817,55 @@ def http_error(code, body=b"", **headers):
     for k, v in headers.items():
         msg[k.replace("_", "-")] = v
     return urllib.error.HTTPError("u", code, "x", msg, io.BytesIO(body))
+
+
+class StartPermissionTests(unittest.TestCase):
+    """The setup check: may the review token start the workflow? It must
+    never be able to start a run."""
+
+    def check(self, answer, token=TOKEN):
+        opener = Opener(answer)
+        return check_start_permission(token, opener=opener), opener
+
+    def test_the_check_sends_no_inputs_so_no_run_can_start(self):
+        _, opener = self.check(http_error(422, b'{"message": "Required input key not provided"}'))
+        (req,) = opener.requests
+        self.assertEqual(
+            req.full_url,
+            f"https://api.github.com/repos/{FACTORY_REPO}/actions/workflows/codex-review.yml/dispatches",
+        )
+        self.assertEqual(json.loads(req.data), {"ref": "main", "inputs": {}})
+
+    def test_a_missing_input_answer_means_the_token_may_start_reviews(self):
+        problem, _ = self.check(http_error(422, b'{"message": "Required input key not provided"}'))
+        self.assertIsNone(problem)
+
+    def test_a_read_only_token_is_named_with_the_fix(self):
+        body = b'{"message": "Resource not accessible by personal access token"}'
+        for code in (401, 403, 404):
+            with self.subTest(code=code):
+                problem, _ = self.check(http_error(code, body))
+                self.assertIn(f"HTTP {code}", problem)
+                self.assertIn("Resource not accessible by personal access token", problem)
+                self.assertIn("Actions: Read and write", problem)
+
+    def test_anything_else_is_not_a_pass(self):
+        for answer in (Response(204), http_error(500), TimeoutError("slow")):
+            with self.subTest(answer=answer):
+                problem, _ = self.check(answer)
+                self.assertIsNotNone(problem)
+
+    def test_no_token_is_not_a_pass_and_nothing_is_sent(self):
+        problem, opener = self.check(Response(204), token="")
+        self.assertEqual(problem, "no review token is set")
+        self.assertEqual(opener.requests, [])
+
+    def test_the_token_never_appears_in_the_answer(self):
+        body = json.dumps({"message": f"bad {TOKEN}"}).encode()
+        problem, _ = self.check(http_error(401, body))
+        self.assertNotIn(TOKEN, problem)
+        problem, _ = self.check(OSError(f"reset {TOKEN}"))
+        self.assertNotIn(TOKEN, problem)
 
 
 class DispatchTests(unittest.TestCase):

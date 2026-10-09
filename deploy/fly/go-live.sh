@@ -107,6 +107,15 @@ secrets_now
 for name in FACTORY_REVIEW_DISPATCHER FACTORY_REVIEW_MODEL FACTORY_REVIEW_TOKEN; do
     have "$name" || stop "The Codex review isn't set up yet ($name is missing). Run first: sh deploy/fly/setup-reviewer.sh"
 done
+# Asks GitHub whether the review token may start the review, without starting
+# one. An image too old to have this check prints neither line and is skipped.
+TOKEN_CHECK=$(on_host "sh -c 'cd /app && FACTORY_SECRETS_DIR=/run/factory-secrets python3 -s -m controller.review check-token 2>&1 || true'")
+case "$TOKEN_CHECK" in
+    *"review token: not ok: "*)
+        stop "The Codex review can't start: ${TOKEN_CHECK##*review token: not ok: }
+On GitHub: Settings > Developer settings > Fine-grained tokens > the factory's review token > Edit.
+Set Actions to \"Read and write\", click Update, then run this again." ;;
+esac
 
 say "1. The factory's own Linear login"
 if have FACTORY_LINEAR_KEY; then

@@ -76,5 +76,16 @@ fly deploy "$BUILD" --app "$APP" --config "$BUILD/deploy/fly/fly.toml" \
     --dockerfile "$BUILD/deploy/fly/Dockerfile" --ha=false
 rm -rf "$BUILD"
 
+echo "== Check the review token can start reviews (starts none)"
+CHECK=$(fly ssh console --app "$APP" -C "sh -c 'cd /app && FACTORY_SECRETS_DIR=/run/factory-secrets python3 -s -m controller.review check-token 2>&1 || true'" | tr -d '\r')
+case "$CHECK" in
+    *"review token: ok"*) ;;
+    *)
+        echo "The review token can't start reviews: ${CHECK##*review token: not ok: }" >&2
+        echo "On GitHub: Settings > Developer settings > Fine-grained tokens > the factory's review token > Edit." >&2
+        echo "Set Actions to \"Read and write\", click Update, then run this again." >&2
+        exit 1 ;;
+esac
+
 echo
 echo "Done. Reviews start on the next worker PR. Nothing has been run or paid for yet."

@@ -304,6 +304,60 @@ class WorkflowDispatchRuntime:
         )
 
 
+def check_start_permission(
+    token: str,
+    opener: Callable[..., object] | None = None,
+    repository: str = FACTORY_REPO,
+    workflow: str = WORKFLOW_PATH,
+    ref: str = "main",
+    timeout: float = 30,
+) -> str | None:
+    """Whether ``token`` may start the review workflow, without starting it:
+    None if it may, else the reason in plain words.
+
+    The request leaves out the workflow's required inputs, so GitHub can
+    never start a run from it. GitHub checks the token's permission first
+    (refused: HTTP 401, 403 or 404) and only then the inputs (HTTP 422), so
+    a 422 means the token could have started a real review."""
+    if not token:
+        return "no review token is set"
+    name = workflow.rsplit("/", 1)[-1]
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repository}/actions/workflows/{name}/dispatches",
+        data=json.dumps({"ref": ref, "inputs": {}}).encode(),
+        method="POST",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "software-factory-service",
+        },
+    )
+    open_ = opener or urllib.request.build_opener(_NoRedirect()).open
+    try:
+        with open_(req, timeout=timeout) as resp:  # type: ignore[attr-defined]
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        if e.code == 422:
+            return None
+        try:
+            body = _scrub(e.read(4096).decode("utf-8", "replace"), token)
+        except Exception:
+            body = None
+        reason = _github_message(body)
+        said = f', GitHub said "{reason}"' if reason else ""
+        if e.code in (401, 403, 404):
+            return (
+                f"GitHub refused it (HTTP {e.code}{said}). The token needs Actions: Read and"
+                f" write on {repository}."
+            )
+        return f"GitHub answered HTTP {e.code}{said}; try again in a minute"
+    except Exception as e:
+        return _scrub(f"GitHub couldn't be reached ({type(e).__name__}: {e})", token)
+    return f"GitHub answered HTTP {status} to a request it should have refused"
+
+
 def _github_message(body: str | None) -> str:
     """GitHub's one-line reason for a refusal (its JSON ``message``), so the
     ticket note says why, e.g. a token without the needed permission."""
