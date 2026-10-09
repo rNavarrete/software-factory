@@ -295,12 +295,25 @@ class WorkflowDispatchRuntime:
             )
         from controller.interfaces import classify
 
+        reason = _github_message(body)
         return LaunchResult(
             classify(code, None),
             http_status=code,
             response_body=body,
-            detail=f"HTTP {code}",
+            detail=f'HTTP {code}, GitHub said "{reason}"' if reason else f"HTTP {code}",
         )
+
+
+def _github_message(body: str | None) -> str:
+    """GitHub's one-line reason for a refusal (its JSON ``message``), so the
+    ticket note says why, e.g. a token without the needed permission."""
+    try:
+        message = json.loads(body or "").get("message")
+    except (ValueError, AttributeError):
+        return ""
+    if not isinstance(message, str):
+        return ""
+    return " ".join("".join(ch for ch in message if ch.isprintable()).split())[:200]
 
 
 def _scrub(text: str, token: str) -> str:

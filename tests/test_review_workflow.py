@@ -850,6 +850,26 @@ class DispatchTests(unittest.TestCase):
                 result, _ = self.launch(http_error(code, b'{"message": "no"}'))
                 self.assertIs(result.outcome, LaunchOutcome.NOT_LAUNCHED)
 
+    def test_a_refusal_keeps_githubs_reason(self):
+        body = b'{"message": "Resource not accessible by personal access token", "status": "403"}'
+        result, _ = self.launch(http_error(403, body))
+        self.assertEqual(
+            result.detail,
+            'HTTP 403, GitHub said "Resource not accessible by personal access token"',
+        )
+
+    def test_a_refusal_without_a_readable_reason_says_only_the_code(self):
+        for body in (b"", b"<html>nope</html>", b'{"message": 5}', b"[1]"):
+            with self.subTest(body=body):
+                result, _ = self.launch(http_error(403, body))
+                self.assertEqual(result.detail, "HTTP 403")
+
+    def test_the_token_never_appears_in_the_reason(self):
+        body = json.dumps({"message": f"bad credentials {TOKEN}\nsecond line"}).encode()
+        result, _ = self.launch(http_error(401, body))
+        self.assertNotIn(TOKEN, result.detail)
+        self.assertNotIn("\n", result.detail)
+
     def test_rate_limits_are_a_429_with_a_wait(self):
         result, _ = self.launch(http_error(429, Retry_After="120"))
         self.assertEqual((result.http_status, result.retry_after_seconds), (429, 120))
