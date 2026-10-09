@@ -20,7 +20,6 @@ from controller import contract as contracts
 from controller.approval import ApprovalRefused, Approvals, StaticKey
 from controller.approval.approval import _sign
 from controller.attempts import AttemptGate
-from controller.attempts.events import ClearingBasis
 from controller.dispatch import Dispatcher
 from controller.interfaces import AttemptId, LedgerEvent, TaskId
 from controller.ledger import SqliteLedgerStore, kinds
