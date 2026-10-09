@@ -52,6 +52,7 @@ from controller.recovery import (
     RecoveryRefused,
     State,
 )
+from controller.recovery import events as rev_events
 from tests.test_approval import example, yes
 from tests.test_attempts import LOST, MemoryLedger, launched, not_launched
 
@@ -98,8 +99,11 @@ class FakeGitHub:
         self.push_allowed = True
         self.push_error: Exception | None = None
         self.push_checks: list[tuple[str, str]] = []
+        self.read_error: Exception | None = None
 
     def branch_head(self, repo, branch):
+        if self.read_error is not None:
+            raise self.read_error
         return self.branches.get(branch) if repo == REPO else None
 
     def pulls_for_branch(self, repo, branch):
@@ -952,9 +956,8 @@ class RecoverySpecTests(unittest.TestCase):
         self.assertEqual(abandoned[0].data["outcome"], "failed")
         st = self.status(NOW + timedelta(hours=6))
         self.assertEqual(st.state, State.FAILED)
-        # A closed PR frees the lane by itself (Rolando's rule, 2026-10-09).
-        self.assertTrue(st.writer_cleared)
-        self.assertIn("PR #7 was closed", st.writer)
+        self.assertFalse(st.writer_cleared)  # closing does not clear the writer
+        self.assert_replacement_refused(NOW + timedelta(hours=6))
 
     def test_ac5_close_attempt_canceled(self):
         self.dispatch(launched(1))
@@ -986,9 +989,8 @@ class RecoverySpecTests(unittest.TestCase):
         self.assertEqual(rec.status.state, State.MERGED)
         task = self.recovery.status(self.task, NOW + timedelta(minutes=31))
         self.assertEqual(task.state, State.MERGED)
-        # A merged PR frees the lane by itself (Rolando's rule, 2026-10-09).
-        self.assertTrue(rec.status.writer_cleared)
-        self.assertIn("PR #7 was merged", rec.status.writer)
+        # Reading it is not enough: only a confirmation from a fresh read frees the lane.
+        self.assertFalse(rec.status.writer_cleared)
         with self.writes_nothing(), self.assertRaises(RecoveryRefused):
             self.recovery.close_attempt(self.a1, State.FAILED, "oops", NOW + timedelta(hours=1))
 
@@ -1007,8 +1009,11 @@ class RecoverySpecTests(unittest.TestCase):
         self.publish(self.pr(7, state="closed", merged=True, merge_commit=SHA_MERGE))
         rec = self.recovery.reconcile(self.a1, NOW + timedelta(minutes=30))
         self.assertEqual(rec.status.state, State.MERGED)
-        self.assertTrue(rec.status.writer_cleared)
-        self.assert_replacement_allowed(NOW + timedelta(minutes=30))
+        self.assertFalse(rec.status.writer_cleared)
+        at = NOW + timedelta(minutes=31)
+        self.assertEqual(self.recovery.confirm_idle(self.a1, at), "PR #7 was merged")
+        self.assertTrue(self.status(at).writer_cleared)
+        self.assert_replacement_allowed(at)
 
     # --- Rolando's 2026-10-09 rule: the worker's PR frees the lane ------------
 
@@ -1016,35 +1021,96 @@ class RecoverySpecTests(unittest.TestCase):
         self.dispatch(launched(1))
         self.publish(self.pr(7))
         self.recovery.reconcile(self.a1, NOW + timedelta(minutes=5))
-        self.assertFalse(self.status(NOW + timedelta(minutes=34)).writer_cleared)
+        self.assertIsNone(self.recovery.confirm_idle(self.a1, NOW + timedelta(minutes=34)))
         self.assert_replacement_refused(NOW + timedelta(minutes=34))
-        st = self.status(NOW + timedelta(minutes=35))
+        at = NOW + timedelta(minutes=35)
+        reason = self.recovery.confirm_idle(self.a1, at)
+        self.assertEqual(reason, "PR #7 has had no new commit for 30 minutes")
+        st = self.status(at)
         self.assertTrue(st.writer_cleared)
-        self.assertIn("no change for 30 minutes", st.writer)
-        self.assert_replacement_allowed(NOW + timedelta(minutes=35))
+        self.assertIn(reason, st.writer)
+        self.assert_replacement_allowed(at)
+
+    def test_merged_or_closed_frees_the_lane_at_once(self):
+        for state, merged, words in (("closed", True, "merged"), ("closed", False, "closed")):
+            with self.subTest(words=words):
+                self.setUp()
+                self.dispatch(launched(1))
+                self.publish(self.pr(7, state=state, merged=merged, merge_commit=SHA_MERGE))
+                at = NOW + timedelta(minutes=3)
+                self.assertEqual(self.recovery.confirm_idle(self.a1, at), f"PR #7 was {words}")
+                self.assert_replacement_allowed(at)
+
+    def test_a_confirmation_goes_stale(self):
+        self.dispatch(launched(1))
+        self.publish(self.pr(7, state="closed", merged=True, merge_commit=SHA_MERGE))
+        self.recovery.confirm_idle(self.a1, NOW + timedelta(minutes=1))
+        self.assertTrue(self.status(NOW + timedelta(minutes=11)).writer_cleared)
+        self.assertFalse(self.status(NOW + timedelta(minutes=12)).writer_cleared)
+        self.assert_replacement_refused(NOW + timedelta(minutes=12))
+
+    def test_a_failed_github_read_keeps_the_lane_held(self):
+        self.dispatch(launched(1))
+        self.publish(self.pr(7))
+        self.recovery.reconcile(self.a1, NOW + timedelta(minutes=5))
+        self.github.read_error = GitHubUnreadable("gh: HTTP 502")
+        at = NOW + timedelta(minutes=36)
+        self.assertIsNone(self.recovery.confirm_idle(self.a1, at))
+        self.assertEqual(self.kinds(rev_events.WORKER_IDLE), [])
+        self.assertFalse(self.status(at).writer_cleared)
+        self.assert_replacement_refused(at)
 
     def test_a_new_push_holds_the_lane_again(self):
         self.dispatch(launched(1))
         self.publish(self.pr(7))
         self.recovery.reconcile(self.a1, NOW + timedelta(minutes=5))
-        self.assertTrue(self.status(NOW + timedelta(minutes=40)).writer_cleared)
+        self.assertIsNotNone(self.recovery.confirm_idle(self.a1, NOW + timedelta(minutes=40)))
         self.publish(self.pr(7, head_sha=SHA_B), branch_sha=SHA_B)
         self.recovery.reconcile(self.a1, NOW + timedelta(minutes=41))
         self.assertFalse(self.status(NOW + timedelta(minutes=42)).writer_cleared)
         self.assert_replacement_refused(NOW + timedelta(minutes=42))
-        self.assertTrue(self.status(NOW + timedelta(minutes=71)).writer_cleared)
+        self.assertIsNone(self.recovery.confirm_idle(self.a1, NOW + timedelta(minutes=70)))
+        self.assertIsNotNone(self.recovery.confirm_idle(self.a1, NOW + timedelta(minutes=71)))
+
+    def test_a_push_after_the_pr_closed_holds_the_lane(self):
+        for merged in (True, False):
+            with self.subTest(merged=merged):
+                self.setUp()
+                self.dispatch(launched(1))
+                closed = self.pr(7, state="closed", merged=merged, merge_commit=SHA_MERGE)
+                self.publish(closed)
+                self.assertIsNotNone(
+                    self.recovery.confirm_idle(self.a1, NOW + timedelta(minutes=2))
+                )
+                # The worker pushes to its branch after the PR closed.
+                self.publish(closed, branch_sha=SHA_B)
+                at = NOW + timedelta(minutes=4)
+                self.assertIsNone(self.recovery.confirm_idle(self.a1, at))
+                self.assertFalse(self.status(at).writer_cleared)
+                self.assert_replacement_refused(at)
+                later = NOW + timedelta(minutes=34)
+                self.assertIn("no new commit", self.recovery.confirm_idle(self.a1, later))
+
+    def test_an_old_closed_pr_does_not_hide_an_active_one(self):
+        self.dispatch(launched(1))
+        old = self.pr(7, state="closed")
+        self.publish(old, self.pr(8, head_sha=SHA_B), branch_sha=SHA_B)
+        at = NOW + timedelta(minutes=10)
+        self.assertIsNone(self.recovery.confirm_idle(self.a1, NOW + timedelta(minutes=1)))
+        self.assertIsNone(self.recovery.confirm_idle(self.a1, at))
+        self.assert_replacement_refused(at)
 
     def test_no_pr_never_frees_the_lane_by_itself(self):
         self.dispatch(launched(1))
         self.publish()
         self.recovery.reconcile(self.a1, NOW + timedelta(minutes=5))
-        self.assertFalse(self.status(NOW + timedelta(days=3)).writer_cleared)
+        self.assertIsNone(self.recovery.confirm_idle(self.a1, NOW + timedelta(days=3)))
         self.assert_replacement_refused(NOW + timedelta(days=3))
 
     def test_a_pr_without_the_markers_does_not_free_the_lane(self):
         self.dispatch(launched(1))
         self.publish(self.pr(7, title="Filter books by status", state="closed"))
-        self.recovery.reconcile(self.a1, NOW + timedelta(minutes=5))
+        self.assertIsNone(self.recovery.confirm_idle(self.a1, NOW + timedelta(hours=2)))
         self.assertFalse(self.status(NOW + timedelta(hours=2)).writer_cleared)
 
     def test_ac5_pr_state_changes_are_observed_once_each(self):

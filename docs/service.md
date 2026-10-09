@@ -156,10 +156,15 @@ ENG-174 settled how a verified Todo move becomes the approval: Rolando chose it 
 
 ## When the next worker may start
 
-Only one worker runs at a time. The factory can't see or stop a worker's session, so it frees the lane when one of these is true for the last worker:
+Only one worker runs at a time. The factory can't see or stop a worker's session, so before any launch it reads GitHub again for every earlier worker that hasn't been cleared. That includes the previous attempt when a repair is about to start. It frees the lane only if that fresh read shows one of these:
 
-- **Its PR was merged or closed.**
-- **Its PR has had no change for 30 minutes.** Workers stop once they have opened their PR. A change means a new head commit, a new state or a new draft flag, as the factory last read them from GitHub.
-- **Rolando recorded that its session finished**, with `/app/factory clear <task> <session link>`. This is still needed when a worker opened no PR, for example when it stopped to ask him something.
+- **Every PR for that worker was merged or closed, with no new commit after that.**
+- **The worker has made no new commit for 30 minutes**, on its PR or its branch. Workers stop once they have opened their PR.
 
-Rolando chose this on 2026-10-09 so that routine runs don't wait on him. The accepted risk: a worker that keeps going after 30 quiet minutes can still push. It can only push to its own branch, though, so that push shows up as a new revision of its own PR. The lane is then held again until the PR goes quiet, and the review checks the new revision. Giving the bot's push access back after it was removed still needs his clearing records, as before (ADR 0002 section 6.1).
+A worker that never opened a PR always holds the lane.
+
+What the read finds is recorded as "worker-idle-confirmed". A launch can rely on that record for 10 minutes, and only if no newer commit was seen since. If GitHub can't be read, nothing is recorded and the lane stays held. A new commit holds the lane again, even after the PR was merged or closed.
+
+Rolando can still free the lane himself with `/app/factory clear <task> <session link>`. That is the only way for a worker that opened no PR, for example one that stopped to ask him something.
+
+Rolando chose this on 2026-10-09 so that routine runs don't wait on him. The accepted risk: a worker that keeps going after 30 quiet minutes can still push. It can only push to its own branch, though, so the push shows up at the next launch check and holds the lane again. The review then checks the new revision. Giving the bot's push access back after it was removed still needs his clearing records, as before (ADR 0002 section 6.1).

@@ -20,6 +20,7 @@ from controller import contract as contracts
 from controller.approval import ApprovalRefused, Approvals, StaticKey
 from controller.approval.approval import _sign
 from controller.attempts import AttemptGate
+from controller.attempts.events import ClearingBasis
 from controller.dispatch import Dispatcher
 from controller.interfaces import AttemptId, LedgerEvent, TaskId
 from controller.ledger import SqliteLedgerStore, kinds
@@ -1023,8 +1024,7 @@ class MergedTests(LoopCase):
         self.open_pr(merged=True)
         code = self.run_loop("12\n")
         self.assertEqual(code, EXIT_READY, self.text())
-        # The merge itself frees the lane (Rolando's 2026-10-09 rule): no clearing to record.
-        self.assertEqual(self.recovery.clears, [])
+        self.assertEqual(self.recovery.clears, [(ATTEMPT, ClearingBasis.COMPLETED, (SESSION,))])
         status = self.recovery.attempt_status(ATTEMPT, self.now)
         self.assertTrue(status.writer_cleared)
         minutes = [e for e in self.events(kinds.HUMAN_TIME) if e.data["entered_by"] == "Rolando"]
@@ -1037,7 +1037,7 @@ class MergedTests(LoopCase):
     def test_f_merged_with_no_minutes_records_none(self):
         self.open_pr(merged=True)
         self.assertEqual(self.run_loop("\n"), EXIT_READY, self.text())
-        self.assertEqual(self.recovery.clears, [])
+        self.assertEqual(len(self.recovery.clears), 1)
         self.assertEqual(
             [e for e in self.events(kinds.HUMAN_TIME) if e.data["entered_by"] == "Rolando"], []
         )
@@ -1076,13 +1076,8 @@ class MergedTests(LoopCase):
         self.said.clear()
         self.assertEqual(self.run_loop("15\n"), EXIT_READY)
         self.assertEqual(len(self.recovery.clears), 0)  # the rebuilt recovery's spy
-        # Minutes were skipped the first time, so the re-run asks once more.
-        self.assertEqual([e["minutes"] for e in (m.data for m in self.minutes())], [15])
-        self.said.clear()
-        self.assertEqual(self.run_loop("20\n"), EXIT_READY)
         self.assertIn("already closed out", self.text())
-        self.assertEqual(len(self.minutes()), 1)
-        self.assertEqual(self.stdin.read(), "20\n")  # minutes not asked a third time
+        self.assertEqual(self.stdin.read(), "15\n")  # minutes not asked twice
         cleared = [e for e in self.store.events() if e.event.kind == "attempt-cleared"]
         self.assertLessEqual(len(cleared), 1)
 

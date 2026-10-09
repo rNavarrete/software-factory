@@ -90,7 +90,10 @@ from verify.findings import (
 )
 from verify.review import Review
 
-POLICY_VERSION = "1"
+POLICY_VERSION = "2"
+"""Part of every review request key: a change to what the review is asked
+(version 2: the ticket, PR page and CI runs are not unreviewed context)
+gives open PRs a fresh review instead of reusing the old verdict."""
 
 
 class ReviewState(Enum):
@@ -587,7 +590,9 @@ class AutoReviewer:
         self, attempt, cycle, rev, key, contract, findings, view, a: Assessment, collected
     ) -> ReviewStatus:
         n = rev.pr
-        common = dict(key=key, revision=rev, findings=tuple(findings))
+        common = dict(
+            key=key, revision=rev, findings=tuple(findings), reviewer=self._policy.reviewer
+        )
         if not self._policy.configured:
             return ReviewStatus(
                 ReviewState.BLOCKED,

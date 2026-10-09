@@ -79,7 +79,10 @@ elif args[:2] == ["ssh", "console"]:
         value, name = cmd.split("echo ")[1].split(" > /data/go-live/")
         st["records"][name.rstrip("'")] = value
     elif "controller.review check-token" in cmd:
-        out = st.get("token_check", "review token: ok\n")
+        if st["deploys"] == 0 and "token_check_before_deploy" in st:
+            out = st["token_check_before_deploy"]
+        else:
+            out = st.get("token_check", "review token: ok\n")
     elif "controller.intake probe" in cmd:
         out = st["intake_probe"]
     elif "controller.report probe" in cmd:
@@ -505,11 +508,29 @@ class ReviewFindingTests(GoLiveScriptCase):
         self.assertEqual(self.fly_calls("deploy"), [])
         self.assertEqual(self.st()["staged"], {})
 
-    def test_an_image_without_the_token_check_is_not_stopped_by_it(self):
+    def test_an_old_image_is_checked_again_after_the_practice_deploy(self):
+        self.set_state(token_check_before_deploy="unknown command\n")
+        out = self.run_script(FIRST_RUN)
+        self.assertIn("Review token: can start reviews.", out.stdout)
+        self.assertIn("FACTORY_MODE", self.st()["secrets"])
+
+    def test_a_bad_token_on_the_new_image_stops_before_live(self):
+        self.set_state(
+            token_check_before_deploy="unknown command\n",
+            token_check="review token: not ok: GitHub refused it (HTTP 403).\n",
+        )
+        out = self.run_script(FIRST_RUN)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("The Codex review can't start", out.stderr)
+        self.assertNotIn("FACTORY_MODE", self.st()["secrets"])
+        self.assertNotIn("FACTORY_MODE", self.st()["staged"])
+
+    def test_a_new_image_that_cant_answer_stops_before_live(self):
         self.set_state(token_check="unknown command\n")
         out = self.run_script(FIRST_RUN)
-        self.assertNotIn("The Codex review can't start", out.stderr)
-        self.assertIn("FACTORY_MODE", self.st()["secrets"])
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("Couldn't check the review token", out.stderr)
+        self.assertNotIn("FACTORY_MODE", self.st()["secrets"])
 
     def test_no_live_switch_without_the_codex_review(self):
         for name in ("FACTORY_REVIEW_DISPATCHER", "FACTORY_REVIEW_MODEL", "FACTORY_REVIEW_TOKEN"):

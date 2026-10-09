@@ -107,15 +107,26 @@ secrets_now
 for name in FACTORY_REVIEW_DISPATCHER FACTORY_REVIEW_MODEL FACTORY_REVIEW_TOKEN; do
     have "$name" || stop "The Codex review isn't set up yet ($name is missing). Run first: sh deploy/fly/setup-reviewer.sh"
 done
-# Asks GitHub whether the review token may start the review, without starting
-# one. An image too old to have this check prints neither line and is skipped.
-TOKEN_CHECK=$(on_host "sh -c 'cd /app && FACTORY_SECRETS_DIR=/run/factory-secrets python3 -s -m controller.review check-token 2>&1 || true'")
-case "$TOKEN_CHECK" in
-    *"review token: not ok: "*)
-        stop "The Codex review can't start: ${TOKEN_CHECK##*review token: not ok: }
+# Asks GitHub, from the running image, whether the review token may start
+# the review, without starting one. Sets TOKEN to "ok", "not ok" or "unknown"
+# (an image too old to have the check).
+token_check() {
+    TOKEN_CHECK=$(on_host "sh -c 'cd /app && FACTORY_SECRETS_DIR=/run/factory-secrets python3 -s -m controller.review check-token 2>&1 || true'")
+    case "$TOKEN_CHECK" in
+        *"review token: ok"*) TOKEN=ok ;;
+        *"review token: not ok: "*) TOKEN="not ok" ;;
+        *) TOKEN=unknown ;;
+    esac
+}
+token_refused() {
+    stop "The Codex review can't start: ${TOKEN_CHECK##*review token: not ok: }
 On GitHub: Settings > Developer settings > Fine-grained tokens > the factory's review token > Edit.
-Set Actions to \"Read and write\", click Update, then run this again." ;;
-esac
+Set Actions to \"Read and write\", click Update, then run this again."
+}
+# Early warning only: the check that must pass runs on the new image, still in
+# practice mode, before the switch to live.
+token_check
+[ "$TOKEN" != "not ok" ] || token_refused
 
 say "1. The factory's own Linear login"
 if have FACTORY_LINEAR_KEY; then
@@ -193,7 +204,15 @@ if [ "$HOME_NOW" = /data/factory ]; then
     echo "The factory is already running live."
 elif have FACTORY_MODE; then
     # Set (perhaps only staged) by an earlier run that stopped before its
-    # deploy finished: the key checks already passed, so finish the switch.
+    # deploy finished: the key checks already passed, so finish the switch,
+    # but only once the running image confirms the review token.
+    token_check
+    case "$TOKEN" in
+        ok) ;;
+        "not ok") token_refused ;;
+        *) stop "The running version can't check the review token yet. Undo the half-done switch, then run this again:
+fly secrets unset FACTORY_MODE --app $APP --stage" ;;
+    esac
     say "5. Switching to live"
     deploy
 else
@@ -215,6 +234,12 @@ else
     OUT=$(on_host "sh -c 'cd /app && FACTORY_SECRETS_DIR=/run/factory-secrets python3 -s -m controller.report probe ENG-178'")
     printf '%s\n' "$OUT"
     printf '%s\n' "$OUT" | grep -q '^OK:' || stop "The posting check failed. Tell Claude in the thread."
+    token_check
+    case "$TOKEN" in
+        ok) echo "Review token: can start reviews." ;;
+        "not ok") token_refused ;;
+        *) stop "Couldn't check the review token on the new version. Tell Claude in the thread." ;;
+    esac
 
     say "5. Switching to live"
     printf 'FACTORY_MODE=live\n' | fly secrets import --app "$APP" --stage >/dev/null
