@@ -41,10 +41,17 @@ def main(argv: list[str] | None = None) -> int:
             else ", ".join(c.content) or "other"
         )
         verdict = attribution_problem(c, args[2]) or "counts as Rolando's own action"
+        last = (
+            f" (last change {c.updated_at:%H:%M:%S})"
+            if c.updated_at and c.updated_at != c.at
+            else ""
+        )
         print(
             f"  {c.at:%Y-%m-%d %H:%M:%S} {move:28} actor={c.actor_name!r}"
-            f" bot={c.bot!r} automation={c.automation} import={c.imported}: {verdict}"
+            f" bot={c.bot!r} automation={c.automation} import={c.imported}: {verdict}{last}"
         )
+    for span in ticket.spans:
+        print(f"  state since {span.started_at:%Y-%m-%d %H:%M:%S}: {span.state.name}")
     return 0
 
 

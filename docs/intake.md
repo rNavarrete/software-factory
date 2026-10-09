@@ -19,6 +19,16 @@ Anything else is refused once, with the reason. The reason is posted on the tick
 
 Before reading anything, intake checks whose key it is using, and checks again whenever the key changes (for example after the secret is replaced). If the factory's Linear key acts as Rolando, intake reads nothing and logs why every round, because the factory's own changes would then be recorded as his. The factory therefore needs its own Linear identity (an app, or a separate member) before intake is switched on.
 
+## When Linear folds changes together
+
+Linear combines one person's quick changes into a single history entry and keeps only the net result. Seen live on 2026-10-09: Rolando moved a ticket to Backlog at 01:31 and back to Todo at 01:37, and Linear recorded one entry, created at 01:31, with no state change at all. A move between them was invisible, so the factory ignored it without saying anything.
+
+So intake also reads the ticket's state spans (Linear's `stateHistory`: when it entered each state). A Todo span that follows a span in another state is a move into Todo. The history entry that was being written at that moment, created at or before it and last changed at or after it (within 5 seconds), says who made it. Linear folds only one person's changes together, so that entry's author made the move, and the usual checks apply to it: Rolando's user, no bot, app, automation or import. The move's `event_id` is the entry id plus the span id.
+
+An edit folded into the same entry is judged by when the entry last changed. If that is the move itself, the edit came first and the text he moved is the text the factory works from: the answer-a-question flow (edit, out of Todo, back) works with no waiting. If Linear folded anything into the entry after the move, the factory can't tell when the edit happened and refuses the move, saying why. A folded trip out of Todo and back after acceptance withdraws the accepted move, as a separate one does.
+
+If the span shows up before its history entry, the poll waits for the entry (up to the 15-minute overlap) instead of reading past it.
+
 ## Why polling and not webhooks
 
 Linear's webhooks would need a public address on the machine, and their payloads would need their own checks. Polling the history uses the one path the service already has: an outbound call every round, with a cursor saved in the ledger. Each poll reaches 15 minutes back before its cursor. That overlap is harmless, because a move that was already recorded is ignored by its `event_id`.
@@ -98,6 +108,8 @@ How the factory uses the allowance to start a repair on its own, and the clearin
 These belong to the qualification run in ENG-163.
 
 ## Known limits
+
+- **Folded entries.** An edit Linear folds into a move's own entry within 5 seconds after the move is read as coming before it. A change folded into an entry that already holds an edit, after the factory accepted the move (a priority change a minute later, say), withdraws the move even though the text didn't change; moving it out of Todo and back again starts from the current text. The live probe now prints each entry's last change and the state spans, to check how Linear records a given case.
 
 - **Linear's own record is the proof.** If Linear ever recorded an integration's change as Rolando's own with no bot attached, intake would count it. The probe in step 2 checks this for the connectors in use. Intake fails closed whenever Linear doesn't say who acted.
 - **Edits Linear writes to the history late.** The two-minute wait and the check before every dispatch catch an edit that shows up in the history later. An edit made after the factory accepted the move is caught even if it never shows up in the history, because the text no longer matches its `revision`. An edit made in the two minutes before acceptance that never shows up in the history at all would be taken as the approved text.
