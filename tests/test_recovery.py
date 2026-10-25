@@ -44,6 +44,8 @@ from controller.recovery import (
     LAUNCH_RECONCILED,
     PR_OBSERVED,
     RELEASE_STATUS,
+    WORKER_STOPPED,
+    Commit,
     Finding,
     GitHubReader,
     GitHubUnreadable,
@@ -64,6 +66,9 @@ BOT = "rnavarrete-factory-bot"
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_MERGE = "c" * 40
+SHA_STOP = "d" * 40
+TREE = "e" * 40
+OTHER_TREE = "f" * 40
 URL1 = "https://claude.ai/code/cse_1"
 URL2 = "https://claude.ai/code/cse_2"
 STALE = NOW + INTERRUPTED_AFTER + timedelta(minutes=1)
@@ -100,6 +105,14 @@ class FakeGitHub:
         self.push_error: Exception | None = None
         self.push_checks: list[tuple[str, str]] = []
         self.read_error: Exception | None = None
+        self.commits: dict[str, Commit] = {}
+        self.commit_error: Exception | None = None
+
+    def commit(self, repo, sha):
+        if self.commit_error is not None:
+            raise self.commit_error
+        # Unless a test says otherwise, a commit is ordinary work.
+        return self.commits.get(sha, Commit(sha, "Add a filter", OTHER_TREE, (SHA_MERGE,)))
 
     def branch_head(self, repo, branch):
         if self.read_error is not None:
@@ -1106,6 +1119,121 @@ class RecoverySpecTests(unittest.TestCase):
         self.recovery.reconcile(self.a1, NOW + timedelta(minutes=5))
         self.assertIsNone(self.recovery.confirm_idle(self.a1, NOW + timedelta(days=3)))
         self.assert_replacement_refused(NOW + timedelta(days=3))
+
+    # --- Rolando's 2026-10-25 go-ahead: a worker's stop note frees the lane ----
+
+    def stop(self, note="checks fail on the base commit", tree=TREE, parents=(SHA_A,)):
+        """The worker's last act: an empty stop commit on its branch, no PR."""
+        self.github.commits[SHA_A] = Commit(SHA_A, "Base", TREE, (SHA_MERGE,))
+        self.github.commits[SHA_STOP] = Commit(
+            SHA_STOP, f"Factory-Stop: {note}\n\nMore detail.", tree, parents
+        )
+        self.publish(branch_sha=SHA_STOP)
+
+    def test_a_stop_note_frees_the_lane_and_waits_on_rolando(self):
+        self.dispatch(launched(1))
+        self.stop()
+        at = NOW + timedelta(minutes=2)
+        self.assertEqual(
+            self.recovery.confirm_idle(self.a1, at),
+            "the worker stopped without opening a PR (commit dddddddddddd)",
+        )
+        st = self.status(at)
+        self.assertEqual(st.state, State.AWAITING_HUMAN)
+        self.assertEqual(st.stop_note, "checks fail on the base commit More detail.")
+        self.assertTrue(st.writer_cleared)
+        self.assert_replacement_allowed(at)
+
+    def test_a_stop_note_is_recorded_once(self):
+        self.dispatch(launched(1))
+        self.stop()
+        for minutes in (1, 2, 3):
+            self.recovery.reconcile(self.a1, NOW + timedelta(minutes=minutes))
+        stops = self.kinds(WORKER_STOPPED)
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0].data["head"], SHA_STOP)
+
+    def test_only_an_empty_single_parent_commit_with_the_marker_is_a_stop(self):
+        cases = {
+            "changes files": dict(tree=OTHER_TREE),
+            "is a merge": dict(parents=(SHA_A, SHA_MERGE)),
+            "has no parent": dict(parents=()),
+        }
+        for why, changes in cases.items():
+            with self.subTest(why=why):
+                self.setUp()
+                self.dispatch(launched(1))
+                self.stop(**changes)
+                at = NOW + timedelta(hours=2)
+                self.assertIsNone(self.recovery.confirm_idle(self.a1, at))
+                st = self.status(at)
+                self.assertEqual(st.state, State.RUNNING)
+                self.assertIsNone(st.stop_note)
+                self.assertEqual(self.kinds(WORKER_STOPPED), [])
+                self.assert_replacement_refused(at)
+
+    def test_a_message_without_the_exact_marker_is_not_a_stop(self):
+        for message in ("factory-stop: done", "Stop: done", "Note\n\nFactory-Stop: done"):
+            with self.subTest(message=message):
+                self.setUp()
+                self.dispatch(launched(1))
+                self.stop()
+                self.github.commits[SHA_STOP] = Commit(SHA_STOP, message, TREE, (SHA_A,))
+                at = NOW + timedelta(hours=2)
+                self.assertIsNone(self.recovery.confirm_idle(self.a1, at))
+                self.assertEqual(self.status(at).state, State.RUNNING)
+
+    def test_a_push_after_the_stop_note_holds_the_lane_again(self):
+        self.dispatch(launched(1))
+        self.stop()
+        self.assertIsNotNone(self.recovery.confirm_idle(self.a1, NOW + timedelta(minutes=2)))
+        self.publish(branch_sha=SHA_B)  # the worker carried on after all
+        at = NOW + timedelta(minutes=4)
+        self.assertIsNone(self.recovery.confirm_idle(self.a1, at))
+        st = self.status(at)
+        self.assertEqual(st.state, State.RUNNING)
+        self.assertIsNone(st.stop_note)
+        self.assertFalse(st.writer_cleared)
+        self.assert_replacement_refused(at)
+        # A new stop note on top frees it again.
+        second = "1" * 40
+        self.github.commits[second] = Commit(second, "Factory-Stop: gave up", TREE, (SHA_B,))
+        self.github.commits[SHA_B] = Commit(SHA_B, "Try", TREE, (SHA_A,))
+        self.publish(branch_sha=second)
+        at = NOW + timedelta(minutes=5)
+        self.assertIn("stopped without opening a PR", self.recovery.confirm_idle(self.a1, at))
+        self.assertEqual(self.status(at).stop_note, "gave up")
+
+    def test_a_pr_after_the_stop_note_follows_the_pr_rules(self):
+        self.dispatch(launched(1))
+        self.stop()
+        self.recovery.reconcile(self.a1, NOW + timedelta(minutes=1))
+        self.publish(self.pr(7, head_sha=SHA_STOP), branch_sha=SHA_STOP)
+        at = NOW + timedelta(minutes=2)
+        self.assertIsNone(self.recovery.confirm_idle(self.a1, at))
+        st = self.status(at)
+        self.assertIsNone(st.stop_note)
+        self.assertEqual(st.pull_requests, (7,))
+        self.assert_replacement_refused(at)
+
+    def test_a_failed_commit_read_records_nothing_and_keeps_the_lane(self):
+        self.dispatch(launched(1))
+        self.stop()
+        self.github.commit_error = GitHubUnreadable("gh: HTTP 502")
+        at = NOW + timedelta(minutes=2)
+        with self.writes_nothing():
+            self.assertIsNone(self.recovery.confirm_idle(self.a1, at))
+        self.assertFalse(self.status(at).writer_cleared)
+        self.assert_replacement_refused(at)
+
+    def test_a_stop_note_survives_a_restart(self):
+        self.dispatch(launched(1))
+        self.stop()
+        self.recovery.reconcile(self.a1, NOW + timedelta(minutes=1))
+        before = self.recovery.status(self.task, NOW + timedelta(minutes=2))
+        self.reopen()
+        self.assertEqual(self.recovery.status(self.task, NOW + timedelta(minutes=2)), before)
+        self.assertIsNotNone(before.attempts[-1].stop_note)
 
     def test_a_pr_without_the_markers_does_not_free_the_lane(self):
         self.dispatch(launched(1))

@@ -160,11 +160,12 @@ Only one worker runs at a time. The factory can't see or stop a worker's session
 
 - **Every PR for that worker was merged or closed, with no new commit after that.**
 - **The worker has made no new commit for 30 minutes**, on its PR or its branch. Workers stop once they have opened their PR.
+- **The worker left a stop note instead of a PR.** A worker that stops without opening a PR (checks already failing on the starting commit, or an escalation with nothing useful to push) ends by pushing one empty commit to its branch whose message starts `Factory-Stop:` and says why. When that commit is the newest one on the branch and no PR carries the attempt's markers, the lane is free at once. The ticket gets one "Needs your decision" note with the worker's reason and the command that ends the attempt. Rolando chose this on 2026-10-25.
 
-A worker that never opened a PR always holds the lane.
+A worker that opened no PR and left no stop note still holds the lane: one whose task message failed its checks (it pushes nothing at all), or one whose session ended before it could leave the note.
 
 What the read finds is recorded as "worker-idle-confirmed". A launch can rely on that record for 10 minutes, and only if no newer commit was seen since. If GitHub can't be read, nothing is recorded and the lane stays held. A new commit holds the lane again, even after the PR was merged or closed.
 
-Rolando can still free the lane himself with `/app/factory clear <task> <session link>`. That is the only way for a worker that opened no PR, for example one that stopped to ask him something.
+Rolando can still free the lane himself with `/app/factory clear <task> <session link>`. That is the only way for a worker that opened no PR and left no stop note.
 
-Rolando chose this on 2026-10-09 so that routine runs don't wait on him. The accepted risk: a worker that keeps going after 30 quiet minutes can still push. It can only push to its own branch, though, so the push shows up at the next launch check and holds the lane again. The review then checks the new revision. Giving the bot's push access back after it was removed still needs his clearing records, as before (ADR 0002 section 6.1).
+Rolando chose this on 2026-10-09 so that routine runs don't wait on him. The accepted risk: a worker that keeps going after 30 quiet minutes can still push. It can only push to its own branch, though, so the push shows up at the next launch check and holds the lane again. The review then checks the new revision. The same goes for a worker that pushes again after its stop note. A stop note is the worker's own text: it is shown to Rolando, never read as a decision, and only an empty commit with the exact `Factory-Stop:` start counts. Giving the bot's push access back after it was removed still needs his clearing records, as before (ADR 0002 section 6.1).

@@ -312,4 +312,6 @@ def _print_attempt(a) -> None:
     print(f"    session: {a.writer}")
     for url in a.session_urls:
         print(f"    {url}")
+    if a.stop_note is not None:
+        print(f"    the worker's stop note: {a.stop_note!r}")
     print(f"    next: {a.next_step}")

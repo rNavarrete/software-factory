@@ -954,6 +954,22 @@ class Service:
                 ),
                 now,
             )
+        if status.stop_note is not None:
+            self._notice(
+                item,
+                f"stopped:{status.latest_run}",
+                m.progress(
+                    Stage.NEEDS_DECISION,
+                    "The worker stopped without opening a pull request. Its note says:"
+                    f' "{status.stop_note}". The next ticket no longer waits on it, and nothing'
+                    " more happens on this one until you decide. To end this attempt, run this"
+                    " from any folder on your Mac: fly ssh console --app rnavarrete-factory"
+                    f' --pty -C "/app/factory close {attempt.task} failed'
+                    " 'worker stopped without a PR'\"",
+                    worker=str(status.latest_run),
+                ),
+                now,
+            )
         view = self._view()
         if status.pull_requests and str(attempt) not in view.reviews:
             request = view.review_requests.get(str(attempt))

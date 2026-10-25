@@ -13,9 +13,16 @@ from controller.recovery.events import (
     RELEASE_STATUS,
     RELEASE_STATUSES,
     SESSION_URL_RE,
+    WORKER_STOPPED,
     Finding,
 )
-from controller.recovery.github import GhCliReader, GitHubReader, GitHubUnreadable, PullRequest
+from controller.recovery.github import (
+    Commit,
+    GhCliReader,
+    GitHubReader,
+    GitHubUnreadable,
+    PullRequest,
+)
 from controller.recovery.recovery import (
     PILOT_REPO,
     PROTECTED_BRANCH,
@@ -46,7 +53,9 @@ __all__ = [
     "RELEASE_STATUSES",
     "SESSION_URL_RE",
     "WORKER_LOGINS",
+    "WORKER_STOPPED",
     "AttemptStatus",
+    "Commit",
     "Finding",
     "GhCliReader",
     "GitHubReader",

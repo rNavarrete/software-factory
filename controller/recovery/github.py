@@ -55,10 +55,22 @@ class PullRequest:
     """The merge commit, only when merged."""
 
 
+@dataclass(frozen=True)
+class Commit:
+    sha: str
+    message: str
+    tree: str
+    parents: tuple[str, ...]
+
+
 @runtime_checkable
 class GitHubReader(Protocol):
     def branch_head(self, repo: str, branch: str) -> str | None:
         """The branch's head commit, or None if there is no such branch."""
+        ...
+
+    def commit(self, repo: str, sha: str) -> Commit:
+        """One commit's message, tree and parents."""
         ...
 
     def pulls_for_branch(self, repo: str, branch: str) -> list[PullRequest]:
@@ -105,6 +117,25 @@ class GhCliReader:
         if not isinstance(sha, str) or not _SHA_RE.fullmatch(sha):
             raise GitHubUnreadable(f"branch {branch} has no readable head commit")
         return sha
+
+    def commit(self, repo: str, sha: str) -> Commit:
+        if not _SHA_RE.fullmatch(sha):
+            raise ValueError(f"not a commit sha: {sha!r}")
+        answer = self._api(f"repos/{_check_repo(repo)}/git/commits/{sha}")
+        message, tree = _get(answer, "message"), _get(answer, "tree", "sha")
+        parents = _get(answer, "parents")
+        shas = [_get(p, "sha") for p in parents] if isinstance(parents, list) else None
+        ok = (
+            _get(answer, "sha") == sha
+            and isinstance(message, str)
+            and isinstance(tree, str)
+            and _SHA_RE.fullmatch(tree) is not None
+            and shas is not None
+            and all(isinstance(p, str) and _SHA_RE.fullmatch(p) for p in shas)
+        )
+        if not ok:
+            raise GitHubUnreadable(f"commit {sha} is not readable")
+        return Commit(sha, message, tree, tuple(str(p) for p in shas))
 
     def pulls_for_branch(self, repo: str, branch: str) -> list[PullRequest]:
         owner = _check_repo(repo).split("/")[0]

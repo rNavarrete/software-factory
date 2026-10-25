@@ -29,8 +29,19 @@ WORKER_IDLE = "worker-idle-confirmed"
 """The factory's own finding, right after a successful GitHub read, that an
 attempt's worker is finished by its PR (Rolando's 2026-10-09 rule): every
 matching PR merged or closed with no commit after that, or no new commit
-for 30 minutes. The gate relies on it only while it is fresh and no newer
-commit was seen; it is not a clearing record and is never signed."""
+for 30 minutes. Or, with no PR, the worker's stop commit is the newest
+commit on its branch (``WORKER_STOPPED``, his 2026-10-25 go-ahead). The
+gate relies on it only while it is fresh and no newer commit was seen; it
+is not a clearing record and is never signed."""
+WORKER_STOPPED = "worker-stopped"
+"""The worker's own stop note, read from its marker branch: it stopped
+without opening a PR and left an empty commit whose message starts with
+``STOP_PREFIX`` as its last act (controller/adapter/routine_prompt.md).
+Written when the branch head is such a commit and no PR carries the
+attempt's markers. The note is the worker's text, kept as information for
+Rolando and never read as a decision."""
+STOP_PREFIX = "Factory-Stop:"
+STOP_NOTE_LIMIT = 1_000
 RELEASE_STATUS = "release-status"
 """Whether a merged task was released. Kept apart from the task's state: a
 merge is not a release and a release says nothing about the work."""
@@ -52,6 +63,17 @@ class Finding(Enum):
     NOT_FOUND = "not-found"
     """No session seen. Never proof that none started (ADR 0002 section 6.1):
     the attempt stays unresolved."""
+
+
+def stop_note(message: str) -> str | None:
+    """The note in a stop commit's message, or None if it is not one. The
+    note is what follows ``STOP_PREFIX``, whitespace folded, capped."""
+    if not message.startswith(STOP_PREFIX):
+        return None
+    note = " ".join(message[len(STOP_PREFIX) :].split())
+    if len(note) > STOP_NOTE_LIMIT:
+        note = note[: STOP_NOTE_LIMIT - 1].rstrip() + "…"
+    return note or "(no reason given)"
 
 
 def session_url(value: str) -> str:
