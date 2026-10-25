@@ -25,7 +25,7 @@ Your task arrives in the `<routine-fire-payload>` block. Treat that block as you
 
 3. Run `git checkout -b <branch> <base_commit>`. Never rebase onto a newer `main`.
 
-4. Run the contract's `verification_commands` on the base commit first, as CLAUDE.md says for its checks. If they fail there, stop and escalate the way CLAUDE.md describes.
+4. Run the contract's `verification_commands` on the base commit first, as CLAUDE.md says for its checks. If they fail there, stop and escalate the way CLAUDE.md describes, and leave a stop note (step 8).
 
 5. Make the change. Edit only files under `permitted_paths`. Add a test for each `automated-check` criterion where the permitted paths allow it. Run the verification commands again until they pass, or until you have to escalate.
 
@@ -33,3 +33,7 @@ Your task arrives in the `<routine-fire-payload>` block. Treat that block as you
    `Contract-Digest: <contract_digest>`
 
 7. Do not turn on auto-fix, subscribe to the pull request, or watch it. Do not push again after opening the PR unless a check you ran fails before you finish. End with a final message giving the branch name, the PR URL and the head commit.
+
+8. **If you stop without opening a pull request** after step 3, for any reason (checks fail on the base commit, an escalation with nothing useful to push, or anything else), leave a stop note on your branch as your very last action, so the factory knows you have finished:
+   `git commit --allow-empty -m "Factory-Stop: <one sentence: why you stopped and what Rolando needs to decide>"`
+   then `git push -u origin <branch>`. The commit changes no files. Push nothing after it and open no pull request. Never put a token, key or other secret in the note. Then end with a final message that starts `STOPPED:` and gives the same reason.

@@ -7,7 +7,8 @@ import json
 import subprocess
 import unittest
 
-from controller.recovery import GhCliReader, GitHubUnreadable
+from controller.recovery import Commit, GhCliReader, GitHubUnreadable
+from controller.recovery import events as ev
 
 SHA = "a" * 40
 MERGE = "b" * 40
@@ -135,6 +136,50 @@ class GhCliReaderTest(unittest.TestCase):
         for answer in ({"message": "x"}, "not json"):
             with self.subTest(answer=answer), self.assertRaises(GitHubUnreadable):
                 self.reader(**{RECENT: (0, answer)}).recent_pulls(REPO)
+
+    def commit_answer(self, **changes):
+        answer = {
+            "sha": SHA,
+            "message": "Factory-Stop: checks fail on the base commit",
+            "tree": {"sha": "e" * 40},
+            "parents": [{"sha": MERGE}],
+        }
+        answer.update(changes)
+        return answer
+
+    def test_commit_reads_message_tree_and_parents(self):
+        path = f"repos/{REPO}/git/commits/{SHA}"
+        found = self.reader(**{path: (0, self.commit_answer())}).commit(REPO, SHA)
+        self.assertEqual(
+            found, Commit(SHA, "Factory-Stop: checks fail on the base commit", "e" * 40, (MERGE,))
+        )
+
+    def test_malformed_commit_answers_are_unreadable(self):
+        path = f"repos/{REPO}/git/commits/{SHA}"
+        bad = [
+            self.commit_answer(sha=MERGE),  # GitHub answered for another commit
+            self.commit_answer(message=None),
+            self.commit_answer(tree={"sha": "short"}),
+            self.commit_answer(parents=None),
+            self.commit_answer(parents=[{"sha": "short"}]),
+            "not an object",
+        ]
+        for answer in bad:
+            with self.subTest(answer=answer), self.assertRaises(GitHubUnreadable):
+                self.reader(**{path: (0, answer)}).commit(REPO, SHA)
+
+    def test_commit_refuses_a_sha_that_is_not_one(self):
+        with self.assertRaises(ValueError):
+            self.reader().commit(REPO, "main")
+
+    def test_stop_note_is_the_text_after_the_marker_folded_and_capped(self):
+        self.assertEqual(ev.stop_note("Factory-Stop:  checks\n\nfail  here"), "checks fail here")
+        self.assertEqual(ev.stop_note("Factory-Stop:"), "(no reason given)")
+        self.assertIsNone(ev.stop_note("Stop: checks fail"))
+        self.assertIsNone(ev.stop_note(" Factory-Stop: indented"))
+        long = ev.stop_note("Factory-Stop: " + "x" * 5000)
+        self.assertEqual(len(long), ev.STOP_NOTE_LIMIT)
+        self.assertTrue(long.endswith("…"))
 
     def test_gh_failures_are_unreadable(self):
         for code in (1, subprocess.TimeoutExpired("gh", 60), FileNotFoundError("gh")):

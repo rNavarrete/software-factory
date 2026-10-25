@@ -744,6 +744,13 @@ class PayloadTests(unittest.TestCase):
         self.assertIn("`repair`", text)
         self.assertIn("Never delete, skip or weaken a test", text)
 
+    def test_saved_prompt_tells_a_worker_that_stops_without_a_pr_to_leave_a_stop_note(self):
+        from controller.recovery.events import STOP_PREFIX
+
+        text = Path(routine.__file__).with_name("routine_prompt.md").read_text()
+        self.assertIn(f'git commit --allow-empty -m "{STOP_PREFIX} ', text)
+        self.assertIn("If you stop without opening a pull request", text)
+
 
 class OnboardingTests(unittest.TestCase):
     def parse(self, **entry):

@@ -82,6 +82,9 @@ class _Read:
     seen: tuple[tuple[PullRequest, tuple[str, ...]], ...]
     warnings: tuple[str, ...]
     hints: tuple[str, ...]
+    stop: str | None = None
+    """The worker's stop note, when the branch head is its stop commit and
+    no PR carries the attempt's markers."""
 
 
 @dataclass(frozen=True)
@@ -245,7 +248,7 @@ class Recovery:
             with self._store.writer_lock():
                 if self._last_seq(attempt.task) != mark:
                     continue  # someone recorded something while we read
-                new = self._new_records(attempt, found.run, found.head, found.seen, now)
+                new = self._new_records(attempt, found.run, found.head, found.seen, now, found.stop)
                 if new:
                     self._store.append(*new)
             return Reconciliation(
@@ -323,8 +326,13 @@ class Recovery:
                     f"PR #{pr.number} has no single Contract-Digest line matching {digest.short}."
                 )
         matching = [pr for pr, problems in seen if not problems]
+        stop = None
         if head is not None and not matching:
-            warnings.append(f"Branch {attempt.branch} exists with no matching PR (head {head}).")
+            stop = self._stop_note(head)
+            if stop is None:
+                warnings.append(
+                    f"Branch {attempt.branch} exists with no matching PR (head {head})."
+                )
         if (head is not None or matching) and current.writer.startswith("none"):
             warnings.append(
                 "GitHub shows work for this attempt although none of its fires launched."
@@ -338,7 +346,21 @@ class Recovery:
                 if url not in current.session_urls
             )
         )
-        return _Read(run, head, tuple(seen), tuple(warnings), hints)
+        return _Read(run, head, tuple(seen), tuple(warnings), hints, stop)
+
+    def _stop_note(self, head: str) -> str | None:
+        """The note on ``head`` if it is a worker's stop commit: one parent,
+        no change to the files, a message starting ``Factory-Stop:``."""
+        assert self._github is not None
+        try:
+            commit = self._github.commit(self._repo, head)
+            note = ev.stop_note(commit.message)
+            if note is None or len(commit.parents) != 1:
+                return None
+            parent = self._github.commit(self._repo, commit.parents[0])
+        except (GitHubUnreadable, ValueError) as e:
+            raise RecoveryRefused(f"GitHub could not be read, nothing recorded: {e}") from e
+        return note if parent.tree == commit.tree else None
 
     def _names(self, pr: PullRequest, attempt: AttemptId) -> bool:
         """Whether the PR claims to be this attempt's, by branch or title."""
@@ -372,10 +394,12 @@ class Recovery:
         head: str | None,
         seen: Sequence[tuple[PullRequest, tuple[str, ...]]],
         now: datetime,
+        stop: str | None = None,
     ) -> list[LedgerEvent]:
         """The events not already in the ledger, read afresh under the lock."""
         observed: dict[int, Mapping[str, object]] = {}
         candidates: set[tuple[int | None, str]] = set()
+        stops: set[str] = set()
         for s in self._store.events(attempt.task):
             e = s.event
             if e.attempt != attempt:
@@ -387,6 +411,8 @@ class Recovery:
                     number = e.data.get("pr_number")
                     commit = e.data["candidate_commit"]
                     candidates.add((number if isinstance(number, int) else None, str(commit)))
+                elif e.kind == ev.WORKER_STOPPED and e.run == run:
+                    stops.add(str(e.data["head"]))
             except (KeyError, TypeError, ValueError):
                 continue  # a malformed record is never read as already seen
         new: list[LedgerEvent] = []
@@ -406,6 +432,12 @@ class Recovery:
         recorded_shas = {sha for _, sha in candidates}
         if head is not None and head not in recorded_shas:
             new.append(records.candidate(run, attempt.branch, head, now))
+        if head is not None and stop is not None and head not in stops:
+            new.append(
+                LedgerEvent(
+                    ev.WORKER_STOPPED, now, attempt.task, attempt, run, {"head": head, "note": stop}
+                )
+            )
         return new
 
     # --- writing: Rolando's records ------------------------------------------
@@ -631,10 +663,11 @@ def _aware(now: datetime) -> None:
 
 
 def _idle_reason(stored: Sequence[StoredEvent], attempt: AttemptId, now: datetime) -> str | None:
-    """Why ``attempt``'s worker counts as finished by its PR, from what is on
-    record after its latest fire, or None. Activity is a new commit (a
-    candidate record), on the PR or the marker branch; a PR's state change is
-    not activity."""
+    """Why ``attempt``'s worker counts as finished by its PR, or by the stop
+    commit it left instead of a PR, from what is on record after its latest
+    fire, or None. Activity is a new commit (a candidate record), on the PR or
+    the marker branch; a PR's state change is not activity. A commit after the
+    stop commit means the worker is working again."""
     last_fire: RunId | None = None
     for s in sorted(stored, key=lambda s: s.seq):
         if s.event.kind == gate_events.FIRE_INTENT and s.event.run is not None:
@@ -644,6 +677,7 @@ def _idle_reason(stored: Sequence[StoredEvent], attempt: AttemptId, now: datetim
         return None
     activity: datetime | None = None
     prs: dict[int, tuple[str, bool, datetime]] = {}
+    stopped: tuple[str, datetime] | None = None
     for s in sorted(stored, key=lambda s: s.seq):
         e = s.event
         if e.run != last_fire:
@@ -651,6 +685,10 @@ def _idle_reason(stored: Sequence[StoredEvent], attempt: AttemptId, now: datetim
         try:
             if e.kind == ledger_kinds.CANDIDATE:
                 activity = e.at if activity is None or e.at > activity else activity
+                if stopped is not None and e.data["candidate_commit"] != stopped[0]:
+                    stopped = None  # a commit after the stop commit: working again
+            elif e.kind == ev.WORKER_STOPPED:
+                stopped = (str(e.data["head"]), e.at)
             elif e.kind == ev.PR_OBSERVED:
                 number = int(e.data["number"])
                 if e.data["matches"] is not True:
@@ -667,6 +705,8 @@ def _idle_reason(stored: Sequence[StoredEvent], attempt: AttemptId, now: datetim
         except (KeyError, TypeError, ValueError):
             continue
     if not prs:
+        if stopped is not None and (activity is None or activity <= stopped[1]):
+            return f"the worker stopped without opening a PR (commit {stopped[0][:12]})"
         return None
     done = {n: p for n, p in prs.items() if p[1] or p[0] == "closed"}
     if len(done) == len(prs) and all(activity is None or activity <= p[2] for p in done.values()):

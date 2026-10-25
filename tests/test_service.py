@@ -26,7 +26,7 @@ from controller.attempts.policy import LedgerView
 from controller.dispatch import Dispatcher
 from controller.interfaces import AttemptId, LedgerLocked, TaskId
 from controller.ledger import SqliteLedgerStore
-from controller.recovery import Recovery, State
+from controller.recovery import Commit, Recovery, State
 from controller.service import main as service_main
 from controller.service import onboarding
 from controller.service import queue as q
@@ -49,7 +49,7 @@ from controller.service.secrets import (
 from controller.service.service import PAUSE_HOLD, Heartbeat, Service, never
 from tests.test_approval import example, yes
 from tests.test_attempts import MemoryLedger
-from tests.test_recovery import BOT, REPO, SHA_A, FakeGitHub
+from tests.test_recovery import BOT, REPO, SHA_A, SHA_STOP, TREE, FakeGitHub
 
 logging.getLogger("factory").addHandler(logging.NullHandler())
 
@@ -416,6 +416,35 @@ class ServiceTests(ServiceCase):
             self.tick(minutes=6 if i else 0)
         self.assertEqual(len(self.adapter.requests), 1)
         self.assertTrue(any("Waiting" in t for t in self.reporter.texts("issue-ENG-187")))
+
+    def test_a_worker_that_stops_without_a_pr_frees_the_lane_and_asks_once(self):
+        """Rolando's 2026-10-25 go-ahead: the worker's stop note on its branch
+        lets the next ticket start without his clearing, and the ticket says
+        what the worker reported and how to end the attempt."""
+        self.source.events = [move(1), move(2, key="ENG-187")]
+        self.preparer.by_issue["ENG-187"] = contract_for("ENG-187")
+        self.rolando_approves()
+        self.rolando_approves("ENG-187")
+        self.tick()
+        a1 = AttemptId(self.task(), 1)
+        self.github.commits[SHA_A] = Commit(SHA_A, "Base", TREE, ("c" * 40,))
+        self.github.commits[SHA_STOP] = Commit(
+            SHA_STOP, "Factory-Stop: the tests already fail on the base commit", TREE, (SHA_A,)
+        )
+        self.github.branches[a1.branch] = SHA_STOP
+        for _ in range(3):
+            self.tick(minutes=6)
+        self.assertEqual(len(self.adapter.requests), 2)
+        self.assertEqual(self.fires()[-1].attempt, AttemptId(self.task("ENG-187"), 1))
+        notes = [t for t in self.reporter.texts("issue-ENG-186") if "stopped without" in t]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Needs your decision", notes[0])
+        self.assertIn("the tests already fail on the base commit", notes[0])
+        self.assertIn("/app/factory close eng-186 failed", notes[0])
+        self.assertIsNone(self.view().items["evt-1"].closed)
+        self.recovery_close(a1)
+        self.tick(minutes=6)
+        self.assertEqual(self.view().items["evt-1"].closed, "failed")
 
     # --- restarts and two instances ---
 

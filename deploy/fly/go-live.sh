@@ -188,7 +188,7 @@ if recorded routine-prompt "$PROMPT_SHA"; then
 else
     prompt | pbcopy
     cat <<'EOF'
-The routine's saved instructions predate repairs, so they would turn a repair away.
+The routine's saved instructions are older than the current version in the repo.
 The current text is now on your clipboard.
   a. Signed in to the factory claude.ai account, open https://claude.ai/code/routines,
      then the factory-worker routine, then Edit.

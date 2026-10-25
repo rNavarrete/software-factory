@@ -83,6 +83,9 @@ class AttemptStatus:
     next_step: str
     problem: str | None = None
     """Why a signed clearing on record does not meet the rules, if it doesn't."""
+    stop_note: str | None = None
+    """The worker's own note, when it stopped without opening a PR and its
+    stop commit is still the newest commit on its branch. Worker text."""
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,8 @@ class _Facts:
     work_recorded: bool = False
     """A candidate or a matching PR was ever recorded, whatever happened after."""
     closed: tuple[State, str] | None = None
+    stopped: tuple[str, str] | None = None
+    """(stop commit, note) while that commit is the newest seen on the branch."""
     clearings: list[tuple[gate.ClearingBasis, str]] = field(default_factory=list)
 
     @property
@@ -219,6 +224,10 @@ def _apply(item, facts, checks, releases) -> None:
         f.work_recorded = True
         if "pr_number" not in d:
             f.branch_pushed = True
+        if f.stopped is not None and d["candidate_commit"] != f.stopped[0]:
+            f.stopped = None  # a newer commit: the worker is working again
+    elif e.kind == ev.WORKER_STOPPED and on_latest:
+        f.stopped = (str(d["head"]), str(d["note"]))
     elif e.kind == ledger.ATTEMPT_ABANDONED:
         # A plain abandoned record (controller/ledger/records.py) means failed.
         outcome = State(d.get("outcome", State.FAILED.value))
@@ -327,6 +336,11 @@ def _state(
         if any(finding is ev.Finding.NOT_FOUND for finding, _ in f.findings):
             return State.UNKNOWN, "No session was found. That does not prove none started."
         return State.UNKNOWN, "No usable launch response; a session may exist."
+    if f.stopped is not None:
+        return (
+            State.AWAITING_HUMAN,
+            f"The worker stopped without opening a PR (commit {f.stopped[0][:12]}).",
+        )
     if f.branch_pushed:
         return State.RUNNING, "The worker pushed its branch; no PR yet."
     return State.RUNNING, "A session started; no PR found yet."
@@ -402,6 +416,7 @@ def _status(f: _Facts, led: _Ledger, now: datetime, wait: timedelta) -> AttemptS
         pull_requests=tuple(sorted(n for n in f.prs)),
         next_step=_next_step(state, cleared, problem, f),
         problem=problem,
+        stop_note=f.stopped[1] if f.stopped is not None and not f.prs else None,
     )
 
 
