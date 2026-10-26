@@ -108,5 +108,10 @@ def attempt_cleared(
     )
 
 
-def attempt_reserved(attempt: AttemptId, digest: ContractDigest, at: datetime) -> LedgerEvent:
-    return LedgerEvent(ATTEMPT_RESERVED, at, attempt.task, attempt, data={"digest": digest.value})
+def attempt_reserved(
+    attempt: AttemptId, digest: ContractDigest, at: datetime, repository: str | None = None
+) -> LedgerEvent:
+    data = {"digest": digest.value}
+    if repository is not None:
+        data["repository"] = repository
+    return LedgerEvent(ATTEMPT_RESERVED, at, attempt.task, attempt, data=data)

@@ -185,3 +185,21 @@ Sign-off applies to this file as it stands at the version below; any later edit 
 - Open follow-up: governance-map amendment G-C12..G-C14 (section 3) handed to the coordinator; the map is unchanged until its owner applies it.
 - Rolando's active time on ENG-138: about 3 minutes (reading the summary and one decision).
 - Post-sign-off notes (2026-10-08, Linear-first): the notes marked *Note 2026-10-08* or *Superseded* record where the limits now run and what now counts against them. No number changed. The version hash above covers the file before them.
+
+## Amendment 2026-10-26: a weekly cap per repository
+
+- Status: **Accepted** (Rolando chose "Approve, 24 per week" on the decision card in the "Make software factory support neon-war" project thread, 2026-10-26 04:31Z).
+- Why: the factory now also works on `rNavarrete/neon-war` (the Gauntlet game-week game). Its 8 planned tickets need about 22 starts once Codex reviews and a few repairs are counted, which would not fit beside the pilot in one shared 12-start week.
+
+What changes in section 3:
+
+| Limit | Before | Now | Class |
+|---|---|---|---|
+| Fires per rolling 7 days | 12 for the whole factory | **12 for the pilot** (alert at 9), **24 for neon-war** (alert at 18). Each repository is counted on its own | Code |
+
+How it works: every attempt's reservation records the repository its signed contract names, and every fire and Codex review claim counts against that repository's cap. Records from before this amendment carry no repository and count as the pilot's, which they are. A review claim for an attempt the ledger has no reservation for counts against every repository's cap, so a malformed record can never free one. A repository without its own entry uses the pilot's numbers (`controller/attempts/limits.py`, `repo_window_caps`).
+
+What does not change: 3 attempts per task, 2 fires per attempt, 6 per task, **one active attempt at a time across the whole factory**, the hold, the rate-limit wait, and the 75% plan-usage stop. The last three are shared because both repositories run on the same factory account. If the usage stop blocks neon-war work more than once, section 6's rule applies: moving to Max 5x needs a recorded decision.
+
+- Rolando's active time on this amendment: one decision.
+- Version signed: `da884125adff93dce96aee1cf6d7ce257b73621da9c1063bea025c81a041a975` (sha256 of this amendment, from its heading to the line above). Sections 1 to 11 and the sign-off record above are unchanged, so their hash still holds.

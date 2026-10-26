@@ -47,6 +47,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from controller import contract as contracts
+from controller import targets
 from controller.adapter import routine
 from controller.approval import ApprovalRefused, Approvals
 from controller.attempts import AttemptGate
@@ -71,9 +72,8 @@ from controller.ledger import records
 from controller.recovery import PILOT_REPO, PROTECTED_BRANCH, Recovery
 from controller.recovery import state as st
 
-FACTORY_ROUTINE = "trig_01CHWbQ267i1CMLGUym1kGd9"
-"""The ``factory-worker`` routine on the factory account (created 2026-10-08).
-It is bound to the pilot repo only."""
+FACTORY_ROUTINE = targets.PILOT_ROUTINE
+"""The pilot's routine (``controller/targets.py`` lists every repository's)."""
 
 RUNTIME = "cloud-routine"
 PROMPT_FILE = Path(__file__).resolve().parent.parent / "adapter" / "routine_prompt.md"
@@ -227,13 +227,15 @@ class Launcher:
         prepare: Prepare,
         *,
         refire_of: RunId | None = None,
+        model_config_version: str | None = None,
     ) -> Fired:
         """One fire, in order: recover, check, prepare, reserve (checks again
         under the lock), record the run context, send, record the result,
         back up. Raises Refused if nothing was sent, with the refusal in the
-        ledger (G-A1)."""
+        ledger (G-A1). ``model_config_version`` names the routine this fire
+        uses, when it isn't the launcher's own."""
         try:
-            return self._fire(contract, prepare, refire_of=refire_of)
+            return self._fire(contract, prepare, refire_of=refire_of, config=model_config_version)
         except Refused as e:
             record_refusal(self._store, self._gate, self._now(), contract, e)
             raise
@@ -244,6 +246,7 @@ class Launcher:
         prepare: Prepare,
         *,
         refire_of: RunId | None = None,
+        config: str | None = None,
     ) -> Fired:
         now = self._now()
         self._recovery.recover(now)
@@ -276,7 +279,7 @@ class Launcher:
                     str(frozen["version"]),
                     str(frozen["base_commit"]),
                     RUNTIME,
-                    self._config,
+                    config or self._config,
                     int(frozen["attempt_budget"]),  # type: ignore[call-overload]
                     now,
                 )
@@ -288,6 +291,7 @@ class Launcher:
                 digest,
                 now,
                 refire_of=refire_of,
+                repository=str(frozen["repository"]),
                 precondition=still_allowed,
                 with_intent=context,
             )
@@ -397,6 +401,7 @@ class Dispatcher:
         *,
         routine_id: str = FACTORY_ROUTINE,
         repo: str = PILOT_REPO,
+        routines: Mapping[str, str] | None = None,
         base_branch: str = PROTECTED_BRANCH,
         adapter: AdapterFactory = _routine_adapter,
         start_key: Callable[[str], str] = routine.keychain_key,
@@ -411,15 +416,17 @@ class Dispatcher:
         self._recovery = recovery
         self._gate = gate
         self._base = base_check
-        self._routine = routine_id
-        self._repo = repo
+        # Repository -> the one routine that works on it (controller/targets.py).
+        self._routines = dict(routines) if routines is not None else {repo: routine_id}
+        if not self._routines:
+            raise ValueError("name at least one repository and its routine")
+        self._model_config = model_config_version
         self._branch = base_branch
         self._adapter = adapter
         self._start_key = start_key
         self._now = now
-        config = model_config_version or (
-            f"routine {routine_id}; prompt sha256 {prompt_revision()}"
-        )
+        first = next(iter(self._routines.values()))
+        config = model_config_version or self._config_for(first)
         self.launcher = Launcher(
             store,
             approvals,
@@ -435,6 +442,14 @@ class Dispatcher:
     @property
     def approvals(self) -> Approvals:
         return self._approvals
+
+    def _config_for(self, routine_id: str) -> str:
+        return self._model_config or f"routine {routine_id}; prompt sha256 {prompt_revision()}"
+
+    def _routine_of(self, contract: Mapping[str, object]) -> str:
+        """The routine for the contract's repository; ``_check_target`` has
+        already refused any repository without one."""
+        return self._routines[str(contract["repository"])]
 
     def dispatch(self, contract: Mapping[str, object]) -> DispatchResult:
         """Fire the next attempt of ``contract``'s task, or report the one on record.
@@ -472,7 +487,12 @@ class Dispatcher:
             # A signed go-ahead for the next attempt means Rolando has moved on
             # from this one, whatever state it was left in.
             next_attempt = AttemptId(task, latest.attempt.number + 1)
-            trusted = self._approvals.trusted_events(self._store.events(), digest, now=now)
+            trusted = self._approvals.trusted_events(
+                self._store.events(),
+                digest,
+                now=now,
+                routine=self._approvals.source_routine_for(contract),
+            )
             repaired = next_attempt in LedgerView.build(trusted).repairs
             moved_on = repaired and status.state is not st.State.MERGED
             if status.state in _GOING and not not_launched and not moved_on:
@@ -504,12 +524,15 @@ class Dispatcher:
             text = routine.build_fire_text(
                 contract, digest, run.attempt, repair=self._repair_brief(contract, run.attempt)
             )
-            key = self._start_key(self._routine)
-            adapter = self._adapter(self._routine, lambda _trig: key)
+            key = self._start_key(trig)
+            adapter = self._adapter(trig, lambda _trig: key)
             request = LaunchRequest(run, digest, text)
             return lambda: adapter.launch(request)
 
-        fired = self.launcher.fire(contract, prepare, refire_of=refire_of)
+        trig = self._routine_of(contract)
+        fired = self.launcher.fire(
+            contract, prepare, refire_of=refire_of, model_config_version=self._config_for(trig)
+        )
         status = self._recovery.attempt_status(fired.run.attempt, self._now())
         return DispatchResult(
             fired.result.outcome.value,
@@ -523,19 +546,21 @@ class Dispatcher:
     # --- steps ----------------------------------------------------------------
 
     def _check_target(self, contract: Mapping[str, object]) -> None:
-        if contract["repository"] != self._repo:
+        repo = contract["repository"]
+        if repo not in self._routines:
             raise Refused(
                 [
                     Notice(
                         "wrong-repository",
-                        f"The contract is for {contract['repository']}; the factory worker"
-                        f" only works on {self._repo}.",
+                        f"The contract is for {repo}; the factory worker"
+                        f" only works on {', '.join(sorted(self._routines))}.",
                     )
                 ]
             )
+        repo = str(repo)
         base = str(contract["base_commit"])
         try:
-            on_branch = self._base.on_branch(self._repo, base, self._branch)
+            on_branch = self._base.on_branch(repo, base, self._branch)
         except BaseUnreadable as e:
             raise Refused(
                 [Notice("base-unreadable", f"Could not check the base commit: {e}")]
@@ -545,7 +570,7 @@ class Dispatcher:
                 [
                     Notice(
                         "base-not-on-main",
-                        f"Base commit {base} is not on {self._repo}'s {self._branch} branch.",
+                        f"Base commit {base} is not on {repo}'s {self._branch} branch.",
                     )
                 ]
             )
@@ -583,7 +608,9 @@ class Dispatcher:
         wait, the single lane, a cap, a missing repair go-ahead, a withdrawn
         approval."""
         task = TaskId(str(contract["task_id"]))
-        decision = self._gate.decide(task, digest, now, refire_of=refire_of)
+        decision = self._gate.decide(
+            task, digest, now, refire_of=refire_of, repository=str(contract["repository"])
+        )
         _, _, checked = self.launcher.check(contract, now, refire_of)
         blocks: list[Notice] = []
         for b in (*decision.blocks, *checked):

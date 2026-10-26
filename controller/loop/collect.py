@@ -47,6 +47,7 @@ from urllib.parse import quote
 
 from controller.adapter import routine
 from controller.interfaces import AttemptId, ContractDigest
+from controller.targets import PILOT_REPO
 from verify.assertions import ControlChangeReport, TestSource
 from verify.criteria import (
     DEFAULT_POLICY,
@@ -59,7 +60,6 @@ from verify.criteria import (
 )
 from verify.review import Comment
 
-PILOT_REPO = "rNavarrete/factory-pilot-demo"
 BASE_BRANCH = "main"
 VERIFIED_JOB = "verified"
 """The one job the pilot's main ruleset requires; it passes only when every

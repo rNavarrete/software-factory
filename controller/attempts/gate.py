@@ -63,6 +63,7 @@ class AttemptGate:
         *,
         refire_of: RunId | None = None,
         automated: bool = False,
+        repository: str | None = None,
     ) -> Decision:
         """Read-only preview of what ``reserve`` would do. Writes nothing."""
         return check_dispatch(
@@ -73,6 +74,7 @@ class AttemptGate:
             refire_of=refire_of,
             automated=automated,
             limits=self._limits,
+            repository=repository,
         )
 
     def reserve(
@@ -83,6 +85,7 @@ class AttemptGate:
         *,
         refire_of: RunId | None = None,
         automated: bool = False,
+        repository: str | None = None,
         precondition: Callable[[RunId], Sequence[Notice]] | None = None,
         with_intent: Callable[[RunId], Sequence[LedgerEvent]] = lambda _run: (),
     ) -> RunId:
@@ -101,6 +104,9 @@ class AttemptGate:
         ``with_intent`` gives events to append in the same transaction as the
         fire intent (dispatch's run context), so they can't be lost between
         the reservation and the send.
+
+        ``repository`` is the contract's: a new attempt records it, and its
+        weekly cap applies (docs/limits.md section 3).
         """
         with self._store.writer_lock():
             stored = self._store.events()
@@ -112,6 +118,7 @@ class AttemptGate:
                 refire_of=refire_of,
                 automated=automated,
                 limits=self._limits,
+                repository=repository,
             )
             if decision.allowed and precondition is not None:
                 assert decision.run is not None
@@ -125,7 +132,7 @@ class AttemptGate:
             assert run is not None
             new = []
             if refire_of is None:
-                new.append(ev.attempt_reserved(run.attempt, digest, now))
+                new.append(ev.attempt_reserved(run.attempt, digest, now, repository))
             new.append(
                 LedgerEvent(
                     ev.FIRE_INTENT,

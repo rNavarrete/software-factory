@@ -62,19 +62,23 @@ def main(argv: list[str] | None = None) -> int:
 def _autofix() -> int:
     from controller.audit.autofix import check_autofix
     from controller.loop.collect import GhApi, GitHubUnreadable
-    from controller.recovery import PILOT_REPO
     from controller.recovery.recovery import WORKER_LOGINS
+    from controller.targets import REPOSITORIES
 
-    try:
-        report = check_autofix(GhApi(), PILOT_REPO, WORKER_LOGINS)
-    except GitHubUnreadable as e:
-        print(f"Couldn't read the pilot repo's PRs: {e}")
-        return 1
-    print(f"Worker PRs checked: {', '.join(f'#{n}' for n in report.checked) or 'none'}")
-    for f in report.findings:
-        print(f"  - {f}")
-    print("No sign of auto-fix on any of them." if report.clean else "Auto-fix check: NOT clean.")
-    return 0 if report.clean else 1
+    clean = True
+    for repo in sorted(REPOSITORIES):
+        try:
+            report = check_autofix(GhApi(), repo, WORKER_LOGINS)
+        except GitHubUnreadable as e:
+            print(f"Couldn't read {repo}'s PRs: {e}")
+            return 1
+        checked = ", ".join(f"#{n}" for n in report.checked) or "none"
+        print(f"{repo}: worker PRs checked: {checked}")
+        for f in report.findings:
+            print(f"  - {f}")
+        clean = clean and report.clean
+    print("No sign of auto-fix on any of them." if clean else "Auto-fix check: NOT clean.")
+    return 0 if clean else 1
 
 
 if __name__ == "__main__":

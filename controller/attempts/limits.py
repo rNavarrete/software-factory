@@ -20,8 +20,13 @@ class Limits:
     fires_per_task: int = 6
     fires_per_task_alert_at: int = 5
     fires_per_window: int = 12
-    """Fires per rolling window, whole factory (G-C13)."""
+    """Fires per rolling window for the pilot, and for any repository without
+    its own entry in ``repo_window_caps`` (G-C13)."""
     fires_per_window_alert_at: int = 9
+    repo_window_caps: tuple[tuple[str, int, int], ...] = (("rNavarrete/neon-war", 24, 18),)
+    """(repository, cap, alert at): a repository's own rolling weekly cap,
+    instead of ``fires_per_window`` (Rolando's decision of 2026-10-26,
+    docs/limits.md section 3). Each repository is counted on its own."""
     fire_window: timedelta = timedelta(days=7)
     snapshot_max_age: timedelta = timedelta(days=7)
     usage_alert_pct: float = 60
@@ -32,6 +37,13 @@ class Limits:
     rate_limit_default_wait: timedelta = timedelta(minutes=15)
     """Used when a 429 has no Retry-After; doubles per consecutive 429."""
     rate_limit_max_wait: timedelta = timedelta(hours=2)
+
+    def window_cap(self, repository: str) -> tuple[int, int]:
+        """(cap, alert at) for ``repository``'s fires in the rolling window."""
+        for repo, cap, alert_at in self.repo_window_caps:
+            if repo == repository:
+                return cap, alert_at
+        return self.fires_per_window, self.fires_per_window_alert_at
 
 
 PILOT_LIMITS = Limits()

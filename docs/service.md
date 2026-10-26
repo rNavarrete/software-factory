@@ -55,13 +55,14 @@ Switching it on belongs to the qualification run (ENG-163), after the factory ha
 
 ## Secrets
 
-There are five secrets. Each is scoped to one job, and none is a copy of Rolando's own credentials:
+There are six secrets. Each is scoped to one job, and none is a copy of Rolando's own credentials:
 
 | Name | What it can do | Made where |
 |---|---|---|
 | `approval-key` | Signs and checks decision records in this machine's ledger | Generated straight into Fly's secret store. It is a new key, not the Mac's Keychain key |
-| `github-token` | Reads the pilot repo (contents, pull requests, metadata, and Actions for the reviewer's CI evidence). It cannot write | A fine-grained GitHub token limited to that one repository |
-| `routine-token` | Starts the factory routine, nothing else | The routine's own start key. Not needed until real workers start |
+| `github-token` | Reads the factory's repositories (contents, pull requests, metadata, and Actions for the reviewer's CI evidence). It cannot write | A fine-grained GitHub token limited to the pilot and neon-war |
+| `routine-token` | Starts the pilot's routine, nothing else | The routine's own start key. Not needed until real workers start |
+| `neon-war-routine-token` | Starts the neon-war routine, nothing else ([neon-war.md](neon-war.md)) | That routine's own start key |
 | `linear-key` | Reads Todo moves and ticket text, and posts the factory's comments (ENG-174, 175, 178) | The factory's own Linear login, never Rolando's. Needed only for live mode |
 | `review-token` | Starts and reads the Codex review workflow in the factory repo, nothing else (ENG-156). It can't change code in either repo | A fine-grained GitHub token limited to `software-factory`, with Actions read and write and Contents read. Set by `deploy/fly/setup-reviewer.sh` |
 

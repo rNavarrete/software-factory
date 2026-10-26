@@ -1,12 +1,15 @@
 """Secrets for the background service, without macOS Keychain or a terminal.
 
-The service needs four secrets, each scoped to one job:
+The service needs these secrets, each scoped to one job:
 
 - ``approval-key``: signs and checks decision records in the host's ledger.
   A new key made on the host, never a copy of the Mac's Keychain key.
-- ``routine-token``: the factory routine's start key (fire only).
-- ``github-token``: read-only access to the pilot repo, for reconcile and the
-  base-commit check. Never the bot's write access, never Rolando's login.
+- ``routine-token``: the pilot routine's start key (fire only).
+- ``neon-war-routine-token``: the neon-war routine's start key (fire only).
+  Each routine has its own key (``controller/targets.py``).
+- ``github-token``: read-only access to the factory's repositories, for
+  reconcile and the base-commit check. Never the bot's write access, never
+  Rolando's login.
 - ``linear-key``: ENG-174's and ENG-178's Linear access.
 - ``review-token``: starts and reads the Codex review workflow in the factory
   repository (Actions read and write, Contents read, that repository only).
@@ -31,7 +34,14 @@ from collections.abc import Iterable, MutableMapping
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-NAMES = ("approval-key", "routine-token", "github-token", "linear-key", "review-token")
+NAMES = (
+    "approval-key",
+    "routine-token",
+    "neon-war-routine-token",
+    "github-token",
+    "linear-key",
+    "review-token",
+)
 ENV_PREFIX = "FACTORY_"
 _NAME_RE = re.compile(r"^[a-z]+(?:-[a-z]+)*$")
 

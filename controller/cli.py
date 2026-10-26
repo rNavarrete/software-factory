@@ -67,6 +67,7 @@ def _real() -> Controller:
     confirmed by typing the code at a terminal in both places."""
     import os
 
+    from controller import targets
     from controller.approval import ContractStore, KeychainKey, StaticKey
     from controller.dispatch import GhBaseCheck
     from controller.ledger import SqliteLedgerStore
@@ -86,7 +87,7 @@ def _real() -> Controller:
         key = StaticKey(approval_key_bytes(secrets))
         gh = HttpGhRunner(lambda: secrets.get("github-token"))
         reader, base = GhCliReader(run=gh), GhBaseCheck(run=gh)
-        extra["start_key"] = lambda trig: secrets.get("routine-token")
+        extra["start_key"] = lambda trig: secrets.get(targets.token_secret(trig))
     else:
         key, reader, base = KeychainKey(), GhCliReader(), GhBaseCheck()
     approvals = Approvals(store, key, contracts=ContractStore())
@@ -97,6 +98,7 @@ def _real() -> Controller:
         recovery,
         gate,
         base,
+        routines=targets.live_routines(),
         backup=lambda now: store.backup(backups, now),
         **extra,  # type: ignore[arg-type]
     )
