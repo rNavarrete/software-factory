@@ -44,6 +44,49 @@
         "tsconfig.json",
         "vite.config.ts"
       ]
+    },
+    {
+      "linear_project_id": "08057006-6d52-4743-a43c-dfc2370c7a12",
+      "name": "Neon War",
+      "repository": "rNavarrete/neon-war",
+      "routine_id": "trig_01CHWbQ267i1CMLGUym1kGd9",
+      "allowed_actions": [
+        "modify-files",
+        "add-files",
+        "add-tests"
+      ],
+      "checks": [
+        "npm run typecheck",
+        "npm test",
+        "npm run build"
+      ],
+      "max_attempts": 2,
+      "repair_allowance": 1,
+      "repair_allowance_since": "2026-10-26T06:00:00+00:00",
+      "status_issue_id": "ab11b765-6762-4137-b4d4-257086103d88",
+      "issues": [
+        "ENG-496",
+        "ENG-497",
+        "ENG-498",
+        "ENG-499",
+        "ENG-500",
+        "ENG-501"
+      ],
+      "skip_labels": [
+        "baseline"
+      ],
+      "protected_paths": [
+        ".github/",
+        ".claude/",
+        "CLAUDE.md",
+        "scripts/",
+        "public/art/",
+        "package.json",
+        "package-lock.json",
+        "tsconfig.json",
+        "vite.config.ts",
+        "playwright.config.ts"
+      ]
     }
   ]
 }

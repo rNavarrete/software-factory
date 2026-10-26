@@ -113,7 +113,10 @@ class IntakeKeysTests(unittest.TestCase):
         if not path.exists():
             self.skipTest("no pilot onboarding file")
         doc = json.loads(path.read_text())
-        (entry,) = doc["projects"]
+        # The pilot's entry; neon-war's has its own tickets (docs/neon-war.md).
+        (entry,) = [
+            p for p in doc["projects"] if p["repository"] == "rNavarrete/factory-pilot-demo"
+        ]
         # The pilot's factory tickets plus the go-live samples (docs/go-live.md).
         self.assertEqual(
             sorted(entry["issues"]),

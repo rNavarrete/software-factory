@@ -6,8 +6,9 @@ The factory works on two repositories: the pilot (`rNavarrete/factory-pilot-demo
 
 | | Pilot | Neon War |
 |---|---|---|
-| Worker routine | `factory-worker` (`trig_01CHWbQ267i1CMLGUym1kGd9`) | Its own routine, neon-war attached only |
-| Start key secret | `routine-token` | `neon-war-routine-token` |
+| Worker routine | `factory-worker` (`trig_01CHWbQ267i1CMLGUym1kGd9`) | The same routine, with neon-war added to its repositories (Rolando's choice, 2026-10-26) |
+| Start key secret | `routine-token` | the same `routine-token` |
+| Linear project | Factory Pilot Demo | Neon War (Milestone 1 tickets ENG-496 to ENG-501, status ticket ENG-495) |
 | Starts per rolling 7 days (reviews included) | 12, alert at 9 | 24, alert at 18 ([limits.md amendment](limits.md#amendment-2026-10-26-a-weekly-cap-per-repository)) |
 | Workers running at once | one, shared | one, shared |
 | Plan-usage stop (75% weekly), hold, rate-limit wait | shared | shared |
@@ -16,29 +17,33 @@ The repository table is `controller/targets.py`. The onboarding file can only ma
 
 Neon War's own rules for workers are in its `CLAUDE.md`. Its CI has the same `check`, `control-change`, `check-selftest` and `verified` jobs as the pilot, so the base-commit choice and evidence collection work unchanged.
 
+Sharing the routine means a worker started for either repository holds credentials for both. The factory still sends each contract only for its own repository and its own onboarded tickets, and recovery and review read only that repository. A separate routine later is one line in `controller/targets.py` plus its own start-key secret (`neon-war-routine-token`).
+
 ## Steps before the first ticket
 
-1. **Create the routine** on the factory account: neon-war attached (nothing else), the same prompt as `factory-worker` (`controller/adapter/routine_prompt.md`), a Node 22 environment with the npm registry allowed. Put its `trig_…` id in `NEON_WAR_ROUTINE` in `controller/targets.py` (a reviewed one-line change).
-2. **Store its start key** with `fly secrets set FACTORY_NEON_WAR_ROUTINE_TOKEN=…` from a hidden prompt, as `go-live.sh` does for the pilot's.
-3. **GitHub access.** Give `rnavarrete-factory-bot` write access to neon-war. Widen the service's read-only `github-token` to neon-war too. Check the reviewer still can't write there: `python3 -m controller.review qualify-identity <login> --repo rNavarrete/neon-war`.
-4. **Protect `main`** on neon-war with a ruleset requiring the `verified` check, as on the pilot.
-5. **Linear.** Make a Neon War project. Add its entry to `deploy/pilot/onboarding.json` and `deploy/pilot/drafting.json` (below), list the ticket keys in `issues`, then deploy.
+The onboarding and drafting entries are already in `deploy/pilot/`. What is left is on accounts:
 
-### Onboarding entry
+1. **Add neon-war to `factory-worker`** on the factory account (the routine's repositories).
+2. **GitHub access.** Give `rnavarrete-factory-bot` write access to neon-war. Widen the service's read-only `github-token` to neon-war too. Check the reviewer still can't write there: `python3 -m controller.review qualify-identity <login> --repo rNavarrete/neon-war`.
+3. **Protect `main`** on neon-war with a ruleset requiring the `verified` check, as on the pilot.
+4. **Deploy**, then move a ticket to Todo once docs/GAME.md for Milestone 1 and its art are on neon-war's main.
+
+### Onboarding entry (as shipped)
 
 ```json
 {
-  "linear_project_id": "<Neon War Linear project id>",
+  "linear_project_id": "08057006-6d52-4743-a43c-dfc2370c7a12",
   "name": "Neon War",
   "repository": "rNavarrete/neon-war",
-  "routine_id": "<neon-war trig_ id>",
+  "routine_id": "trig_01CHWbQ267i1CMLGUym1kGd9",
   "allowed_actions": ["modify-files", "add-files", "add-tests"],
   "checks": ["npm run typecheck", "npm test", "npm run build"],
   "max_attempts": 2,
   "repair_allowance": 1,
-  "repair_allowance_since": "<deploy time, ISO with zone>",
-  "status_issue_id": "<a Neon War status ticket id>",
-  "issues": ["<the 8 ticket keys>"],
+  "repair_allowance_since": "2026-10-26T06:00:00+00:00",
+  "status_issue_id": "ab11b765-6762-4137-b4d4-257086103d88",
+  "issues": ["ENG-496", "ENG-497", "ENG-498", "ENG-499", "ENG-500", "ENG-501"],
+  "skip_labels": ["baseline"],
   "protected_paths": [
     ".github/", ".claude/", "CLAUDE.md", "scripts/", "public/art/",
     "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts", "playwright.config.ts"
@@ -46,11 +51,11 @@ Neon War's own rules for workers are in its `CLAUDE.md`. Its CI has the same `ch
 }
 ```
 
-### Drafting entry
+### Drafting entry (as shipped)
 
 ```json
 {
-  "linear_project_id": "<Neon War Linear project id>",
+  "linear_project_id": "08057006-6d52-4743-a43c-dfc2370c7a12",
   "writable_paths": ["src/**", "tests/**", "index.html", "README.md", "docs/**"],
   "protected_paths": [
     ".github/**", ".claude/**", "CLAUDE.md", "scripts/**", "public/art/**",

@@ -6,8 +6,11 @@ with exactly the routine listed for it, so a hand edit on the server can't
 point the factory at a repository nobody reviewed. Adding one is a reviewed
 change to this file (and, for its weekly cap, to docs/limits.md).
 
-Each routine has only its own repository attached, so a worker started for
-one repository holds no credentials for another.
+A routine may serve more than one repository. Neon-war shares the pilot's
+``factory-worker`` routine (Rolando's choice, 2026-10-26), so a worker started
+for either holds credentials for both; the factory still dispatches each
+contract only to the routine listed for its own repository, and only for its
+own repository's onboarded tickets.
 
 Anything recorded before a repository was written into the ledger (fires,
 reservations, reviews from before 2026-10-26) was for the pilot.
@@ -25,9 +28,10 @@ PILOT_ROUTINE = "trig_01CHWbQ267i1CMLGUym1kGd9"
 """The ``factory-worker`` routine on the factory account (created 2026-10-08),
 bound to the pilot repo only."""
 
-NEON_WAR_ROUTINE: str | None = None
-"""The neon-war worker routine, bound to neon-war only. None until Rolando
-creates it on the factory account; until then neon-war can't be onboarded."""
+NEON_WAR_ROUTINE: str | None = PILOT_ROUTINE
+"""Neon-war reuses ``factory-worker``, with neon-war added to its repositories
+(Rolando's choice, 2026-10-26). A separate routine needs only this line and
+its own start-key secret in ``TOKEN_SECRETS``."""
 
 ROUTINES: Mapping[str, str | None] = MappingProxyType(
     {
@@ -42,11 +46,12 @@ REPOSITORIES = frozenset(ROUTINES)
 TOKEN_SECRETS: Mapping[str, str] = MappingProxyType(
     {
         PILOT_REPO: "routine-token",
-        NEON_WAR_REPO: "neon-war-routine-token",
+        NEON_WAR_REPO: "routine-token",
     }
 )
-"""Repository -> the service secret holding its routine's start key (each
-routine has its own key; ``controller/service/secrets.py``)."""
+"""Repository -> the service secret holding its routine's start key
+(``controller/service/secrets.py``). A shared routine shares its key; a
+separate neon-war routine would use ``neon-war-routine-token``."""
 
 
 def routine_for(repository: object) -> str | None:
