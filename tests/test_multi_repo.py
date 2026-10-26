@@ -17,6 +17,7 @@ from controller.attempts import PILOT_LIMITS, AttemptGate, DispatchRefused
 from controller.attempts import events as ev
 from controller.attempts.policy import REVIEW_JOB_INTENT, LedgerView
 from controller.interfaces import AttemptId, ContractDigest, LedgerEvent, RunId, TaskId
+from controller.prepare import policy as drafting
 from controller.review import codex_job
 from controller.review.reviewer import Revision
 from controller.service import onboarding
@@ -42,7 +43,9 @@ class TargetTableTests(unittest.TestCase):
         for repo in targets.REPOSITORIES:
             with self.subTest(repo):
                 self.assertIn(targets.TOKEN_SECRETS[repo], NAMES)
-        self.assertEqual(len(set(targets.TOKEN_SECRETS.values())), len(targets.TOKEN_SECRETS))
+        for repo, trig in targets.live_routines().items():
+            with self.subTest(repo):
+                self.assertEqual(targets.token_secret(trig), targets.TOKEN_SECRETS[repo])
 
     def test_a_routine_finds_its_own_start_key_only(self):
         self.assertEqual(targets.token_secret(targets.PILOT_ROUTINE), "routine-token")
@@ -94,13 +97,30 @@ class OnboardingTests(unittest.TestCase):
             onboarding.parse(doc(entry("someone/else", TRIG, "p")), targets=self.both)
 
     def test_by_default_only_the_table_counts(self):
-        """Without a routine in the table, neon-war can't be onboarded at all;
-        the pilot entry still loads with the table's routine."""
-        pilot = onboarding.parse(doc(entry(PILOT, targets.PILOT_ROUTINE, "p")))
-        self.assertEqual(pilot.project("p").repository, PILOT)
-        if targets.NEON_WAR_ROUTINE is None:
-            with self.assertRaises(onboarding.OnboardingError):
-                onboarding.parse(doc(entry(NEON, NEON_TRIG, "n")))
+        """Neon-war shares the pilot's routine (2026-10-26): by default it
+        onboards with that routine and no other."""
+        both = onboarding.parse(
+            doc(
+                entry(PILOT, targets.PILOT_ROUTINE, "p"),
+                entry(NEON, targets.PILOT_ROUTINE, "n"),
+            )
+        )
+        self.assertEqual(both.project("n").repository, NEON)
+        with self.assertRaises(onboarding.OnboardingError):
+            onboarding.parse(doc(entry(NEON, NEON_TRIG, "n")))
+
+    def test_the_shipped_files_onboard_neon_war(self):
+        root = Path(__file__).resolve().parent.parent / "deploy" / "pilot"
+        config = onboarding.load(root / "onboarding.json")
+        neon = [p for p in config.projects.values() if p.repository == NEON]
+        self.assertEqual(len(neon), 1)
+        self.assertEqual(neon[0].routine_id, targets.PILOT_ROUTINE)
+        self.assertEqual(neon[0].issues, frozenset(f"ENG-{n}" for n in range(496, 502)))
+        self.assertTrue(
+            {"public/art/", "scripts/", "playwright.config.ts"} <= neon[0].protected_paths
+        )
+        policies = drafting.load(root / "drafting.json")
+        self.assertIn(neon[0].linear_project_id, policies.projects)
 
     def test_the_single_pair_form_still_works(self):
         raw = json.dumps(config()).encode()

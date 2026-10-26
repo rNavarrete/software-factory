@@ -77,8 +77,11 @@ class ShippedSettingsTests(unittest.TestCase):
     """What the live service will read at the switch."""
 
     def setUp(self):
-        self.config = onboarding.load(PILOT, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
-        (self.project,) = self.config.projects.values()
+        # The shipped file also onboards neon-war (docs/neon-war.md); these
+        # checks are about the pilot's entry.
+        self.config = onboarding.load(PILOT)
+        (self.project,) = [p for p in self.config.projects.values() if p.repository == PILOT_REPO]
+        self.assertEqual(self.project.routine_id, FACTORY_ROUTINE)
 
     def test_intake_is_on_from_a_fixed_time(self):
         self.assertTrue(self.config.intake_enabled)

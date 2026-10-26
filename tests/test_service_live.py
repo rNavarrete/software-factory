@@ -22,7 +22,6 @@ from unittest import mock
 
 from controller.approval import StaticKey
 from controller.attempts import events as ev
-from controller.dispatch.dispatch import FACTORY_ROUTINE
 from controller.intake.linear import LinearUnavailable
 from controller.ledger import SqliteLedgerStore
 from controller.loop.collect import GhApi, NotFound
@@ -479,11 +478,7 @@ class ShippedFilesTests(unittest.TestCase):
     def test_pilot_onboarding_turns_intake_on_only_from_a_fixed_time(self):
         # Switched on for the go-live run (docs/go-live.md); moves before
         # intake_since are never read.
-        config = onboarding.load(
-            ROOT / "deploy" / "pilot" / "onboarding.json",
-            repository=PILOT_REPO,
-            routine_id=FACTORY_ROUTINE,
-        )
+        config = onboarding.load(ROOT / "deploy" / "pilot" / "onboarding.json")
         self.assertTrue(config.intake_enabled)
         self.assertIsNotNone(config.intake_since)
         self.assertEqual(config.approver_linear_user_id, service_main.ROLANDO_LINEAR_ID)
@@ -491,11 +486,7 @@ class ShippedFilesTests(unittest.TestCase):
     def test_pilot_drafting_policy_covers_every_onboarded_project(self):
         from controller.prepare import policy as drafting
 
-        config = onboarding.load(
-            ROOT / "deploy" / "pilot" / "onboarding.json",
-            repository=PILOT_REPO,
-            routine_id=FACTORY_ROUTINE,
-        )
+        config = onboarding.load(ROOT / "deploy" / "pilot" / "onboarding.json")
         policies = drafting.load(service_main.DRAFTING_POLICY)
         for pid, project in config.projects.items():
             with self.subTest(project=pid):

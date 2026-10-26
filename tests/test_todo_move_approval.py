@@ -331,10 +331,12 @@ class AuthorizerTests(AuthorizerCase):
         from controller.dispatch.dispatch import FACTORY_ROUTINE
         from controller.recovery import PILOT_REPO
 
-        pilot = onboarding.parse(raw, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
-        (project,) = pilot.projects.values()
-        for path in (".github/", ".claude/", "CLAUDE.md", "package.json", "tsconfig.json"):
-            self.assertIn(path, project.protected_paths)
+        shipped = onboarding.parse(raw)
+        for project in shipped.projects.values():  # the pilot and neon-war
+            self.assertEqual(project.routine_id, FACTORY_ROUTINE)
+            self.assertIn(project.repository, {PILOT_REPO, "rNavarrete/neon-war"})
+            for path in (".github/", ".claude/", "CLAUDE.md", "package.json", "tsconfig.json"):
+                self.assertIn(path, project.protected_paths)
 
     def test_contracts_outside_the_projects_limits_are_refused(self):
         self.config = intake_config(entry={"max_attempts": 2})
