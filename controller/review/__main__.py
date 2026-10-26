@@ -39,6 +39,7 @@ from controller.loop.collect import PILOT_REPO, GhApi, GitHubApi, NotFound
 from controller.review import events as ev
 from controller.review.reviewer import AutoReviewer, ReviewPolicy
 from controller.service.seams import PullRequestRef
+from controller.targets import REPOSITORIES
 
 
 class DryRunRuntime:
@@ -97,11 +98,12 @@ def dry_run(
     *,
     attempt_number: int = 1,
     reviewer: str | None = None,
-    repo: str = PILOT_REPO,
+    repo: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, object]:
     contract = contracts.loads(contract_text)
     digest = contracts.digest(contract)
+    repo = repo or str(contract["repository"])
     attempt = AttemptId(TaskId(str(contract["task_id"])), attempt_number)
     now = now or datetime.now(UTC)
     policy = ReviewPolicy(reviewers=frozenset({reviewer}) if reviewer else frozenset())
@@ -109,7 +111,7 @@ def dry_run(
     with tempfile.TemporaryDirectory() as tmp:
         with SqliteLedgerStore(Path(tmp) / "dry-run.db") as store:
             with store.writer_lock():
-                store.append(aev.attempt_reserved(attempt, digest, now))
+                store.append(aev.attempt_reserved(attempt, digest, now, repo))
                 # A stand-in reading so the allowance checks run; nothing is fired.
                 store.append(
                     LedgerEvent(
@@ -230,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--as-open", action="store_true")
     q = sub.add_parser("qualify-identity", help="check an account can be the reviewer")
     q.add_argument("login")
+    q.add_argument("--repo", default=PILOT_REPO, choices=sorted(REPOSITORIES))
     sub.add_parser(
         "check-token", help="on the host: check the review token can start reviews (starts none)"
     )
@@ -239,17 +242,17 @@ def main(argv: list[str] | None = None) -> int:
     api: GitHubApi = GhApi()
     if args.command == "qualify-identity":
         try:
-            problems = qualify_identity(api, args.login)
+            problems = qualify_identity(api, args.login, args.repo)
         except Exception as e:
             print(f"check failed: {type(e).__name__}: {e}", file=sys.stderr)
             return 1
         for line in problems:
             print(f"not qualified: {line}")
         if not problems:
-            print(f"{args.login} can be the reviewer: a user with no write access to {PILOT_REPO}.")
+            print(f"{args.login} can be the reviewer: a user with no write access to {args.repo}.")
         return 1 if problems else 0
     if args.as_open:
-        api = AsOpen(api, args.pr, PILOT_REPO)
+        api = AsOpen(api, args.pr, str(contracts.loads(args.contract.read_text())["repository"]))
     try:
         out = dry_run(
             api,

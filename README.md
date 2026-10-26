@@ -6,7 +6,7 @@ Software Factory connects **Linear, Claude cloud workers, GitHub and Codex revie
 
 The ambition is simple: **spend your time shaping the product while the factory handles the engineering handoffs.**
 
-> **Current stage:** The Linear intake, task preparation, cloud dispatch, independent Codex review, bounded repair and Linear reporting components are implemented and connected. The project is qualifying the full hosted workflow before its measured pilot. The initial configuration uses one pilot repository and one implementation lane; intake ships disabled until qualification.
+> **Current stage:** The Linear intake, task preparation, cloud dispatch, independent Codex review, bounded repair and Linear reporting components are implemented and connected. The project is qualifying the full hosted workflow before its measured pilot. It works on the pilot repository and on [Neon War](docs/neon-war.md), each with its own worker routine and weekly cap, through one implementation lane; intake ships disabled until qualification.
 
 ## The delivery loop
 
@@ -104,6 +104,7 @@ The next milestone is the full **Linear-to-reviewed-change qualification**, foll
 | [Bounded repairs](docs/repair.md) | When another attempt is allowed and when the factory stops |
 | [Linear reporting](docs/reporting.md) | Progress, questions, observations and review handoffs |
 | [Background service](docs/service.md) | Hosting, configuration, operation and recovery |
+| [Neon War on the factory](docs/neon-war.md) | The second repository: what is shared, what is separate, onboarding steps |
 | [Failure qualification](docs/linear-failure-qualification.md) | Tested failure cases and remaining live evidence |
 | [Captured context](docs/captured-context.md) | The foundation for richer briefs and visual inputs |
 | [Contribution guide](CONTRIBUTING.md) | Development commands, code ownership and shared interfaces |

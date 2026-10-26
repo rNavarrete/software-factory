@@ -34,7 +34,6 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from controller.contract import digest
-from controller.loop.collect import PILOT_REPO
 from controller.review.reviewer import Revision
 from controller.review.runtime import ENVELOPE
 from controller.review.workflow import (
@@ -49,6 +48,7 @@ from controller.review.workflow import (
     RESULT_SCHEMA,
     request_hash,
 )
+from controller.targets import REPOSITORIES
 
 HERE = Path(__file__).resolve().parent
 PROMPT = HERE / "codex_prompt.md"
@@ -76,8 +76,8 @@ def check_request(text: str, key: str) -> dict:
         raise BadRequest("the request is not a review job envelope")
     if not _KEY_RE.fullmatch(key) or data.get("key") != key:
         raise BadRequest("the request's key doesn't match the run's key")
-    if data.get("repository") != PILOT_REPO:
-        raise BadRequest("the request is not for the pilot repository")
+    if data.get("repository") not in REPOSITORIES:
+        raise BadRequest("the request is not for a repository the factory works on")
     pr = data.get("pr")
     if not isinstance(pr, int) or isinstance(pr, bool) or pr < 1:
         raise BadRequest("the request has no PR number")

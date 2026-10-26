@@ -480,8 +480,10 @@ class Approvals:
     written.
     ``contracts`` (optional) keeps each approved contract's exact bytes.
     ``source_routine`` (optional): count signed ``source-authorization``
-    records (Rolando's verified Todo move) for this routine. Left out, as on
-    the terminal, only typed approvals count.
+    records (Rolando's verified Todo move) for this routine, or for these
+    routines given as repository -> routine (``controller/targets.py``). With
+    a mapping, a contract's own record must name its repository's routine.
+    Left out, as on the terminal, only typed approvals count.
     """
 
     def __init__(
@@ -495,7 +497,7 @@ class Approvals:
         approvers: frozenset[str] = frozenset({APPROVER}),
         retired_keys: Sequence[tuple[ApprovalKey, int]] = (),
         contracts: ContractStore | None = None,
-        source_routine: str | None = None,
+        source_routine: str | Mapping[str, str] | None = None,
     ) -> None:
         if identity not in approvers:
             raise ValueError(f"{identity!r} is not an approver")
@@ -509,7 +511,14 @@ class Approvals:
         self._os_user = os_user or getpass.getuser()
         self._approvers = approvers
         self._contracts = contracts
-        self._source_routine = source_routine
+        if source_routine is None or isinstance(source_routine, str):
+            self._source_routines: Mapping[str, str] | None = None
+            self._source_routine_ids = (
+                frozenset() if source_routine is None else frozenset({source_routine})
+            )
+        else:
+            self._source_routines = dict(source_routine)
+            self._source_routine_ids = frozenset(self._source_routines.values())
 
     # --- writing decisions ---
 
@@ -661,11 +670,12 @@ class Approvals:
         stored = self._store.events()
         blocks: list[Notice] = []
 
-        standing = self._approval_block(stored, task, digest, now)
+        routine = self.source_routine_for(contract)
+        standing = self._approval_block(stored, task, digest, now, routine=routine)
         if standing is not None:
             blocks.append(standing)
 
-        trusted = self.trusted_events(stored, digest, now=now)
+        trusted = self.trusted_events(stored, digest, now=now, routine=routine)
         decision = check_dispatch(trusted, task, digest, now, refire_of=refire_of)
         blocks += [b for b in decision.blocks if b.code in _GATE_CODES]
         run = decision.run
@@ -679,6 +689,14 @@ class Approvals:
                 )
             )
         return Verdict(digest, run, tuple(blocks))
+
+    def source_routine_for(self, contract: Mapping[str, object]) -> str | None:
+        """The one routine whose Todo-move records count for this contract:
+        its repository's, when routines are given by repository."""
+        if self._source_routines is None:
+            return next(iter(self._source_routine_ids), None)
+        # A repository without a routine matches no record ("" names none).
+        return self._source_routines.get(contract.get("repository"), "")  # type: ignore[arg-type]
 
     def typed_approval_in_force(self, contract: Mapping[str, object], now: datetime) -> bool:
         """Whether Rolando's own typed approval of exactly this contract is in
@@ -696,6 +714,7 @@ class Approvals:
         digest: ContractDigest,
         *,
         now: datetime | None = None,
+        routine: str | None = None,
     ) -> list[StoredEvent]:
         """The ledger with every repair, re-fire and clearing decision left out
         unless it is signed, counted once, bound to the right contract, and made
@@ -703,7 +722,8 @@ class Approvals:
         repairs only count for it.
 
         A repair under the Todo move's allowance (``source-repair-authorized``)
-        also has to be in force at ``now``; without ``now`` it never counts."""
+        also has to be in force at ``now``; without ``now`` it never counts.
+        With ``routine``, Todo-move records count only if they name it."""
         reserved: dict[AttemptId, str] = {}
         latest_fire: dict[AttemptId, RunId] = {}
         results: set[RunId] = set()
@@ -719,7 +739,7 @@ class Approvals:
                 e.kind == SOURCE_AUTHORIZATION
                 and signed
                 and d.get("decision") == APPROVED
-                and self._source_ok(e)
+                and self._source_ok(e, routine)
             ):
                 # The terms of the move's first authorization of this contract
                 # are the allowance Rolando's move came with (signed with it;
@@ -746,7 +766,7 @@ class Approvals:
                     and now is not None
                     and d.get("digest") == digest.value
                     and digest.value not in withdrawn
-                    and self._source_repair_ok(e, reserved, terms, heads, now)
+                    and self._source_repair_ok(e, reserved, terms, heads, now, routine)
                 )
             elif e.kind == ev.REFIRE_AUTHORIZED:
                 keep = (
@@ -786,7 +806,12 @@ class Approvals:
             yield item, signed
 
     def _decisions(
-        self, stored: Sequence[StoredEvent], task: TaskId, *, sources: bool
+        self,
+        stored: Sequence[StoredEvent],
+        task: TaskId,
+        *,
+        sources: bool,
+        routine: str | None = None,
     ) -> tuple[list[tuple[int, str, datetime, datetime]], dict[str, list], set[str]]:
         """The task's signed approvals (seq, digest, decided, expires), its
         withdrawals by digest (seq, signed time or None, decision), and the
@@ -808,7 +833,7 @@ class Approvals:
                     continue
                 if decision != APPROVED:
                     continue  # the signer only ever approves
-                if not signed or not self._source_ok(e):
+                if not signed or not self._source_ok(e, routine):
                     unsigned.add(digest)
                     continue
                 max_ttl = MAX_SOURCE_TTL
@@ -835,11 +860,20 @@ class Approvals:
     def _source_seqs(stored: Sequence[StoredEvent]) -> set[int]:
         return {item.seq for item in stored if item.event.kind == SOURCE_AUTHORIZATION}
 
-    def _source_ok(self, e: LedgerEvent) -> bool:
+    def _routine_ok(self, d: Mapping[str, object], routine: str | None) -> bool:
+        """The record names one of this dispatcher's routines; with
+        ``routine``, exactly that one."""
+        named = d.get("routine_id")
+        if named not in self._source_routine_ids:
+            return False
+        return routine is None or named == routine
+
+    def _source_ok(self, e: LedgerEvent, routine: str | None = None) -> bool:
         """A signed Todo-move authorization counts only for this dispatcher's
-        routine, for its own task, never for a single attempt or run."""
+        routines (with ``routine``, that one), for its own task, never for a
+        single attempt or run."""
         d = e.data
-        if self._source_routine is None or d.get("routine_id") != self._source_routine:
+        if not self._routine_ok(d, routine):
             return False
         key = d.get("issue_key")
         if not isinstance(key, str) or e.task is None:
@@ -853,6 +887,7 @@ class Approvals:
         terms: Mapping[tuple[str, str], int],
         heads: Mapping[tuple[AttemptId, int], str | None],
         now: datetime,
+        routine: str | None = None,
     ) -> bool:
         """A signed repair under the Todo move's allowance counts only for this
         dispatcher's routine, for exactly attempt n on the contract attempt n-1
@@ -860,7 +895,7 @@ class Approvals:
         under, on the exact commit the findings were raised on (still the open
         PR's head), with its findings intact, and while it is in force."""
         d = e.data
-        if self._source_routine is None or d.get("routine_id") != self._source_routine:
+        if not self._routine_ok(d, routine):
             return False
         a = e.attempt
         if a is None or e.run is not None or a.number < 2 or e.task != a.task:
@@ -918,8 +953,11 @@ class Approvals:
         now: datetime,
         *,
         sources: bool = True,
+        routine: str | None = None,
     ) -> Notice | None:
-        approvals, withdrawals, unsigned = self._decisions(stored, task, sources=sources)
+        approvals, withdrawals, unsigned = self._decisions(
+            stored, task, sources=sources, routine=routine
+        )
         sources = self._source_seqs(stored)
 
         def withdrawn(seq: int, digest: str, decided: datetime) -> bool:

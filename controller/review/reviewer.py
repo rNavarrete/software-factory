@@ -323,7 +323,7 @@ class AutoReviewer:
         if watch is None:
             return ""
         try:
-            pr = self._api.json(f"repos/{self._repo}/pulls/{watch[0]}")
+            pr = self._api.json(f"repos/{self._repo_of(attempt)}/pulls/{watch[0]}")
         except Exception:
             return ""
         if not isinstance(pr, dict) or pr.get("merged") is not True:
@@ -342,22 +342,23 @@ class AutoReviewer:
             raise LookupError(f"no review was asked for {attempt}")
         number, _ = view.watches[attempt]
         contract, digest = self._contracts(attempt)
+        repo = self._repo_of(attempt)
         collected = collect(
             self._api,
             contract,
             digest,
             attempt,
             number,
-            repo=self._repo,
+            repo=repo,
             policy=self._policy.trust,
         )
         cand = collected.candidate
         cycle = ev.cycle_of(attempt.task, digest.value)
         if cand is None:
-            rev = Revision(self._repo, number, digest.value, "", "", "")
+            rev = Revision(repo, number, digest.value, "", "", "")
         else:
             rev = Revision(
-                self._repo,
+                repo,
                 number,
                 digest.value,
                 cand.head_commit,
@@ -719,7 +720,7 @@ class AutoReviewer:
                     pass_kind=job.pass_kind,
                     **common,
                 )
-            blocks = self._blocks(stored, view, cycle, job)
+            blocks = self._blocks(stored, view, cycle, job, rev.repository)
             if blocks:
                 return ReviewStatus(
                     ReviewState.BLOCKED,
@@ -875,10 +876,10 @@ class AutoReviewer:
         except LedgerLocked:
             pass
 
-    def _blocks(self, stored, view: ev.ReviewView, cycle: str, job) -> list[str]:
+    def _blocks(self, stored, view: ev.ReviewView, cycle: str, job, repo: str) -> list[str]:
         """Why no review job may start now. Shares every factory allowance with
         the workers: holds, the 429 wait, the usage reading and the weekly fire
-        count (review launches count there too)."""
+        count of the reviewed repository (review launches count there too)."""
         gate = LedgerView.build(stored)
         now = self._now()
         notices: list[Notice] = []
@@ -887,7 +888,7 @@ class AutoReviewer:
         if gate.retry_not_before is not None and now < gate.retry_not_before:
             notices.append(Notice("rate-limited", "the runtime asked the factory to wait"))
         _check_snapshot(gate, now, self._limits, notices, [])
-        _check_window(gate, now, self._limits, notices, [])
+        _check_window(gate, now, self._limits, notices, [], repo)
         out = [n.detail for n in notices]
         tries = len(job.claims) - job.rate_limited if job is not None else 0
         if job is not None and tries >= self._policy.launches_per_job:
@@ -908,7 +909,7 @@ class AutoReviewer:
         if (
             rev.head
             and collected.problems == (f"PR #{number} is closed.",)
-            and self._merged(number)
+            and self._merged(rev.repository, number)
         ):
             # A merged PR, otherwise unchanged: the last verdict stands if it
             # was for exactly this revision.
@@ -933,9 +934,15 @@ class AutoReviewer:
             "The factory can't review PR #{n} as it is: {why}",
         )
 
-    def _merged(self, number: int) -> bool:
+    def _repo_of(self, attempt: AttemptId) -> str:
+        """The repository the attempt's reservation names; the default (the
+        pilot) for reservations from before repositories were recorded."""
+        view = LedgerView.build(self._store.events(attempt.task))
+        return view.repository_of(attempt) or self._repo
+
+    def _merged(self, repo: str, number: int) -> bool:
         try:
-            pr = self._api.json(f"repos/{self._repo}/pulls/{number}")
+            pr = self._api.json(f"repos/{repo}/pulls/{number}")
         except Exception:
             return False
         return isinstance(pr, dict) and pr.get("merged") is True
@@ -950,7 +957,12 @@ class AutoReviewer:
 
     def _from_record(self, record: ev.VerdictRecord, view) -> ReviewStatus:
         rev = Revision(
-            self._repo, record.pr, record.digest, record.head, record.base, record.merge_base
+            self._repo_of(record.attempt),
+            record.pr,
+            record.digest,
+            record.head,
+            record.base,
+            record.merge_base,
         )
         state = ReviewState(record.verdict)
         job = view.jobs.get(record.key)

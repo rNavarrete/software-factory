@@ -172,13 +172,13 @@ def install_secrets(
 
 def build(args: argparse.Namespace):
     """The real wiring on the host. Imported late so ``status`` stays light."""
+    from controller import targets
     from controller.adapter.fake import FakeRuntimeAdapter, FakeStep
     from controller.approval import Approvals, ContractStore, StaticKey
     from controller.attempts import AttemptGate
     from controller.dispatch import Dispatcher, GhBaseCheck
-    from controller.dispatch.dispatch import FACTORY_ROUTINE
     from controller.ledger import SqliteLedgerStore
-    from controller.recovery import PILOT_REPO, GhCliReader, Recovery
+    from controller.recovery import GhCliReader, Recovery
     from controller.service import fixtures, onboarding
     from controller.service.github_http import HttpGhRunner
     from controller.service.seams import Integrations
@@ -209,7 +209,7 @@ def build(args: argparse.Namespace):
         confirm=never,
         os_user="factory-service",
         contracts=ContractStore(root / "contracts"),
-        source_routine=FACTORY_ROUTINE,
+        source_routine=targets.live_routines(),
     )
     gh = HttpGhRunner(lambda: secrets.get("github-token"), github_opener())
     recovery = Recovery(store, approvals, GhCliReader(run=gh), gate=gate, confirm=never)
@@ -227,7 +227,7 @@ def build(args: argparse.Namespace):
         from controller.adapter.routine import RoutineAdapter
 
         adapter = lambda trig, key: RoutineAdapter(trig, start_key=key)  # noqa: E731
-        start_key = lambda trig: secrets.get("routine-token")  # noqa: E731
+        start_key = lambda trig: secrets.get(targets.token_secret(trig))  # noqa: E731
 
     dispatcher = Dispatcher(
         store,
@@ -235,6 +235,7 @@ def build(args: argparse.Namespace):
         recovery,
         gate,
         GhBaseCheck(run=gh),
+        routines=targets.live_routines(),
         adapter=adapter,
         start_key=start_key,
         backup=backup,
@@ -252,9 +253,7 @@ def build(args: argparse.Namespace):
         from controller.intake import LinearSource, policy_from
 
         def policy():
-            return policy_from(
-                onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
-            )
+            return policy_from(onboarding.load(config_path))
 
         source = LinearSource(linear, policy)
     else:
@@ -295,7 +294,7 @@ def build(args: argparse.Namespace):
         recovery,
         gate,
         ContractStore(root / "contracts"),
-        lambda: onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE),
+        lambda: onboarding.load(config_path),
         integrations,
         heartbeat=Heartbeat(root / "service.heartbeat"),
         backup=backup,
@@ -310,15 +309,13 @@ def approvers(args: argparse.Namespace, config_path: Path) -> Callable[[], froze
     onboarding file names as approver now or named earlier in this run. So
     a changed approver applies to keys already checked, and a file that
     can't be read never lifts a restriction."""
-    from controller.dispatch.dispatch import FACTORY_ROUTINE
-    from controller.recovery import PILOT_REPO
     from controller.service import onboarding
 
     seen = {args.approver_linear_id}
 
     def current() -> frozenset[str]:
         try:
-            config = onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
+            config = onboarding.load(config_path)
         except (OSError, onboarding.OnboardingError):
             pass
         else:
@@ -332,8 +329,6 @@ def approvers(args: argparse.Namespace, config_path: Path) -> Callable[[], froze
 def ready_check(args: argparse.Namespace, secrets, socket_path: str | None, config_path: Path):
     """Refuse to start a service that would fail every round. Reads only
     local files: nothing is sent to Linear or GitHub."""
-    from controller.dispatch.dispatch import FACTORY_ROUTINE
-    from controller.recovery import PILOT_REPO
     from controller.service import onboarding
 
     uses = {args.source, args.preparer, args.reporter}
@@ -367,7 +362,7 @@ def ready_check(args: argparse.Namespace, secrets, socket_path: str | None, conf
         except SignerUnavailable as e:
             raise NotReady(f"the signer at {socket_path} is not working: {e}") from None
     try:
-        config = onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
+        config = onboarding.load(config_path)
     except (OSError, onboarding.OnboardingError) as e:
         raise NotReady(f"the onboarding file {config_path} is unusable: {e}") from None
     named = config.approver_linear_user_id
@@ -480,9 +475,7 @@ def run_signer(args: argparse.Namespace) -> int:
 def _todo_move_handler(args: argparse.Namespace, key, linear_key: str):
     """The signer's ``authorize`` request. The Linear key and onboarding path
     are read here, as root, before the signer drops to its own user."""
-    from controller.dispatch.dispatch import FACTORY_ROUTINE
     from controller.intake.linear import HttpTransport, LinearSource
-    from controller.recovery import PILOT_REPO
     from controller.service import onboarding
     from controller.signer import authorize_handler
     from controller.signer.authorize import OneContractPerMove, TodoMoveAuthorizer
@@ -492,7 +485,7 @@ def _todo_move_handler(args: argparse.Namespace, key, linear_key: str):
     config_path = Path(args.onboarding)
 
     def load():
-        return onboarding.load(config_path, repository=PILOT_REPO, routine_id=FACTORY_ROUTINE)
+        return onboarding.load(config_path)
 
     transport = HttpTransport(
         lambda: linear_key, forbidden_user=lambda: load().approver_linear_user_id

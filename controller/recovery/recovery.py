@@ -53,8 +53,8 @@ from controller.ledger.redact import redact_json
 from controller.recovery import events as ev
 from controller.recovery import state as st
 from controller.recovery.github import GitHubReader, GitHubUnreadable, PullRequest
+from controller.targets import PILOT_REPO
 
-PILOT_REPO = "rNavarrete/factory-pilot-demo"
 PROTECTED_BRANCH = "main"
 """The only branch a worker PR may merge into to count as accepted work: the
 one the ruleset protects (ENG-142). A merge into any other branch lands
@@ -294,6 +294,12 @@ class Recovery:
         stored = self._store.events(task)
         return max((s.seq for s in stored), default=0)
 
+    def _repo_of(self, attempt: AttemptId) -> str:
+        """The repository the attempt's reservation names (the pilot's for
+        reservations from before repositories were recorded)."""
+        view = LedgerView.build(self._store.events(attempt.task))
+        return view.repository_of(attempt) or self._repo
+
     def _read_github(self, attempt: AttemptId, now: datetime) -> _Read:
         current = self.attempt_status(attempt, now)
         run = current.latest_run
@@ -301,12 +307,11 @@ class Recovery:
             raise RecoveryRefused(f"{attempt} has no recorded fire")
         digest = ContractDigest(current.digest)
         assert self._github is not None
+        repo = self._repo_of(attempt)
         try:
-            head = self._github.branch_head(self._repo, attempt.branch)
-            pulls = {p.number: p for p in self._github.recent_pulls(self._repo)}
-            pulls.update(
-                {p.number: p for p in self._github.pulls_for_branch(self._repo, attempt.branch)}
-            )
+            head = self._github.branch_head(repo, attempt.branch)
+            pulls = {p.number: p for p in self._github.recent_pulls(repo)}
+            pulls.update({p.number: p for p in self._github.pulls_for_branch(repo, attempt.branch)})
         except GitHubUnreadable as e:
             raise RecoveryRefused(f"GitHub could not be read, nothing recorded: {e}") from e
 
@@ -315,7 +320,7 @@ class Recovery:
         for pr in sorted(pulls.values(), key=lambda p: p.number):
             if not self._names(pr, attempt):
                 continue
-            problems = self._mismatches(pr, attempt, digest)
+            problems = self._mismatches(pr, attempt, digest, repo)
             seen.append((pr, problems))
             if problems:
                 warnings.append(
@@ -328,7 +333,7 @@ class Recovery:
         matching = [pr for pr, problems in seen if not problems]
         stop = None
         if head is not None and not matching:
-            stop = self._stop_note(head)
+            stop = self._stop_note(head, repo)
             if stop is None:
                 warnings.append(
                     f"Branch {attempt.branch} exists with no matching PR (head {head})."
@@ -348,16 +353,16 @@ class Recovery:
         )
         return _Read(run, head, tuple(seen), tuple(warnings), hints, stop)
 
-    def _stop_note(self, head: str) -> str | None:
+    def _stop_note(self, head: str, repo: str) -> str | None:
         """The note on ``head`` if it is a worker's stop commit: one parent,
         no change to the files, a message starting ``Factory-Stop:``."""
         assert self._github is not None
         try:
-            commit = self._github.commit(self._repo, head)
+            commit = self._github.commit(repo, head)
             note = ev.stop_note(commit.message)
             if note is None or len(commit.parents) != 1:
                 return None
-            parent = self._github.commit(self._repo, commit.parents[0])
+            parent = self._github.commit(repo, commit.parents[0])
         except (GitHubUnreadable, ValueError) as e:
             raise RecoveryRefused(f"GitHub could not be read, nothing recorded: {e}") from e
         return note if parent.tree == commit.tree else None
@@ -368,17 +373,16 @@ class Recovery:
         return pr.head_branch == attempt.branch or (parsed is not None and parsed[0] == attempt)
 
     def _mismatches(
-        self, pr: PullRequest, attempt: AttemptId, digest: ContractDigest
+        self, pr: PullRequest, attempt: AttemptId, digest: ContractDigest, repo: str
     ) -> tuple[str, ...]:
         out = []
         if pr.head_branch != attempt.branch:
             out.append(f"its branch is {pr.head_branch!r}, not {attempt.branch!r}")
-        if (pr.base_repo, pr.base_branch) != (self._repo, self._base):
+        if (pr.base_repo, pr.base_branch) != (repo, self._base):
             out.append(
-                f"it targets {pr.base_branch!r} in {pr.base_repo},"
-                f" not {self._base!r} in {self._repo}"
+                f"it targets {pr.base_branch!r} in {pr.base_repo}, not {self._base!r} in {repo}"
             )
-        if pr.head_repo != self._repo:
+        if pr.head_repo != repo:
             out.append(f"its branch lives in {pr.head_repo or 'a deleted repository'}")
         parsed = AttemptId.from_pr_title(pr.title)
         if parsed is None or parsed[0] != attempt or parsed[1] != digest.short:
@@ -516,7 +520,7 @@ class Recovery:
         elif not note.strip():
             raise RecoveryRefused(f"a {basis.value} clearing needs a note")
         elif basis is gate_events.ClearingBasis.WRITE_ACCESS_REMOVED:
-            evidence = self._access_evidence(note, now)
+            evidence = self._access_evidence(note, now, self._repo_of(attempt))
         else:
             if current.session_urls:
                 raise RecoveryRefused(
@@ -548,22 +552,22 @@ class Recovery:
         evidence = " ".join(given)
         return f"{evidence} (note: {note.strip()})" if note.strip() else evidence
 
-    def _access_evidence(self, note: str, now: datetime) -> str:
+    def _access_evidence(self, note: str, now: datetime, repo: str) -> str:
         if self._github is None:
             raise RecoveryRefused("a write-access-removed clearing needs GitHub to confirm it")
         try:
-            still = sorted(w for w in self._workers if self._github.can_push(self._repo, w))
+            still = sorted(w for w in self._workers if self._github.can_push(repo, w))
         except GitHubUnreadable as e:
             raise RecoveryRefused(f"GitHub could not confirm the bot lost push access: {e}") from e
         if still:
             raise RecoveryRefused(
-                f"GitHub still lists {', '.join(still)} with push access to {self._repo}."
+                f"GitHub still lists {', '.join(still)} with push access to {repo}."
                 " Remove the bot as a collaborator first."
             )
         workers = ", ".join(sorted(self._workers))
         return (
             f"{note.strip()} Confirmed by the controller at {now.isoformat()}: GitHub lists"
-            f" no push access for {workers} on {self._repo}."
+            f" no push access for {workers} on {repo}."
         )
 
     def close_attempt(

@@ -12,8 +12,10 @@ The service re-reads the file every round and records its sha256 in the
 ledger whenever it changes, so every dispatch can be traced to the mapping
 in force at the time.
 
-v1 has one worker routine bound to one repository, so every entry must name
-exactly the repository and routine the dispatcher is built for.
+Each entry's repository must be one ``controller/targets.py`` lists, and its
+routine exactly the one listed for that repository (each routine is bound to
+its own repository on the factory account). Several projects may share a
+repository.
 
 Todo intake (ENG-174) reads three more things from it:
 
@@ -42,6 +44,7 @@ from datetime import datetime
 from pathlib import Path
 
 from controller import contract as contracts
+from controller import targets as known_targets
 from controller.attempts.limits import PILOT_LIMITS
 from controller.contract.contract import _path as _check_path
 
@@ -187,8 +190,28 @@ def _strings(value: object, what: str) -> frozenset[str]:
     return frozenset(value)
 
 
-def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
+def _targets(
+    targets: Mapping[str, str] | None, repository: str | None, routine_id: str | None
+) -> Mapping[str, str]:
+    """Repository -> routine the file may use: ``targets``, or the one pair
+    ``repository``/``routine_id`` (tests and single-repo tools), or by default
+    every repository in ``controller/targets.py`` that has a routine."""
+    if repository is not None or routine_id is not None:
+        if targets is not None or repository is None or routine_id is None:
+            raise TypeError("give targets, or repository with routine_id")
+        return {repository: routine_id}
+    return known_targets.live_routines() if targets is None else targets
+
+
+def parse(
+    raw: bytes,
+    *,
+    targets: Mapping[str, str] | None = None,
+    repository: str | None = None,
+    routine_id: str | None = None,
+) -> Onboarding:
     """Check the whole file; any problem refuses all of it."""
+    allowed = _targets(targets, repository, routine_id)
     try:
         doc = json.loads(raw)
     except ValueError as e:
@@ -247,13 +270,15 @@ def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
         repo, trig = e["repository"], e["routine_id"]
         if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo):
             raise OnboardingError(f"{where}: repository must be owner/name")
-        if repo != repository:
-            raise OnboardingError(f"{where}: v1 can only work on {repository}, not {repo}")
-        if not isinstance(trig, str) or not _TRIG_RE.fullmatch(trig) or trig != routine_id:
-            raise OnboardingError(f"{where}: routine must be {routine_id}")
+        if repo not in allowed:
+            raise OnboardingError(
+                f"{where}: the factory can only work on {', '.join(sorted(allowed))}, not {repo}"
+            )
+        if not isinstance(trig, str) or not _TRIG_RE.fullmatch(trig) or trig != allowed[repo]:
+            raise OnboardingError(f"{where}: routine for {repo} must be {allowed[repo]}")
         branch = e.get("base_branch", "main")
         if branch != "main":
-            raise OnboardingError(f"{where}: base_branch must be main in v1")
+            raise OnboardingError(f"{where}: base_branch must be main")
         actions = _strings(e["allowed_actions"], f"{where}.allowed_actions")
         unknown = actions - set(contracts.ACTIONS)
         if unknown:
@@ -315,12 +340,18 @@ def parse(raw: bytes, *, repository: str, routine_id: str) -> Onboarding:
     return Onboarding(projects, hashlib.sha256(raw).hexdigest(), enabled, approver, since)
 
 
-def load(path: Path, *, repository: str, routine_id: str) -> Onboarding:
+def load(
+    path: Path,
+    *,
+    targets: Mapping[str, str] | None = None,
+    repository: str | None = None,
+    routine_id: str | None = None,
+) -> Onboarding:
     try:
         raw = path.read_bytes()
     except OSError as e:
         raise OnboardingError(f"can't read {path}: {e.strerror}") from None
-    return parse(raw, repository=repository, routine_id=routine_id)
+    return parse(raw, targets=targets, repository=repository, routine_id=routine_id)
 
 
 def empty() -> Onboarding:

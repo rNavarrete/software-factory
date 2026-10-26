@@ -21,6 +21,7 @@ from controller.interfaces import (
     StoredEvent,
     TaskId,
 )
+from controller.targets import PILOT_REPO
 
 # controller.review.events.REVIEW_JOB_INTENT, named here so the gate doesn't
 # import the reviewer (a test keeps the two the same).
@@ -74,6 +75,10 @@ class AttemptState:
     idle: tuple[datetime, str] | None = None
     """The factory's latest confirmation, from a successful GitHub read, that
     the worker is finished: when, and why."""
+    repository: str | None = None
+    """The repository its reservation names; reservations from before
+    repositories were recorded are the pilot's. None if no reservation was
+    seen, which counts against every repository's weekly cap."""
 
     @property
     def last_fire(self) -> Fire | None:
@@ -139,6 +144,9 @@ class LedgerView:
     review_fires: list[datetime] = field(default_factory=list)
     """When each independent review job was claimed (ENG-156). Review launches
     use the same weekly fire allowance as workers."""
+    review_claims: list[tuple[datetime, AttemptId]] = field(default_factory=list)
+    """``review_fires`` with the reviewed attempt, whose repository's weekly
+    allowance each one uses."""
     snapshot: Snapshot | None = None
     repairs: set[AttemptId] = field(default_factory=set)
     refires: set[RunId] = field(default_factory=set)
@@ -164,9 +172,15 @@ class LedgerView:
         e = item.event
         d = e.data
         if e.kind == ev.ATTEMPT_RESERVED and e.attempt is not None:
-            self.attempts.setdefault(
-                e.attempt, AttemptState(e.attempt, str(d.get("digest", "")), e.at)
-            )
+            if e.attempt not in self.attempts:
+                # Only the first record for the attempt says where it works.
+                repo = d.get("repository", PILOT_REPO)
+                self.attempts[e.attempt] = AttemptState(
+                    e.attempt,
+                    str(d.get("digest", "")),
+                    e.at,
+                    repository=repo if _text(repo) else None,
+                )
         elif e.kind == ev.FIRE_INTENT and e.run is not None:
             state = self.attempts.setdefault(e.run.attempt, AttemptState(e.run.attempt, "", e.at))
             fire = Fire(e.run, e.at, None)
@@ -245,6 +259,7 @@ class LedgerView:
             self.escalations.add(str(d["dedup"]))
         elif e.kind == REVIEW_JOB_INTENT and e.attempt is not None:
             self.review_fires.append(e.at)
+            self.review_claims.append((e.at, e.attempt))
         elif e.kind in (CANDIDATE, WORKER_IDLE) and e.attempt in self.attempts:
             state = self.attempts[e.attempt]
             last = state.last_fire
@@ -255,6 +270,34 @@ class LedgerView:
                     state.activity_at = e.at
             elif _text(d.get("reason")):
                 state.idle = (e.at, str(d["reason"]))
+
+    def repository_of(self, attempt: AttemptId) -> str | None:
+        """The attempt's repository; None when no reservation names one."""
+        state = self.attempts.get(attempt)
+        return state.repository if state is not None else None
+
+    def task_repository(self, task: TaskId) -> str | None:
+        """The repository of the task's latest reserved attempt, if any."""
+        for state in reversed(self.task_attempts(task)):
+            if state.repository is not None:
+                return state.repository
+        return None
+
+    def window_fires(self, repository: str, since: datetime) -> int:
+        """Worker fires and review claims after ``since`` that count against
+        ``repository``'s weekly cap. One whose repository is unknown counts
+        against every repository's, so a malformed record never frees one."""
+        fires = sum(
+            1
+            for f in self.all_fires
+            if f.at > since and self.repository_of(f.run.attempt) in (repository, None)
+        )
+        reviews = sum(
+            1
+            for at, attempt in self.review_claims
+            if at > since and self.repository_of(attempt) in (repository, None)
+        )
+        return fires + reviews
 
     def task_attempts(self, task: TaskId) -> list[AttemptState]:
         return sorted((s for a, s in self.attempts.items() if a.task == task), key=_number_of)
@@ -330,13 +373,17 @@ def check_dispatch(
     refire_of: RunId | None = None,
     automated: bool = False,
     limits: Limits = PILOT_LIMITS,
+    repository: str | None = None,
 ) -> Decision:
     """May the controller fire for ``task`` now?
 
     Without ``refire_of`` this asks for the task's next attempt. With it, it asks
     to fire that run's attempt again after a definite not-launched result.
+    ``repository`` is the contract's, whose weekly cap applies; left out, the
+    task's earlier attempts say, else the pilot.
     """
     view = LedgerView.build(stored)
+    repository = repository or view.task_repository(task) or PILOT_REPO
     blocks: list[Notice] = []
     alerts: list[Notice] = []
 
@@ -354,7 +401,7 @@ def check_dispatch(
             Notice("rate-limited", f"No fire before {view.retry_not_before.isoformat()} (429).")
         )
     _check_snapshot(view, now, limits, blocks, alerts)
-    _check_window(view, now, limits, blocks, alerts)
+    _check_window(view, now, limits, blocks, alerts, repository)
 
     for state in view.attempts.values():
         if state.holds_lane(now):
@@ -414,19 +461,21 @@ def _check_snapshot(
 
 
 def _check_window(
-    view: LedgerView, now: datetime, limits: Limits, blocks: list[Notice], alerts: list[Notice]
+    view: LedgerView,
+    now: datetime,
+    limits: Limits,
+    blocks: list[Notice],
+    alerts: list[Notice],
+    repository: str = PILOT_REPO,
 ) -> None:
-    since = now - limits.fire_window
-    recent = sum(1 for f in view.all_fires if f.at > since)
-    recent += sum(1 for at in view.review_fires if at > since)
-    if recent >= limits.fires_per_window:
-        blocks.append(
-            Notice("window-fire-cap", f"{recent} of {limits.fires_per_window} fires in 7 days.")
-        )
-    elif recent >= limits.fires_per_window_alert_at:
-        alerts.append(
-            Notice("window-fires-high", f"{recent} of {limits.fires_per_window} fires in 7 days.")
-        )
+    """``repository``'s rolling weekly cap (docs/limits.md section 3)."""
+    cap, alert_at = limits.window_cap(repository)
+    recent = view.window_fires(repository, now - limits.fire_window)
+    where = "" if repository == PILOT_REPO else f" for {repository}"
+    if recent >= cap:
+        blocks.append(Notice("window-fire-cap", f"{recent} of {cap} fires in 7 days{where}."))
+    elif recent >= alert_at:
+        alerts.append(Notice("window-fires-high", f"{recent} of {cap} fires in 7 days{where}."))
 
 
 def _next_attempt(

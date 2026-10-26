@@ -34,8 +34,8 @@ printf '%s\n' "$HOME" >/run/factory-home
 python3 -s -m controller.service install-secrets "$FACTORY_SECRETS_DIR"
 # The service's copy: never the approval key.
 python3 -s -m controller.service install-secrets /run/factory-service-secrets \
-    --only routine-token,github-token,linear-key,review-token --owner factory
-for name in APPROVAL_KEY ROUTINE_TOKEN GITHUB_TOKEN LINEAR_KEY REVIEW_TOKEN; do
+    --only routine-token,neon-war-routine-token,github-token,linear-key,review-token --owner factory
+for name in APPROVAL_KEY ROUTINE_TOKEN NEON_WAR_ROUTINE_TOKEN GITHUB_TOKEN LINEAR_KEY REVIEW_TOKEN; do
     unset "FACTORY_$name"
 done
 chown -R factory:factory "$HOME"

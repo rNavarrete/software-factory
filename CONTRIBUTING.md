@@ -16,6 +16,7 @@ Each directory belongs to one ticket so parallel work never edits the same files
 
 | Path | Owner | What goes there |
 |---|---|---|
+| `controller/targets.py`, `docs/neon-war.md` | neon-war onboarding | The repositories the factory may work on, each one's routine and start-key secret |
 | `controller/interfaces.py` | ENG-185 | Shared types: `TaskId`, `AttemptId`, `RunId`, `ContractDigest`, `LedgerStore`, `RuntimeAdapter` and launch results |
 | `controller/contract/`, `schema/` | ENG-144 | Contract format, canonical bytes and digest. Exposes `validate(contract, digest) -> list[str]` and the canonical digest function, which the routine adapter calls before every launch |
 | `controller/ledger/` | ENG-147 | SQLite `LedgerStore`, event kinds, backups |
