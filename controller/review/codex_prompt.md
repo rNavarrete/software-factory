@@ -76,6 +76,12 @@ you checked:
   file's `path`, the `test` name exactly as the test runner shows it (outer
   `describe` titles and the test title joined with ` > `), the `assertion`
   line copied exactly from the file, and `why` it checks the criterion.
+  The assertion must be an `expect(...)` or `assert(...)` call written
+  directly in that test's own body: a call to a helper that asserts inside
+  it can't be checked independently. If a criterion is checked only through
+  such a helper, still link the closest direct assertion if there is one,
+  and raise a blocking `test` finding asking for a direct assertion in the
+  test body.
 - `limits`: for a criterion where showing the test fail without the change
   isn't practical, say why.
 - `findings`: every problem you found. `category` is `code`, `test`, `scope`,

@@ -184,6 +184,24 @@ class PolicyTests(unittest.TestCase):
         ):
             with self.subTest(action=action):
                 self.assertIsInstance(plan((finding(suggested_action=action),)), policy.Plan)
+                reviewer = finding(category="review-test", suggested_action=action)
+                self.assertIsInstance(plan((reviewer,)), policy.Plan)
+
+    def test_the_factorys_own_finding_text_is_never_read_as_weakening(self):
+        # ENG-503 a2 (neon-war #15): verify/findings.py's own action for an
+        # unmapped criterion matched "fix ... assertion" and stopped the repair.
+        own = finding(
+            9,
+            category="assertion-unknown",
+            summary="ac9 has no test that independently shows it (unknown)",
+            suggested_action="Add or fix a test whose assertion shows ac9, and that fails"
+            " without the change.",
+        )
+        self.assertFalse(policy.asks_to_weaken(own))
+        self.assertIsInstance(plan((own,)), policy.Plan)
+        # The same words from the reviewer are still read.
+        said = finding(9, category="review-test", suggested_action="Fix the assertion to expect 3.")
+        self.assertTrue(policy.asks_to_weaken(said))
 
     def test_anything_routed_to_rolando_stops_it_even_if_not_blocking(self):
         out = plan((finding(1), finding(2, category="security", route="rolando", blocking=False)))

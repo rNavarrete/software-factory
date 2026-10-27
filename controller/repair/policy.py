@@ -219,7 +219,13 @@ def routine(category: str) -> bool:
 def asks_to_weaken(f: RepairFinding) -> bool:
     """True if the finding's own words ask to remove or loosen a test, check,
     criterion or workflow. Errs towards yes: a false alarm only sends the
-    repair to Rolando."""
+    repair to Rolando.
+
+    An ``assertion-*`` finding is skipped: verify/findings.py writes all of
+    its text from the criterion id ("Add or fix a test whose assertion shows
+    ac9, and that fails without the change"), and it never asks for that."""
+    if f.category.startswith(ROUTINE_PREFIXES):
+        return False
     return bool(_WEAKEN_RE.search(f"{f.summary}. {f.suggested_action}"))
 
 
