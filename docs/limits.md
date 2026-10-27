@@ -226,3 +226,4 @@ The cost of the change: without a reading, the factory finds out it has run out 
 
 - Rolando's active time on this amendment: one OK on the pull request.
 - Version to sign: `8b5893fa4ffd7827d0adfd16c44f9f67bdc1628348cdc28f5d214efb92133de7` (sha256 of this amendment, from its heading to the line above). Sections 1 to 11, the sign-off record and the 2026-10-26 amendment are unchanged, so their hashes still hold.
+- Signed: Rolando merged [PR #52](https://github.com/rNavarrete/software-factory/pull/52), which asked for his OK on this version, 2026-10-27 01:15Z. The status line above still reads Proposed because it is inside the hashed text.
