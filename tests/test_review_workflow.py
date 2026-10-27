@@ -997,6 +997,13 @@ class JobStepTests(Case):
         self.assertIn("only for ordering or as\n  earlier work", prompt)
         self.assertIn("code\n  at `merge_base`", prompt)
 
+    def test_the_prompt_asks_for_an_assertion_in_the_test_body(self):
+        """ENG-503 a2: the review linked `expectRestored(r, atC1);`, a helper the
+        verifier can't read as an assertion, so ac9 stayed unknown."""
+        prompt = codex_job.prompt_text(json.loads(self.request()))
+        self.assertIn("written\n  directly in that test's own body", prompt)
+        self.assertIn("blocking `test` finding asking for a direct assertion", prompt)
+
     def test_the_result_takes_provenance_from_the_run_not_the_output(self):
         text = self.request()
         run = self.gh_run()
