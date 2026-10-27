@@ -7,9 +7,15 @@ in plain words, why Rolando decides instead.
 The rules, from the ticket's adopted policy:
 
 - Only concrete, independently evidenced, blocking problems the review routed
-  to repair, in a category known to be a routine technical fix. Anything the
-  review routed to Rolando, or a category this module doesn't know, stops the
-  automatic repair, even if other findings are routine.
+  to repair, in a category known to be a routine technical fix. A category
+  this module doesn't know stops the automatic repair, even if other findings
+  are routine.
+- A question for Rolando about the product, or a criterion only he can
+  observe (``ASK_IN_PARALLEL``), doesn't stop the repair of the rest: the
+  plan carries it as a question for him, and the new PR's own review raises
+  it again until he settles it (Rolando, 2026-10-27). Anything else the
+  review routed to Rolando (integrity, a protected control, security) stops
+  the automatic repair.
 - The finding's text is read for what it asks, not for its severity label: a
   finding asking to delete, skip, disable or weaken a test, a check, a
   criterion or a workflow is never routine.
@@ -50,6 +56,10 @@ ROUTINE_CATEGORIES = frozenset(
 """Review categories (verify/findings.py) a repair worker may fix on its own,
 plus every ``assertion-*`` and the test-quality ``flag-*`` kinds below."""
 ROUTINE_PREFIXES = ("assertion-",)
+ASK_IN_PARALLEL = frozenset({"review-product", "needs-observation"})
+"""Findings routed to Rolando that a code fix can't settle either way: a
+product question (unreviewed context among them) or a behavior he must see.
+The repair runs on the rest while he answers."""
 ROUTINE_FLAGS = frozenset(
     {
         "flag-fixture-only",
@@ -91,6 +101,8 @@ class Plan:
     """The repair allowance the Todo move came with."""
     used: int
     """Repairs (typed or automatic) already used, before this one."""
+    questions: tuple[RepairFinding, ...] = ()
+    """What the review asked Rolando, left out of the repair (``ASK_IN_PARALLEL``)."""
 
     @property
     def failure(self) -> str:
@@ -125,14 +137,17 @@ def plan(
     ``repairs_used``: how many of those were repairs, typed or automatic.
     Every attempt after the first counts against the allowance, as the
     signer and the approval check count it."""
-    open_ = [f for f in findings if f.blocking]
-    # Anything routed to Rolando stops it, blocking or not.
+    open_ = [f for f in findings if f.blocking and f.route == "repair"]
+    # Anything else routed to Rolando stops it, blocking or not.
     rolando = [f for f in findings if f.route != "repair"]
-    if rolando:
+    held = [f for f in rolando if f.category not in ASK_IN_PARALLEL] or (
+        rolando if not open_ else []
+    )
+    if held:
         return Stop(
             "needs-rolando",
             "the review raised something only you can settle: "
-            + "; ".join(f.summary for f in rolando[:3]),
+            + "; ".join(f.summary for f in held[:3]),
             "Settle it on the PR, then repair it by hand or close the attempt.",
         )
     if not open_:
@@ -186,7 +201,7 @@ def plan(
             f"{'' if allowance == 1 else 's'} its Todo move allows",
             f"Allow attempt {nxt} by hand to have the factory try again, or close the attempt.",
         )
-    return Plan(nxt, tuple(open_), allowance, repairs_used)
+    return Plan(nxt, tuple(open_), allowance, repairs_used, tuple(rolando))
 
 
 def detail_chars(findings: Sequence[RepairFinding]) -> int:
@@ -209,6 +224,7 @@ def asks_to_weaken(f: RepairFinding) -> bool:
 
 
 __all__ = [
+    "ASK_IN_PARALLEL",
     "MAX_DETAIL_CHARS",
     "ROUTINE_CATEGORIES",
     "Plan",

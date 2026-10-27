@@ -1431,10 +1431,16 @@ def _bindings(f: _File, t: _Test) -> dict[str, list[str]]:
     while p is not None:
         own.add(p)
         p = f.blocks[p].parent
-    merged: list[list[int]] = []
-    for a, e in sorted(
+    hidden = [
         (b.start, b.end) for i, b in enumerate(f.blocks) if i not in own and b.body is not None
-    ):
+    ]
+    hidden += [
+        (a, e)
+        for a, e in _function_bodies(m)
+        if not a <= t.block.start <= e and not t.block.start <= a <= t.block.end
+    ]
+    merged: list[list[int]] = []
+    for a, e in sorted(hidden):
         if merged and a <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], e)
         else:
@@ -1501,6 +1507,32 @@ def _bindings(f: _File, t: _Test) -> dict[str, list[str]]:
 
 
 _FUNCTION_DECL_RE = re.compile(r"(?<![\w$.])function\s*\*?\s*([A-Za-z_$][\w$]*)")
+_ARROW_BODY_RE = re.compile(r"=>\s*\{")
+
+
+def _function_bodies(m: str) -> list[tuple[int, int]]:
+    """(start, end) of every function body in masked text: a helper's own
+    variables are not in scope in a test, even when they share its names."""
+    out = []
+    for fn in _FUNCTION_DECL_RE.finditer(m):
+        p = m.find("(", fn.end())
+        if p < 0:
+            continue
+        try:
+            b = m.find("{", _match(m, p))
+            if b >= 0:
+                out.append((b, _match(m, b)))
+        except ParseError:
+            continue
+    for a in _ARROW_BODY_RE.finditer(m):
+        b = a.end() - 1
+        try:
+            out.append((b, _match(m, b)))
+        except ParseError:
+            continue
+    return out
+
+
 _TYPEOF_RE = re.compile(r"(?<![\w$.])typeof\s+[\w$.]+")
 
 

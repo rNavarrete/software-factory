@@ -990,6 +990,13 @@ class JobStepTests(Case):
         fence = prompt.split("## The request")[1].split("\n")[2][:4]
         self.assertEqual(fence, "````")
 
+    def test_the_prompt_says_an_ordering_ticket_is_not_missing_context(self):
+        """ENG-503: "Start: after ENG-502 merges" was listed as unreviewed context,
+        which routes to Rolando and stops the automatic repair."""
+        prompt = codex_job.prompt_text(json.loads(self.request()))
+        self.assertIn("only for ordering or as\n  earlier work", prompt)
+        self.assertIn("code\n  at `merge_base`", prompt)
+
     def test_the_result_takes_provenance_from_the_run_not_the_output(self):
         text = self.request()
         run = self.gh_run()

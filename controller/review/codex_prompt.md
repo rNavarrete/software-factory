@@ -38,6 +38,11 @@ and return one JSON object.
   approved text, word for word), the pull request's page, and CI runs (the
   factory checks CI on the exact commit itself). List them only if the
   contract says that something in them is needed to judge a criterion.
+  The same goes for other tickets the contract names only for ordering or as
+  earlier work ("Start: after ENG-502 merges"): what they produced is the code
+  at `merge_base`, which you can read. List one only if the contract says
+  something in that ticket, beyond its merged code, is needed to judge a
+  criterion.
 - Set `complete` to true only when you examined every area below and judged
   every acceptance criterion. If you couldn't, set it to false.
 

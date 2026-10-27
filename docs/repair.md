@@ -15,7 +15,7 @@ All of these must hold, and each is checked where it can't be faked:
 | Check | Where |
 |---|---|
 | The review's latest recorded verdict for this attempt is **failed**, on a known PR and commit. Passed, needs Rolando, incomplete, unknown, blocked or unreadable never starts a repair. | Service, from the review's own ledger records (`controller/repair/review.py`) |
-| Every open blocking finding was routed to repair, is in a category known to be a routine fix, and doesn't ask to delete, skip, disable or weaken a test, check, criterion or workflow, or to change what a test expects. Nothing the review routed to Rolando is open, blocking or not; only a finding marked advisory counts as non-blocking. There are at most 20 findings, with at most 24,000 characters of text between them, and the worker's whole task message must fit its limit. | Service (`controller/repair/policy.py`) |
+| Every open blocking finding was routed to repair, is in a category known to be a routine fix, and doesn't ask to delete, skip, disable or weaken a test, check, criterion or workflow, or to change what a test expects. Nothing the review routed to Rolando is open, blocking or not, except a product question or a criterion only he can observe (`review-product`, `needs-observation`): those ride beside the repair as questions for him (Rolando, 2026-10-27). Only a finding marked advisory counts as non-blocking. There are at most 20 findings, with at most 24,000 characters of text between them, and the worker's whole task message must fit its limit. | Service (`controller/repair/policy.py`) |
 | The failed commit is still the head of the attempt's open PR. A newer push waits for a review of the new head. | Service, and again in the approval check |
 | The next attempt fits the contract's budget and the project's `max_attempts`, and the repairs used so far (every attempt after the first, typed ones included) are fewer than the allowance. | Service, signer and approval check |
 | Rolando has recorded that the earlier worker finished (the clearing below). | Recovery, as for any repair |
@@ -25,7 +25,7 @@ All of these must hold, and each is checked where it can't be faked:
 
 If any check fails, the factory posts one note on the ticket saying why and what Rolando can do: repair it by hand, merge the PR as it is after checking it, or close the attempt. It posts that note once per failed commit, never in a loop. When the task has used all its attempts, the note says further work needs a new ticket.
 
-These go to Rolando and are never repaired automatically: anything the review routed to him, any category not on the routine list, any finding asking to weaken verification, and anything involving changed requirements, ambiguous behavior, architecture, security, permissions or protected controls.
+These go to Rolando and are never repaired automatically: anything the review routed to him, any category not on the routine list, any finding asking to weaken verification, and anything involving changed requirements, ambiguous behavior, architecture, security, permissions or protected controls. A product question or an observable criterion is still his alone, but it no longer holds up the repair of routine findings beside it. The repair worker isn't told about it, the ticket note asks Rolando to answer it on the PR before he merges, and the new PR's own review raises it again if it still stands. On its own, with nothing routine beside it, it stops the repair as before.
 
 ## The one step that still needs Rolando: confirming the earlier worker stopped
 
