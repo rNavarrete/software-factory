@@ -54,6 +54,8 @@ The entry has no `issues` list (removed 2026-10-27, so new game tickets need no 
 
 ### Drafting entry (as shipped)
 
+`max_criteria` is 15, not the pilot's 6 (2026-10-27): the Brownout tickets each have 8 to 15 small criteria, one per rule or number, and at 6 the factory would have stopped every one of them to propose a split.
+
 ```json
 {
   "linear_project_id": "08057006-6d52-4743-a43c-dfc2370c7a12",
@@ -66,7 +68,7 @@ The entry has no `issues` list (removed 2026-10-27, so new game tickets need no 
   "verification_commands": ["npm run typecheck", "npm test", "npm run build"],
   "test_command": "npm test",
   "escalate_to": "rNavarrete",
-  "max_criteria": 6,
+  "max_criteria": 15,
   "max_ticket_chars": 8000,
   "base": {"branch": "main", "workflow_path": ".github/workflows/ci.yml", "job": "verified", "lookback": 20},
   "worker": ["node 22", "npm ci"]

@@ -124,6 +124,10 @@ class OnboardingTests(unittest.TestCase):
         )
         policies = drafting.load(root / "drafting.json")
         self.assertIn(neon[0].linear_project_id, policies.projects)
+        # The Brownout tickets carry 8 to 15 criteria each (2026-10-27).
+        self.assertEqual(policies.projects[neon[0].linear_project_id].max_criteria, 15)
+        (pilot,) = [p for p in config.projects.values() if p.repository == PILOT]
+        self.assertEqual(policies.projects[pilot.linear_project_id].max_criteria, 6)
 
     def test_the_single_pair_form_still_works(self):
         raw = json.dumps(config()).encode()
