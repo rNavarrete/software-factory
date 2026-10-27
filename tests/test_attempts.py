@@ -388,15 +388,18 @@ class AttemptGateTests(unittest.TestCase):
         self.assertIn("window-fires-high", alerts)
 
     def test_usage_snapshot_gates(self):
+        # A reading is optional (docs/limits.md, amendment 2026-10-27): with none,
+        # or only one older than a week, nothing about usage blocks.
         store = self.make_store()
         gate = AttemptGate(store)
-        self.assertIn(
-            "usage-snapshot-missing", {b.code for b in gate.decide(TASK, DIGEST, NOW).blocks}
-        )
-        gate.record_snapshot(NOW - timedelta(days=8), 0, 10, 0, NOW)
-        self.assertIn(
-            "usage-snapshot-stale", {b.code for b in gate.decide(TASK, DIGEST, NOW).blocks}
-        )
+        decision = gate.decide(TASK, DIGEST, NOW)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.alerts, ())
+        gate.record_snapshot(NOW - timedelta(days=8), 0, 90, 5, NOW)
+        decision = gate.decide(TASK, DIGEST, NOW)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.alerts, ())
+        # A current reading still applies the 75% stop and the alerts.
         gate.record_snapshot(NOW, 0, 80, 0, NOW)
         self.assertIn("usage-high", {b.code for b in gate.decide(TASK, DIGEST, NOW).blocks})
         gate.record_snapshot(NOW, 0, 60, 5, NOW)
@@ -405,6 +408,41 @@ class AttemptGateTests(unittest.TestCase):
         self.assertLessEqual(
             {"usage-high", "usage-credits-spent"}, {a.code for a in decision.alerts}
         )
+
+    def test_a_high_reading_stops_work_for_exactly_seven_days(self):
+        store = self.make_store()
+        gate = AttemptGate(store)
+        gate.record_snapshot(NOW, 0, 80, 0, NOW)
+        week = NOW + timedelta(days=7)
+        self.assertIn("usage-high", {b.code for b in gate.decide(TASK, DIGEST, week).blocks})
+        after = week + timedelta(seconds=1)
+        self.assertTrue(gate.decide(TASK, DIGEST, after).allowed)
+
+    def test_an_old_low_reading_cannot_hide_a_newer_high_one(self):
+        store = self.make_store()
+        gate = AttemptGate(store)
+        gate.record_snapshot(NOW, 0, 80, 0, NOW)
+        gate.record_snapshot(NOW - timedelta(days=2), 0, 5, 0, NOW)
+        self.assertIn("usage-high", {b.code for b in gate.decide(TASK, DIGEST, NOW).blocks})
+
+    def test_without_a_reading_running_out_still_holds_the_factory(self):
+        store = self.make_store()
+        gate = AttemptGate(store)
+        self.run_attempt(TASK, not_launched(400, body="Weekly limit reached"), gate=gate)
+        self.assertIn("hold", {b.code for b in gate.decide(OTHER, DIGEST, NOW).blocks})
+
+    def test_without_a_reading_the_weekly_cap_and_lane_still_apply(self):
+        store = self.make_store()
+        gate = AttemptGate(store)
+        gate.reserve(TASK, DIGEST, NOW)
+        self.assertIn(
+            "unresolved-attempt", {b.code for b in gate.decide(OTHER, DIGEST, NOW).blocks}
+        )
+        store = self.make_store()
+        gate = AttemptGate(store)
+        for i in range(12):
+            self.run_attempt(TaskId(f"seed-{i}"), not_launched(), gate=gate)
+        self.assertIn("window-fire-cap", {b.code for b in gate.decide(TASK, DIGEST, NOW).blocks})
 
     def test_hold_blocks_until_resume_with_a_note(self):
         self.gate.hold("upkeep cap reached", "2h this week", NOW)
@@ -437,6 +475,7 @@ class AttemptGateTests(unittest.TestCase):
     def test_future_dated_snapshot_counts_for_nothing(self):
         store = self.make_store()
         gate = AttemptGate(store)
+        gate.record_snapshot(NOW + timedelta(days=29), 0, 80, 0, NOW + timedelta(days=29))
         with store.writer_lock():
             store.append(
                 LedgerEvent(
@@ -451,7 +490,7 @@ class AttemptGateTests(unittest.TestCase):
                 )
             )
         blocks = {b.code for b in gate.decide(TASK, DIGEST, NOW + timedelta(days=30)).blocks}
-        self.assertIn("usage-snapshot-missing", blocks)
+        self.assertIn("usage-high", blocks)
 
     def test_snapshot_rejects_bad_numbers(self):
         for args in ((0, 101, 0), (0, 10, float("nan")), (0, 10, -1)):

@@ -285,7 +285,7 @@ def _status(c: Controller, task: str | None, now: datetime) -> None:
         print(f"Hold: {reason}")
     snap = view.snapshot
     if snap is None:
-        print("Usage reading: none recorded")
+        print("Usage reading: none recorded (optional)")
     else:
         print(
             f"Usage reading: {snap.taken_at:%Y-%m-%d %H:%M} UTC, session {snap.session_pct:g}%,"
