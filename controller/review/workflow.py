@@ -405,6 +405,10 @@ class ResultRequest:
     claim recorded before request hashes were kept: then nothing counts."""
     criteria: Mapping[str, str]
     """Each acceptance criterion's id and evidence type, from the contract."""
+    checks_only: frozenset[str] = frozenset()
+    """Criteria that only say the checks pass (``verify.criteria.checks_only``).
+    A read-only reviewer can't run the checks, so "cannot tell" is a complete
+    answer for them; the trusted check's result is their evidence."""
 
 
 @dataclass(frozen=True)
@@ -751,7 +755,11 @@ def output_problem(out: Mapping, request: ResultRequest) -> str:
     if extra:
         return f"criteria {', '.join(extra)} are not in the contract"
     for cid, verdict in seen.items():
-        if verdict == "cannot-tell" and request.criteria[cid] == "automated-check":
+        if (
+            verdict == "cannot-tell"
+            and request.criteria[cid] == "automated-check"
+            and cid not in request.checks_only
+        ):
             return f"the reviewer couldn't tell whether {cid} is met"
     areas = {}
     for a in out["areas"]:
