@@ -529,6 +529,25 @@ class JudgeTests(LinearCase):
         self.rolando_moves("ENG-188")
         self.assertIsInstance(self.judge("ENG-188"), Authorization)
 
+    def test_shipped_neon_war_rule_takes_new_tickets_but_not_baseline_or_status(self):
+        from pathlib import Path
+
+        from controller.service import onboarding as ob
+
+        shipped = ob.load(
+            Path(__file__).resolve().parents[1] / "deploy" / "pilot" / "onboarding.json"
+        )
+        (neon,) = [p for p in shipped.projects.values() if p.repository == "rNavarrete/neon-war"]
+        rule = policy_from(shipped).projects[neon.linear_project_id]
+        self.policy = policy(issues=rule.issues, skip_labels=rule.skip_labels)
+        self.rolando_moves("ENG-502")
+        self.assertIsInstance(self.judge("ENG-502"), Authorization)
+        self.rolando_moves("ENG-507", labels=("baseline",))
+        self.assertIsInstance(self.judge("ENG-507"), Refusal)
+        self.world.add(STATUS_KEY, created=SINCE - timedelta(days=1))
+        self.world.move(STATUS_KEY, TODO, NOW - timedelta(minutes=10))
+        self.assertIsNone(self.judge(STATUS_KEY))
+
     def test_ticket_with_a_skip_label_is_refused(self):
         self.policy = policy(skip_labels=frozenset({"baseline"}))
         self.rolando_moves(labels=("baseline", "ux"))

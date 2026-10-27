@@ -115,7 +115,10 @@ class OnboardingTests(unittest.TestCase):
         neon = [p for p in config.projects.values() if p.repository == NEON]
         self.assertEqual(len(neon), 1)
         self.assertEqual(neon[0].routine_id, targets.PILOT_ROUTINE)
-        self.assertEqual(neon[0].issues, frozenset(f"ENG-{n}" for n in range(496, 502)))
+        # Any ticket Rolando moves to Todo (2026-10-27), not a fixed list.
+        self.assertIsNone(neon[0].issues)
+        self.assertIn("baseline", neon[0].skip_labels)
+        self.assertIsNotNone(neon[0].status_issue_id)
         self.assertTrue(
             {"public/art/", "scripts/", "playwright.config.ts"} <= neon[0].protected_paths
         )
