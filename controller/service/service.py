@@ -636,7 +636,9 @@ class Service:
                     Stage.WAITING,
                     f"{what} The factory will start repair attempt {decision.attempt} on its own"
                     f" ({_repairs_left(decision)}), but first it needs to know the earlier worker"
-                    " has stopped, so two workers never write at once. " + clearing_step,
+                    " has stopped, so two workers never write at once. "
+                    + clearing_step
+                    + _questions(decision),
                     pr_url=self._pr_url(item, report.pr),
                 ),
                 now,
@@ -731,12 +733,12 @@ class Service:
                 f"{item.event_id}:repairing:{nxt}",
                 item.issue_id,
                 m.progress(
-                    Stage.WAITING,
+                    Stage.NEEDS_DECISION if decision.questions else Stage.WAITING,
                     f"{what} This is a routine fix within the repair allowance of your Todo"
                     f" move ({_repairs_left(decision)}), so repair attempt {decision.attempt}"
                     " will start when the worker lane is free. The task, its acceptance"
                     " criteria and its checks stay exactly as approved; the new PR gets a"
-                    " fresh review.",
+                    " fresh review." + _questions(decision),
                     pr_url=self._pr_url(item, report.pr),
                 ),
                 now,
@@ -1262,6 +1264,18 @@ def _failed_on(report) -> str:
     return (
         f"Attempt {report.attempt.number}'s PR #{report.pr} failed the independent check on"
         f" commit {report.head[:12]}: {first}{more}."
+    )
+
+
+def _questions(decision: repair_policy.Plan) -> str:
+    """What the review asked Rolando, which the repair leaves to him."""
+    if not decision.questions:
+        return ""
+    names = "; ".join(f"{f.summary} ({f.evidence[:200]})" for f in decision.questions[:3])
+    more = f" (and {len(decision.questions) - 3} more)" if len(decision.questions) > 3 else ""
+    return (
+        f" Meanwhile the review needs you for: {names}{more}. The repair leaves it to you:"
+        " answer it on the PR before you merge."
     )
 
 

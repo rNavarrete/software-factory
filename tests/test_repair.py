@@ -100,11 +100,40 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(category=category):
                 self.assertIsInstance(plan((finding(category=category),)), policy.Plan)
 
-    def test_anything_routed_to_rolando_stops_even_beside_routine_findings(self):
-        out = plan((finding(1), finding(2, category="needs-observation", route="rolando")))
+    def test_a_held_finding_for_rolando_stops_even_beside_routine_findings(self):
+        for category in ("integrity", "review-security", "flag-control-change", "something-new"):
+            with self.subTest(category=category):
+                out = plan((finding(1), finding(2, category=category, route="rolando")))
+                self.assertIsInstance(out, policy.Stop)
+                self.assertEqual(out.code, "needs-rolando")
+                self.assertIn("AC2", out.reason)
+
+    def test_a_question_for_rolando_rides_beside_the_repair(self):
+        # Rolando, 2026-10-27: repair the rest, ask him in parallel.
+        for category in sorted(policy.ASK_IN_PARALLEL):
+            with self.subTest(category=category):
+                question = finding(2, category=category, route="rolando")
+                out = plan((finding(1), question))
+                self.assertIsInstance(out, policy.Plan)
+                self.assertEqual([f.id for f in out.findings], [finding(1).id])
+                self.assertEqual(out.questions, (question,))
+
+    def test_a_question_alone_still_stops_for_rolando(self):
+        out = plan((finding(1, category="review-product", route="rolando"),))
         self.assertIsInstance(out, policy.Stop)
         self.assertEqual(out.code, "needs-rolando")
-        self.assertIn("AC2", out.reason)
+
+    def test_a_question_beside_a_held_finding_still_stops(self):
+        out = plan(
+            (
+                finding(1),
+                finding(2, category="review-product", route="rolando"),
+                finding(3, category="integrity", route="rolando"),
+            )
+        )
+        self.assertEqual(out.code, "needs-rolando")
+        self.assertIn("AC3", out.reason)
+        self.assertNotIn("AC2", out.reason)
 
     def test_protected_and_unknown_categories_are_never_routine(self):
         for category in (
@@ -1103,6 +1132,28 @@ class RepairServiceTests(RepairServiceCase):
         self.assertEqual(self.launched(), 1)
         self.assertEqual(self.authorizer.repair_calls, [])
         self.assertEqual(self.count("only you can settle"), 1)
+
+    def test_a_product_question_rides_beside_the_repair(self):
+        """Rolando 2026-10-27: repair the rest, ask him in parallel."""
+        self.start()
+        question = finding(
+            2,
+            category="review-product",
+            route="rolando",
+            summary="The review could not see context the task refers to",
+            evidence="the linked ENG-502 ticket",
+        )
+        self.review_fails(self.a1, 7, SHA_A, finding(1), question)
+        self.clear(self.a1)
+        self.run_rounds(3)
+        self.assertEqual(self.authorizer.repair_calls, [(self.a2, SHA_A)])
+        self.assertEqual(self.launched(), 2)
+        # The worker gets only the routine finding; Rolando gets the question.
+        envelope = json.loads(self.adapter.requests[1].text)
+        self.assertEqual(envelope["repair"]["findings"], rf.as_data([finding(1)]))
+        self.assertEqual(self.count("Meanwhile the review needs you for"), 1)
+        self.assertEqual(self.count("the linked ENG-502 ticket"), 1)
+        self.assertEqual(self.count("only you can settle"), 0)
 
     def test_a_request_to_weaken_a_test_is_never_repaired(self):
         self.start()
