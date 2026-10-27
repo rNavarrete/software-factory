@@ -513,6 +513,13 @@ class Service:
                     return False
         return self._try_dispatch(item, r, may_fire=may_fire)
 
+    def _launched(self, item: q.Item) -> bool:
+        """Whether an attempt was reserved for this item already."""
+        return any(
+            s.event.kind == gate_events.ATTEMPT_RESERVED and s.seq > item.seq
+            for s in self._store.events(item.task)
+        )
+
     def _try_dispatch(self, item: q.Item, r: TickReport, *, may_fire: bool) -> bool:
         if not may_fire:
             return False
@@ -760,7 +767,9 @@ class Service:
             r.closed.append(item.issue_key)
             return False
         standing = self._standing(item)
-        if standing.reason is None and not standing.in_todo:
+        if standing.reason is None and not standing.in_todo and not self._launched(item):
+            # Before the first launch, leaving Todo withdraws the move. After it,
+            # a started state (the factory's own move to In Progress) stands.
             standing = Standing(withdrawn="the ticket left Todo before the factory started it")
         if standing.reason is not None:
             again = (

@@ -38,7 +38,8 @@ Linear's webhooks would need a public address on the machine, and their payloads
 | What happens | Before the worker starts | After the worker starts |
 |---|---|---|
 | A replayed or overlapping poll | Ignored: same `event_id` | Ignored |
-| Moved out of Todo (to any other state, In Progress included) | The queued item closes with a note, even if someone or something moves it back, and even with a typed approval in force | Nothing more starts for it, repairs included, even if it comes back to Todo quickly. The factory says it can't stop a running worker, explains how to stop it from the routine's run page, and keeps checking GitHub |
+| The worker starts | — | The factory moves the ticket from Todo to the team's started state ("In Progress") with its own Linear key, so the board shows the work (Rolando 2026-10-27). Only a ticket still in Todo is moved. This move of its own doesn't count as leaving Todo: the signer undoes it before judging the move (`without_own_start`), so repairs still start. A later move by anyone else counts as below |
+| Moved out of Todo by anyone but the factory (to any other state, In Progress included) | The queued item closes with a note, even if someone or something moves it back, and even with a typed approval in force | Nothing more starts for it, repairs included, even if it comes back to Todo quickly. The factory says it can't stop a running worker, explains how to stop it from the routine's run page, and keeps checking GitHub |
 | Text edited after the move | The item closes. Moving the ticket out of Todo and back approves the new text | The worker keeps its contract and nothing new starts. One note on the ticket says what changed |
 | Moved out and back into Todo | The newer move replaces the queued one | No second worker. One ticket gets one attempt budget |
 | Blocked by an open ticket | It waits and says what it is waiting for | — |

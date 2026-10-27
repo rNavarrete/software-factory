@@ -22,6 +22,13 @@ What it refuses:
   that key, so outside text quoted in a message can't forge one.
 
 Every body is redacted for secrets and capped in length before it leaves.
+When the worker starts (a message keyed ``...:fired:<run>``), the reporter
+also moves the ticket from Todo to the team's started state ("In Progress"),
+so the board shows what the factory is doing. It moves only a ticket still in
+an unstarted state, never one Rolando moved elsewhere, and the signer ignores
+this move of the factory's own when it checks that his Todo move stands
+(``controller.intake.linear.without_own_start``).
+
 When Linear is down or rate limiting the factory, ``post`` raises
 ``ReportFailed(hold_all=True)`` and the service stops posting for the round.
 
@@ -65,6 +72,23 @@ mutation($input: CommentCreateInput!) {
   commentCreate(input: $input) { success comment { id } }
 }
 """
+STATE_QUERY = """
+query($id: String!) {
+  issue(id: $id) {
+    id
+    state { id name type }
+    team { states { nodes { id name type position } } }
+  }
+}
+"""
+START_MUTATION = """
+mutation($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) { success }
+}
+"""
+STARTED_MARK = ":fired:"
+"""Keys of the message posted when a worker starts."""
+STARTED_NAME = "In Progress"
 _KEY_SPACE_RE = re.compile(r"\s+")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -188,6 +212,36 @@ class LinearReporter:
         me = self.viewer()
         issue_id = self.issue_uuid(issue_id)
         key = clean_key(key)
+        self._comment(issue_id, key, text, me)
+        if STARTED_MARK in key:
+            self._start(issue_id)
+
+    def _start(self, issue_id: str) -> None:
+        """Move the ticket from Todo to the team's started state. Linear down
+        raises, so the message is retried; anything else is left alone: the
+        comment already says the worker started."""
+        try:
+            issue = self._call(STATE_QUERY, {"id": issue_id}).get("issue")
+            if not isinstance(issue, Mapping):
+                return
+            state = issue.get("state") or {}
+            if not isinstance(state, Mapping) or state.get("type") != "unstarted":
+                return  # Rolando moved it on, or it is already started
+            nodes = ((issue.get("team") or {}).get("states") or {}).get("nodes") or []  # type: ignore[union-attr]
+            started = sorted(
+                (n for n in nodes if isinstance(n, Mapping) and n.get("type") == "started"),
+                key=lambda n: (n.get("name") != STARTED_NAME, n.get("position") or 0),
+            )
+            if not started:
+                return
+            self._call(
+                START_MUTATION, {"id": issue_id, "input": {"stateId": str(started[0]["id"])}}
+            )
+        except ReportFailed as e:
+            if e.hold_all:
+                raise
+
+    def _comment(self, issue_id: str, key: str, text: str, me: str) -> None:
         cid = comment_id(issue_id, key)
         if self._exists(cid, issue_id, me):
             return

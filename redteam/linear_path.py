@@ -926,10 +926,17 @@ def _reporter_as_rolando(attack: bool) -> Observed:
     return Observed(False, f"{linear.creates()} comment(s) posted")
 
 
+_START_WRITER = "controller/report/reporter.py"
+"""The one file allowed a state write: moving a started ticket to In Progress
+(Rolando 2026-10-27). Anything else there, or that write anywhere else, fails."""
+
+
 def _only_comments(root: Path | None = None) -> Observed:
-    """Nothing in the controller can move a ticket, change its labels or edit
-    its text: the only Linear write it has is creating a comment. A label or
-    state the factory set would change the ticket under Rolando's move."""
+    """Nothing in the controller can change its labels or edit its text, or move
+    it anywhere except the reporter moving it from Todo to In Progress when the
+    worker starts (Rolando 2026-10-27; the signer undoes that move of its own,
+    ``without_own_start``). A label, text or other state the factory set would
+    change the ticket under Rolando's move."""
     root = root or Path(__file__).resolve().parent.parent / "controller"
     found: dict[str, list[str]] = {}
     for path in sorted(root.rglob("*.py")):
@@ -939,7 +946,10 @@ def _only_comments(root: Path | None = None) -> Observed:
         for word in ("issueUpdate", "issueAddLabel", "issueRemoveLabel", "stateId", "labelIds"):
             if word in text:
                 found.setdefault(word, []).append(path.relative_to(root.parent).as_posix())
-    others = {k: v for k, v in found.items() if k != "commentCreate"}
+    allowed = {"commentCreate"} | {
+        k for k in ("issueUpdate", "stateId") if set(found.get(k, ())) == {_START_WRITER}
+    }
+    others = {k: v for k, v in found.items() if k not in allowed}
     if others:
         return Observed(False, f"other Linear writes: {others}")
     if "commentCreate" not in found:
@@ -1404,7 +1414,8 @@ LINEAR_CASES: tuple[Case, ...] = (
         "factory-only-writes-comments",
         F,
         "Any controller code that would move a ticket, change its labels or edit its text.",
-        "None exists: the only Linear write is creating a comment.",
+        "None exists: the Linear writes are creating a comment and, in the reporter only,"
+        " moving a started ticket to In Progress.",
         "controller/ (source scan for Linear mutations)",
         lambda: _only_comments(),
     ),

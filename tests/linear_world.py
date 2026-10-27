@@ -27,6 +27,16 @@ T0 = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
+WORKFLOW = (
+    {"id": "st-backlog", "name": "Backlog", "type": "backlog", "position": 0},
+    {"id": "st-todo", "name": "Todo", "type": "unstarted", "position": 1},
+    {"id": "st-review", "name": "In Review", "type": "started", "position": 3},
+    {"id": "st-progress", "name": "In Progress", "type": "started", "position": 2},
+    {"id": "st-done", "name": "Done", "type": "completed", "position": 4},
+)
+"""A team's workflow states, In Review listed before In Progress on purpose."""
+
+
 def issue_uuid(name: str) -> str:
     """The fake's UUID for a ticket named by key (or anything else)."""
     if _UUID_RE.fullmatch(name):
@@ -95,6 +105,13 @@ class FakeLinear:
     """Ticket names Linear answers "not found" for."""
     refuse_lookup: LinearRefused | None = None
     """Raised by every comment lookup by id while set."""
+    states: dict[str, Mapping[str, object]] = field(default_factory=dict)
+    """issue uuid -> its workflow state; a ticket not listed is in Todo."""
+    team_states: list[Mapping[str, object]] = field(
+        default_factory=lambda: [dict(s) for s in WORKFLOW]
+    )
+    refuse_update: LinearRefused | None = None
+    """Raised by every issueUpdate while set."""
     _clock: int = 0
 
     # --- the transport -----------------------------------------------------------
@@ -115,6 +132,22 @@ class FakeLinear:
             if self.refuse_lookup is not None:
                 raise self.refuse_lookup
             return self._lookup(str(variables["id"]))
+        if "issueUpdate" in query:
+            if self.refuse_update is not None:
+                raise self.refuse_update
+            issue = self.resolve(str(variables["id"]))
+            sid = variables["input"]["stateId"]  # type: ignore[index]
+            self.states[issue] = next(x for x in self.team_states if x["id"] == sid)
+            return {"issueUpdate": {"success": True}}
+        if "issue(id" in query and "state {" in query:
+            issue = self.resolve(str(variables["id"]))
+            return {
+                "issue": {
+                    "id": issue,
+                    "state": dict(self.state_of(issue)),
+                    "team": {"states": {"nodes": [dict(x) for x in self.team_states]}},
+                }
+            }
         if "issue(id" in query:
             return {"issue": {"id": self.resolve(str(variables["id"]))}}
         raise AssertionError(f"unexpected query: {query}")
@@ -135,6 +168,12 @@ class FakeLinear:
                 "user": {"id": c.user_id} if c.user_id else None,
             }
         }
+
+    def state_of(self, issue: str) -> Mapping[str, object]:
+        return self.states.get(issue_uuid(issue), WORKFLOW[1])
+
+    def updates(self) -> int:
+        return sum(1 for q, _ in self.calls if "issueUpdate" in q)
 
     def resolve(self, name: str) -> str:
         if name in self.missing_issues:

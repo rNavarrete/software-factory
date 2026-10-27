@@ -59,7 +59,15 @@ from controller.signer.authorize import (
 from controller.signer.signer import SignerAuthorizer, authorize_handler
 from tests.test_approval import yes
 from tests.test_attempts import MemoryLedger, launched
-from tests.test_intake_linear import BACKLOG, CLAUDE_BOT, IN_PROGRESS, MARIA, TODO, FakeLinear
+from tests.test_intake_linear import (
+    BACKLOG,
+    CLAUDE_BOT,
+    FACTORY_USER,
+    IN_PROGRESS,
+    MARIA,
+    TODO,
+    FakeLinear,
+)
 from tests.test_intake_service import (
     APPROVER as LINEAR_APPROVER,
 )
@@ -284,6 +292,25 @@ class AuthorizerTests(AuthorizerCase):
 
     def test_move_out_of_todo_is_refused(self):
         eid = self.move(ago=timedelta(minutes=10))
+        self.world.move("ENG-187", BACKLOG, NOW - timedelta(minutes=1))
+        self.assertTrue(self.refused(eid).final)
+
+    def test_the_factorys_own_move_to_in_progress_still_stands(self):
+        """Rolando 2026-10-27: the factory moves a started ticket to In Progress."""
+        eid = self.move(ago=timedelta(minutes=10))
+        factory = {"id": FACTORY_USER, "name": "Software Factory", "app": True}
+        self.world.move("ENG-187", IN_PROGRESS, NOW - timedelta(minutes=2), actor=factory)
+        self.authorize(eid)
+
+    def test_anyone_elses_move_to_in_progress_is_refused(self):
+        eid = self.move(ago=timedelta(minutes=10))
+        self.world.move("ENG-187", IN_PROGRESS, NOW - timedelta(minutes=2), actor=MARIA)
+        self.assertTrue(self.refused(eid).final)
+
+    def test_a_move_after_the_factorys_own_still_counts(self):
+        eid = self.move(ago=timedelta(minutes=10))
+        factory = {"id": FACTORY_USER, "name": "Software Factory", "app": True}
+        self.world.move("ENG-187", IN_PROGRESS, NOW - timedelta(minutes=3), actor=factory)
         self.world.move("ENG-187", BACKLOG, NOW - timedelta(minutes=1))
         self.assertTrue(self.refused(eid).final)
 
