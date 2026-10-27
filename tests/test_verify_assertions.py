@@ -1241,6 +1241,39 @@ class FlagsForHumanReviewTest(unittest.TestCase):
         self.assertIn("not traced to code imported from the product", flag.detail)
         self.assertEqual(flag.criterion, "ac1")
 
+    def test_a_helper_s_own_variable_does_not_hide_the_test_s(self):
+        # ENG-503 PR #13: a helper's `let p = play` was read as an assignment of
+        # the test's own `p`, so `p = reading(shelf)` looked untraced.
+        helper = (
+            "\nfunction reading(list: Book[]) {\n"
+            "  let r = list;\n"
+            "  r = filterByStatus(r, 'reading');\n"
+            "  return r;\n"
+            "}\n"
+        )
+        body = "    const r = reading(shelf);\n    expect(r.map((b) => b.id)).toEqual(['2']);"
+        text = probe_file(probe_test(body)).replace(
+            "\ndescribe('probe'", helper + "\ndescribe('probe'", 1
+        )
+        quote = "expect(r.map((b) => b.id)).toEqual(['2'])"
+        report = run(
+            text,
+            links=[link("ac1", test=PROBE, assertion=quote), link("ac2")],
+            proofs=[proof("ac1", test=PROBE), proof("ac2")],
+        )
+        self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
+        self.assertNotIn(f"fixture-only:{TEST_FILE} > {PROBE}", open_keys(report))
+        # A helper that never calls the product is still caught.
+        fake = text.replace(
+            "filterByStatus(r, 'reading')", "r.filter((b) => b.status === 'reading')"
+        )
+        report = run(
+            fake,
+            links=[link("ac1", test=PROBE, assertion=quote), link("ac2")],
+            proofs=[proof("ac1", test=PROBE), proof("ac2")],
+        )
+        self.assertIn(f"fixture-only:{TEST_FILE} > {PROBE}", open_keys(report))
+
     def test_product_name_only_in_a_comment_or_property_does_not_count(self):
         body = (
             "    // filterByStatus(shelf, 'reading')\n"
