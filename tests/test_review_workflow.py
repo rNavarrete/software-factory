@@ -14,6 +14,7 @@ import tempfile
 import unittest
 import urllib.error
 import zipfile
+from dataclasses import replace
 from datetime import timedelta
 from email.message import Message
 from pathlib import Path
@@ -1173,6 +1174,26 @@ class ProofAndSelectionTests(Case):
         req = ResultRequest(self.key(), "r/p", 1, "d", fx.HEAD, "b", "m", (), frozenset(), {})
         weird = honest_output(self.key(), limits=[{"criterion": "x", "reason": "y", "path": 5}])
         self.assertIsInstance(output_problem(weird, req), str)
+
+    def test_cannot_tell_is_complete_only_for_a_checks_only_criterion(self):
+        from controller.review.workflow import ResultRequest, output_problem
+
+        kinds = {"ac1": "automated-check", "ac2": "automated-check", "ac3": "observable-behavior"}
+        out = honest_output(
+            "k",
+            criteria=[
+                {"criterion": "ac1", "verdict": "met", "reasoning": "ok"},
+                {"criterion": "ac2", "verdict": "cannot-tell", "reasoning": "can't run checks"},
+                {"criterion": "ac3", "verdict": "cannot-tell", "reasoning": "person"},
+            ],
+        )
+        plain = ResultRequest("k", "r/p", 1, "d", fx.HEAD, "b", "m", (), frozenset(), kinds)
+        self.assertIn("ac2", output_problem(out, plain))
+        checks = replace(plain, checks_only=frozenset({"ac2"}))
+        self.assertEqual(output_problem(out, checks), "")
+        # It never excuses a different automated criterion.
+        other = replace(plain, checks_only=frozenset({"ac1"}))
+        self.assertIn("ac2", output_problem(out, other))
 
     def test_a_newer_failed_run_doesnt_hide_a_good_one(self):
         r = self.started()

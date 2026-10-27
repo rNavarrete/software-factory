@@ -77,5 +77,7 @@ The entry has no `issues` list (removed 2026-10-27, so new game tickets need no 
 
 ## Known limits
 
+- **"All checks pass" lines.** Each Brownout ticket ends with one. No single test can show it, so since 2026-10-27 the verifier counts the trusted check's overall result (`npm run check` in CI) as its evidence, and the Codex review may answer "cannot tell" for it (`verify.criteria.checks_only`). A line that adds anything beyond a short list of check names is an ordinary criterion and still needs a linked test.
+
 - **Playwright tests aren't linked evidence yet.** The verifier and the Codex review link criteria only to Vitest files (`tests/**/*.test.ts`, run by `npm test`). Neon War's Playwright suite still runs in CI inside `npm run check`, so a failing browser test fails the PR, but a criterion about what the player sees is checked by Rolando's observation (the CI screenshots), not by a linked Playwright assertion. Teaching the verifier about `tests/browser/*.spec.ts` is a follow-up.
 - **One worker at a time.** A neon-war ticket waits while a pilot worker holds the lane, and the other way round. The lane frees itself once a PR has gone quiet for 30 minutes.

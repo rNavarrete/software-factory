@@ -85,6 +85,7 @@ from verify.criteria import (
     Report,
     TrustPolicy,
     Verdict,
+    checks_only,
 )
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -2200,6 +2201,22 @@ def _criterion(c, v, candidate, links, head, parse, proofs, limits, policy, igno
         return CriterionCoverage(
             status=Coverage.FAILED if v.verdict is Verdict.FAIL else Coverage.UNKNOWN,
             reasons=v.reasons or ("no independent observation shows it on this revision",),
+            **base_entry,
+        ), []
+
+    if checks_only(c["statement"]):
+        # No single test shows "the checks pass"; the trusted check's overall
+        # result on this commit does (verify.criteria.CHECKS_COMMAND).
+        if v.verdict is Verdict.PASS:
+            return CriterionCoverage(
+                status=Coverage.COVERED,
+                observations=v.citations,
+                limits=("shown by the trusted check's overall result, not by one test",),
+                **base_entry,
+            ), []
+        return CriterionCoverage(
+            status=Coverage.FAILED if v.verdict is Verdict.FAIL else Coverage.UNKNOWN,
+            reasons=v.reasons or ("the trusted check has no passing result on this commit",),
             **base_entry,
         ), []
 

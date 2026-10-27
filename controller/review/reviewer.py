@@ -77,7 +77,7 @@ from controller.review.workflow import (
     request_hash,
 )
 from controller.service.seams import PullRequestRef
-from verify.criteria import DEFAULT_POLICY, TrustPolicy, _login_key
+from verify.criteria import DEFAULT_POLICY, TrustPolicy, _login_key, checks_only
 from verify.findings import (
     Finding,
     Route,
@@ -467,6 +467,9 @@ class AutoReviewer:
         criteria = {
             str(c["id"]): str(c["evidence"]["type"]) for c in contract["acceptance_criteria"]
         }
+        checks = frozenset(
+            str(c["id"]) for c in contract["acceptance_criteria"] if checks_only(c["statement"])
+        )
         return self._results.find(
             ResultRequest(
                 key=key,
@@ -479,6 +482,7 @@ class AutoReviewer:
                 claimed=job.claims,
                 requests=frozenset(job.requests),
                 criteria=criteria,
+                checks_only=checks,
             )
         )
 

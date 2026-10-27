@@ -2442,5 +2442,85 @@ class BypassFollowUpTest(ProbeCase):
         self.assertIn("moved: const B = 2;", detail)
 
 
+class ChecksOnlyCriterionTest(unittest.TestCase):
+    """A criterion that only says the checks pass is shown by the trusted check's
+    overall result, not by a linked test (2026-10-27, ENG-502's last line)."""
+
+    def contract_with(self, statement):
+        raw = json.loads(EXAMPLE.read_text())
+        raw["acceptance_criteria"][1]["statement"] = statement
+        c = freeze(raw)
+        return c, digest(c)
+
+    def report(self, statement, overall=0):
+        c, approved = self.contract_with(statement)
+        cand = candidate(approved)
+        fresh = str(approved)
+        results = all_green(c)
+        if overall is not None:
+            results.append(ci("npm run check", exit_code=overall))
+        return run(
+            links=[link("ac1", contract_digest=fresh)],
+            proofs=[proof("ac1", contract_digest=fresh)],
+            clearances=[clearance(contract_digest=fresh)],
+            cand=cand,
+            verification=eng156(cand, results=results, contract=c, approved=approved),
+            contract=c,
+            approved=approved,
+        )
+
+    LINE = "All checks pass: typecheck, `npm test`, build, `test:browser`."
+
+    def test_a_green_overall_check_covers_it_without_a_link(self):
+        report = self.report(self.LINE)
+        ac2 = cov(report, "ac2")
+        self.assertEqual(ac2.status, Coverage.COVERED)
+        self.assertEqual(ac2.assertions, ())
+        self.assertIn("npm run check", ac2.observations[0].detail)
+        self.assertTrue(report.ready, report.blockers)
+
+    def test_a_failed_overall_check_fails_it(self):
+        self.assertEqual(cov(self.report(self.LINE, overall=1), "ac2").status, Coverage.FAILED)
+
+    def test_no_overall_result_leaves_it_unknown(self):
+        report = self.report(self.LINE, overall=None)
+        self.assertEqual(cov(report, "ac2").status, Coverage.UNKNOWN)
+        self.assertFalse(report.ready)
+
+    def test_green_steps_alone_do_not_cover_it(self):
+        # typecheck, test and build green, but the overall check (e2e too) not run.
+        self.assertNotEqual(
+            cov(self.report(self.LINE, overall=None), "ac2").status, Coverage.COVERED
+        )
+
+    def test_a_line_that_asks_for_more_still_needs_a_test(self):
+        report = self.report("All checks pass and filterByStatus(books, 'all') returns every book.")
+        self.assertEqual(cov(report, "ac2").status, Coverage.UNCOVERED)
+
+    def test_which_lines_count_as_checks_only(self):
+        from verify.criteria import checks_only
+
+        for line in (
+            self.LINE,
+            "All checks pass.",
+            "The checks pass",
+            "all checks pass in CI",
+            "All repo checks pass: lint and npm run build",
+        ):
+            with self.subTest(line):
+                self.assertTrue(checks_only(line))
+        for line in (
+            "",
+            "Checks pass even when the server is offline",
+            "All checks pass and demandAt returns 30",
+            "All checks pass: typecheck; also add a README section",
+            "All checks pass: the new demand function returns thirty everywhere",
+            "All checks pass (typecheck)",
+            "filterByStatus(books, 'all') returns every book.",
+        ):
+            with self.subTest(line):
+                self.assertFalse(checks_only(line))
+
+
 if __name__ == "__main__":
     unittest.main()

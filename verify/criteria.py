@@ -610,8 +610,10 @@ def _criterion(c, trusted, observations, claims) -> CriterionVerdict:
     cid, ev = c["id"], c["evidence"]
     kind = ev["type"]
     if kind == "automated-check":
-        verdict, citations, why = _command_verdict(ev["command"], trusted)
-        reasons = () if verdict is Verdict.PASS else (f"`{ev['command']}` {why}",)
+        # A line that only says the checks pass is shown by the whole check.
+        command = CHECKS_COMMAND if checks_only(c["statement"]) else ev["command"]
+        verdict, citations, why = _command_verdict(command, trusted)
+        reasons = () if verdict is Verdict.PASS else (f"`{command}` {why}",)
         # A reviewer who saw it fail outweighs a green command.
         failed = [o for o in observations if o.criterion == cid and o.verdict is Verdict.FAIL]
         if failed:
@@ -692,6 +694,36 @@ def _claims_for(cid: str, verdict: Verdict, claims: Sequence[WriterClaim]) -> tu
 # --- Reading the pilot's check evidence ----------------------------------------
 
 # The pilot's scripts/check.mjs step names, and the contract commands they are.
+CHECKS_COMMAND = "npm run check"
+"""The overall outcome of the trusted check, as ``results_from_check_evidence``
+reports it: every required step passed."""
+
+_CHECKS_ONLY_RE = re.compile(
+    r"(?:all\s+)?(?:of\s+)?(?:the\s+)?(?:repo(?:sitory)?\s+|project\s+|ci\s+)?checks\s+pass"
+    r"(?:\s+in\s+ci)?(?:\s*:\s*(?P<items>[^.;()]*?))?\s*\.?",
+    re.IGNORECASE,
+)
+_CHECK_ITEM_RE = re.compile(r"[a-z][\w:.\-]*(?: [a-z][\w:.\-]*){0,2}", re.IGNORECASE)
+
+
+def checks_only(statement: str) -> bool:
+    """Does this criterion only say that the project's checks pass?
+
+    Such a line ("All checks pass: typecheck, `npm test`, build") names no
+    behaviour a single test could show; the trusted check's overall result is
+    its evidence. Anything more than a short list of check names after it
+    makes it an ordinary criterion."""
+    m = _CHECKS_ONLY_RE.fullmatch(statement.strip())
+    if m is None:
+        return False
+    items = m.group("items")
+    if items is None:
+        return True
+    parts = [x.strip().strip("`").strip() for x in re.split(r",|\band\b", items)]
+    parts = [x for x in parts if x]
+    return bool(parts) and all(_CHECK_ITEM_RE.fullmatch(x) for x in parts)
+
+
 PILOT_STEP_COMMANDS = {
     "typecheck": "npm run typecheck",
     "test": "npm test",
