@@ -25,7 +25,7 @@ Every entry the factory posts opens with a bold stage:
 
 The newest entry is where the work stands. Each entry is posted once, on a change; there are no routine check-ins.
 
-The factory does not change the team's states or add labels. It must not overwrite a state Rolando set, and intake (ENG-174) pins a ticket's labels as part of the text he approved, so a label added by the factory would cancel his own Todo move. The Engineering team has no "In Review" state either. The stage in the comments stands in for both.
+The factory changes one state and adds no labels. When a worker starts, it moves the ticket from Todo to the team's started state ("In Progress"), so the board matches the work (Rolando 2026-10-27). It moves only a ticket still in Todo, and the signer ignores that move of its own when it checks his Todo move again (docs/intake.md). It changes no other state: it must not overwrite a state Rolando set, and intake (ENG-174) pins a ticket's labels as part of the text he approved, so a label added by the factory would cancel his own Todo move. The Engineering team has no "In Review" state either. The stage in the comments stands in for both.
 
 ## Each message is posted once
 

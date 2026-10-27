@@ -22,6 +22,7 @@ from tests.linear_world import (
     FACTORY,
     OTHER,
     ROLANDO,
+    WORKFLOW,
     FakeLinear,
     Opener,
     http_error,
@@ -571,3 +572,63 @@ class ProbeTests(unittest.TestCase):
         self.assertFalse(marker_survived(stored(lost), issue, FACTORY))
         other = render(f"x\n\n{QUESTION_MARK} not-probe options=-", key)
         self.assertFalse(marker_survived(stored(other), issue, FACTORY))
+
+
+class StartedTests(unittest.TestCase):
+    """Rolando 2026-10-27: when the worker starts, the ticket goes to In Progress."""
+
+    FIRED = "evt-1:fired:eng-187-a1-f1"
+
+    def setUp(self) -> None:
+        self.linear = FakeLinear()
+
+    def state(self) -> object:
+        return self.linear.state_of(ISSUE)["name"]
+
+    def test_the_worker_starting_moves_a_todo_ticket_to_in_progress(self) -> None:
+        reporter(self.linear).post(ISSUE, self.FIRED, text())
+        self.assertEqual(len(self.linear.on(ISSUE)), 1)
+        self.assertEqual(self.state(), "In Progress")
+
+    def test_other_messages_leave_the_state_alone(self) -> None:
+        reporter(self.linear).post(ISSUE, "evt-1:summary:abc", text())
+        self.assertEqual(self.state(), "Todo")
+        self.assertEqual(self.linear.updates(), 0)
+
+    def test_a_ticket_rolando_moved_on_is_not_moved(self) -> None:
+        for name in ("Backlog", "In Review", "Done"):
+            with self.subTest(name=name):
+                linear = FakeLinear()
+                linear.states[ISSUE] = next(x for x in WORKFLOW if x["name"] == name)
+                reporter(linear).post(ISSUE, self.FIRED, text())
+                self.assertEqual(linear.state_of(ISSUE)["name"], name)
+                self.assertEqual(linear.updates(), 0)
+
+    def test_a_retry_moves_it_once(self) -> None:
+        r = reporter(self.linear)
+        r.post(ISSUE, self.FIRED, text())
+        r.post(ISSUE, self.FIRED, text())
+        self.assertEqual(self.linear.updates(), 1)
+        self.assertEqual(len(self.linear.on(ISSUE)), 1)
+
+    def test_a_refused_move_still_counts_the_message_as_posted(self) -> None:
+        self.linear.refuse_update = LinearRefused("not allowed", "FORBIDDEN")
+        reporter(self.linear).post(ISSUE, self.FIRED, text())
+        self.assertEqual(len(self.linear.on(ISSUE)), 1)
+        self.assertEqual(self.state(), "Todo")
+
+    def test_linear_down_during_the_move_is_retried(self) -> None:
+        r = reporter(self.linear)
+        self.linear.refuse_update = LinearDown("Linear answered HTTP 503")  # type: ignore[assignment]
+        with self.assertRaises(ReportFailed) as cm:
+            r.post(ISSUE, self.FIRED, text())
+        self.assertTrue(cm.exception.hold_all)
+        self.linear.refuse_update = None
+        r.post(ISSUE, self.FIRED, text())
+        self.assertEqual(self.state(), "In Progress")
+        self.assertEqual(len(self.linear.on(ISSUE)), 1)
+
+    def test_without_an_in_progress_state_the_first_started_state_is_used(self) -> None:
+        self.linear.team_states = [x for x in WORKFLOW if x["name"] != "In Progress"]
+        reporter(self.linear).post(ISSUE, self.FIRED, text())
+        self.assertEqual(self.state(), "In Review")

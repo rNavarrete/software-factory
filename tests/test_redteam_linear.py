@@ -56,6 +56,16 @@ class LinearCasesTest(unittest.TestCase):
             root.mkdir()
             (root / "report.py").write_text('Q = "mutation { commentCreate(input: $i) { id } }"')
             self.assertTrue(lp._only_comments(root).blocked)
+            # The reporter's own move to In Progress is the one allowed state write.
+            (root / "report").mkdir()
+            (root / "report" / "reporter.py").write_text(
+                'Q = "mutation($id: String!, $i: IssueUpdateInput!) { issueUpdate(id: $id) }"'
+                '\nV = {"stateId": started}'
+            )
+            self.assertTrue(lp._only_comments(root).blocked)
+            (root / "report" / "reporter.py").write_text('V = {"labelIds": []}')
+            self.assertFalse(lp._only_comments(root).blocked)
+            (root / "report" / "reporter.py").unlink()
             for planted in (
                 'Q = "mutation($i: IssueUpdateInput!) { issueUpdate(input: $i) { id } }"',
                 'Q = "mutation { issueAddLabel(id: $id, labelId: $l) { success } }"',

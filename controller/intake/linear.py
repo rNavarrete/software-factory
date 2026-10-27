@@ -311,6 +311,34 @@ def _stands_in(state: State, policy: IntakePolicy) -> bool:
     return state.type == "started"
 
 
+def without_own_start(t: Ticket, factory_id: str, policy: IntakePolicy) -> Ticket:
+    """The ticket as it was before the factory moved it from Todo to a started
+    state itself when its worker began (controller.report.reporter). Only that
+    move is undone, and only while it is the last state change: if anyone moved
+    the ticket after it, the ticket is returned as it is. Undoing the factory's
+    own move can't make a move into Todo appear: it only removes one."""
+    own = [
+        c
+        for c in t.changes
+        if c.actor_id == factory_id
+        and c.from_state is not None
+        and c.from_state.name == policy.todo
+        and c.to_state is not None
+        and c.to_state.type == "started"
+    ]
+    if not own or t.state.type != "started" or t.state.id != own[-1].to_state.id:  # type: ignore[union-attr]
+        return t
+    first = own[0]
+    if any(c.at >= first.at and c.to_state is not None and c not in own for c in t.changes):
+        return t
+    return replace(
+        t,
+        state=first.from_state,  # type: ignore[arg-type]
+        changes=tuple(c for c in t.changes if c not in own),
+        spans=tuple(sp for sp in t.spans if sp.started_at < first.at - CLOCK),
+    )
+
+
 def judge(t: Ticket, policy: IntakePolicy, now: datetime) -> Authorization | Refusal | None:
     """The ticket's latest Todo move as an authorization, a refusal, or None
     (nothing to say yet: no new move, it left Todo again, or it is settling)."""
@@ -878,4 +906,5 @@ __all__: Sequence[str] = [
     "policy_from",
     "revision",
     "standing",
+    "without_own_start",
 ]

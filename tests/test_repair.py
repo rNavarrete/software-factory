@@ -44,7 +44,7 @@ from controller.service.seams import AuthorizationRefused, FailureReport, Failur
 from controller.signer.authorize import Refused, event_from_json, event_to_json
 from controller.signer.signer import REPAIR_OP, SignerAuthorizer, authorize_handler
 from tests.test_approval import yes
-from tests.test_intake_linear import BACKLOG
+from tests.test_intake_linear import BACKLOG, FACTORY_USER, IN_PROGRESS
 from tests.test_recovery import REPO, SHA_A, SHA_B
 from tests.test_repair_allowance import SINCE as REPAIR_SINCE
 from tests.test_repair_allowance import repair_config
@@ -402,6 +402,19 @@ class SignerRepairTests(RepairSignerCase):
     def test_refuses_once_the_ticket_left_todo_or_changed(self):
         self.first_attempt()
         self.world.move("ENG-187", BACKLOG, self.now - timedelta(minutes=1))
+        self.assertTrue(self.use_refused().final)
+
+    def test_signs_after_the_factory_moved_the_ticket_to_in_progress(self):
+        """Rolando 2026-10-27: the worker starting moves the ticket to In Progress;
+        that move of the factory's own keeps the repair allowance."""
+        self.first_attempt()
+        factory = {"id": FACTORY_USER, "name": "Software Factory", "app": True}
+        self.world.move("ENG-187", IN_PROGRESS, self.now - timedelta(minutes=1), actor=factory)
+        self.assertEqual(self.use().attempt, self.a2)
+
+    def test_refuses_once_someone_else_moved_it_to_in_progress(self):
+        self.first_attempt()
+        self.world.move("ENG-187", IN_PROGRESS, self.now - timedelta(minutes=1))
         self.assertTrue(self.use_refused().final)
 
     def test_refuses_when_the_ticket_text_changed(self):
@@ -1120,6 +1133,20 @@ class RepairServiceTests(RepairServiceCase):
         self.tick(minutes=6)
         self.assertEqual(self.authorizer.repair_calls, [])
         self.assertEqual(self.launched(), 1)
+
+    def test_the_factorys_own_move_to_in_progress_keeps_the_repair(self):
+        """Rolando 2026-10-27: the reporter moves the ticket to In Progress once
+        the worker starts; the automatic repair still goes ahead."""
+        eid = self.start()
+        factory = {"id": FACTORY_USER, "name": "Software Factory", "app": True}
+        self.linear.move("ENG-187", IN_PROGRESS, self.now + timedelta(minutes=1), actor=factory)
+        self.review_fails(self.a1, 7, SHA_A)
+        self.clear(self.a1)
+        self.run_rounds(2)
+        self.assertEqual(self.authorizer.repair_calls, [(self.a2, SHA_A)])
+        self.assertEqual(self.launched(), 2)
+        self.assertIsNone(self.item(eid).withdrawn)
+        self.assertIsNone(self.item(eid).closed)
 
     def test_ticket_leaving_todo_while_the_worker_runs_stops_repairs(self):
         eid = self.start()

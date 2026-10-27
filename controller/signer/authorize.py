@@ -52,7 +52,7 @@ from controller.approval.approval import (
     sign_source_repair,
 )
 from controller.attempts.events import SOURCE_REPAIR_AUTHORIZED
-from controller.intake.linear import IntakeBlocked, Ticket, judge, policy_from
+from controller.intake.linear import IntakeBlocked, Ticket, judge, policy_from, without_own_start
 from controller.interfaces import AttemptId, LedgerEvent, TaskId
 from controller.repair import findings as repair_findings
 from controller.service.onboarding import Onboarding, OnboardingError
@@ -410,7 +410,9 @@ class TodoMoveAuthorizer:
             )
         if ticket is None:
             raise Refused("the ticket is gone", final=True)
-        verdict = judge(ticket, policy, now)
+        # The factory moves the ticket to In Progress when its worker starts;
+        # that move of its own doesn't withdraw Rolando's Todo move.
+        verdict = judge(without_own_start(ticket, viewer, policy), policy, now)
         if not isinstance(verdict, Authorization) or verdict.event_id != event_id:
             reason = getattr(verdict, "reason", None) or (
                 "the ticket's latest Todo move is not this one, or it doesn't stand any more"

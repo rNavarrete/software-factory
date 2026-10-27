@@ -83,3 +83,4 @@ The entry has no `issues` list (removed 2026-10-27, so new game tickets need no 
 
 - **Playwright tests aren't linked evidence yet.** The verifier and the Codex review link criteria only to Vitest files (`tests/**/*.test.ts`, run by `npm test`). Neon War's Playwright suite still runs in CI inside `npm run check`, so a failing browser test fails the PR, but a criterion about what the player sees is checked by Rolando's observation (the CI screenshots), not by a linked Playwright assertion. Teaching the verifier about `tests/browser/*.spec.ts` is a follow-up.
 - **One worker at a time.** A neon-war ticket waits while a pilot worker holds the lane, and the other way round. The lane frees itself once a PR has gone quiet for 30 minutes.
+- **In Progress is the factory's.** When a worker starts, the factory moves the ticket from Todo to In Progress itself. Leave it there: moving it anywhere else yourself still withdraws the approval and stops repairs.
