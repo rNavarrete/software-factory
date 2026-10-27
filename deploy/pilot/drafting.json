@@ -53,7 +53,7 @@
       "verification_commands": ["npm run typecheck", "npm test", "npm run build"],
       "test_command": "npm test",
       "escalate_to": "rNavarrete",
-      "max_criteria": 6,
+      "max_criteria": 15,
       "max_ticket_chars": 8000,
       "base": {
         "branch": "main",
