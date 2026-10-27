@@ -13,7 +13,7 @@ from controller import contract as contracts
 from controller.loop.collect import GitHubUnreadable, NotFound
 from controller.prepare import base as bases
 from controller.prepare import policy as policies
-from controller.prepare.drafter import RuleDrafter
+from controller.prepare.drafter import KIND_LOGIC, KIND_UI, RuleDrafter, kind_of
 from controller.prepare.preparer import LinearTicketReader, Preparer, assemble
 from controller.prepare.review import review
 from controller.prepare.ticket import Snapshot, clean, read, revision
@@ -178,6 +178,13 @@ class SampleTests(unittest.TestCase):
 
     def test_ui_sample(self):
         self.check_sample("clear-finished")
+
+    def test_unit_tests_marker_wins_over_ui_words(self):
+        """ENG-502: "list it under Not done" made a unit-tested rule a built-page check."""
+        rule = "Paying the banner costs 200 credits; list the draft under Not done (unit tests)."
+        self.assertEqual(kind_of(rule), KIND_LOGIC)
+        self.assertEqual(kind_of("The list shows each book (unit test)."), KIND_LOGIC)
+        self.assertEqual(kind_of("The list shows each book."), KIND_UI)
 
     def test_documentation_sample(self):
         self.check_sample("readme-checks")

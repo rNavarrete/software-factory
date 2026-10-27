@@ -1056,6 +1056,9 @@ def _registration(f: _File) -> dict[int, list[str]]:
     return out
 
 
+_TYPE_LEAD = frozenset(":|&<,")
+
+
 def _walk(f: _File, start: int, queries: list[int]):
     """Walk the code from ``start`` and report, at each query position (sorted),
     what encloses it and which return statements before it can end the
@@ -1105,7 +1108,9 @@ def _walk(f: _File, start: int, queries: list[int]):
             i += 2
             continue
         if c in _OPEN:
-            if c == "{" and pending == len(stack):
+            # `function f(): { a: T } {`: a brace right after `:`, `|`, `&`, `<`
+            # or `,` opens an object type in the return type, not the body.
+            if c == "{" and pending == len(stack) and _before(m, i) not in _TYPE_LEAD:
                 stack.append("fn")
                 pending = None
             else:
