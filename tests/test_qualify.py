@@ -109,11 +109,12 @@ class QualifierTest(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertEqual(self.count(ev.FIRE_INTENT), 0)
 
-    def test_fire_needs_a_usage_snapshot_like_any_dispatch(self):
+    def test_fire_stops_at_high_usage_like_any_dispatch(self):
+        self.q.snapshot(10, 80, 0)
         self.q.approve("l1")
         with self.assertRaises(qualify.QualifyRefused) as cm:
             self.q.fire("trig_01X", "l1")
-        self.assertIn("usage-snapshot-missing", str(cm.exception))
+        self.assertIn("usage-high", str(cm.exception))
         self.assertEqual(self.sent, [])
 
     def test_fire_records_intent_before_sending_and_result_after(self):

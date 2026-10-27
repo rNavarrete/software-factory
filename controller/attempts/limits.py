@@ -29,6 +29,8 @@ class Limits:
     docs/limits.md section 3). Each repository is counted on its own."""
     fire_window: timedelta = timedelta(days=7)
     snapshot_max_age: timedelta = timedelta(days=7)
+    """How long a usage reading keeps applying the usage stop. A reading is
+    optional; without a current one nothing is blocked (amendment 2026-10-27)."""
     usage_alert_pct: float = 60
     usage_stop_pct: float = 75
     run_alert_after: timedelta = timedelta(minutes=45)

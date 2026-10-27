@@ -64,14 +64,6 @@
       "repair_allowance": 1,
       "repair_allowance_since": "2026-10-26T06:00:00+00:00",
       "status_issue_id": "ab11b765-6762-4137-b4d4-257086103d88",
-      "issues": [
-        "ENG-496",
-        "ENG-497",
-        "ENG-498",
-        "ENG-499",
-        "ENG-500",
-        "ENG-501"
-      ],
       "skip_labels": [
         "baseline"
       ],

@@ -203,3 +203,26 @@ What does not change: 3 attempts per task, 2 fires per attempt, 6 per task, **on
 
 - Rolando's active time on this amendment: one decision.
 - Version signed: `da884125adff93dce96aee1cf6d7ce257b73621da9c1063bea025c81a041a975` (sha256 of this amendment, from its heading to the line above). Sections 1 to 11 and the sign-off record above are unchanged, so their hash still holds.
+
+## Amendment 2026-10-27: the usage reading becomes optional
+
+- Status: **Proposed**. It takes effect when Rolando says OK on its pull request; until then the version line below is unsigned.
+- Why: dispatch refused whenever the latest hand-typed usage reading (`factory snapshot`) was over 7 days old. The last one is from 2026-10-09, so since 2026-10-16 every new start is refused and neon-war's first ticket sits in Todo. Rolando declined to keep typing readings (2026-10-27: "don't worry about that") and wants the factory as autonomous as it can be. The controller cannot read the factory account's usage page itself: claude.ai documents no usage API for a subscription account, and section 7 rules out guessing a number.
+
+What changes in sections 3, 4 and 7:
+
+| Limit | Before | Now | Class |
+|---|---|---|---|
+| Usage reading | One at most 7 days old is **required** for any dispatch or Codex review | **Optional**. With none, or only one older than 7 days, usage blocks nothing | Code |
+| 75% plan-usage stop | Applies to the latest reading | Unchanged for a reading at most 7 days old. An older reading describes a usage week that has already reset, so it counts for nothing | Code on the recorded snapshot |
+
+What still guards usage without a reading:
+
+1. **Usage credits stay off** (section 6, G-C11). An account that runs out is refused, never billed, so the money budget still fails closed.
+2. **The subscription-exhausted hold** (section 5). A launch or review refused with usage-limit text sets the hold and one escalation, and nothing starts until `factory resume`. This was already the only real signal; the reading was a forecast.
+3. **The caps.** One active attempt at a time across the factory, 12 starts per rolling week for the pilot and 24 for neon-war, 3 attempts and 6 fires per task. None of these change.
+
+The cost of the change: without a reading, the factory finds out it has run out by being refused, instead of stopping at 75% first. A refused launch starts no worker and is recorded as `not-launched`, so the worst case is one wasted fire and a hold until the window resets. `factory snapshot` still works, and a current reading at 75% or more still stops work.
+
+- Rolando's active time on this amendment: one OK on the pull request.
+- Version to sign: `8b5893fa4ffd7827d0adfd16c44f9f67bdc1628348cdc28f5d214efb92133de7` (sha256 of this amendment, from its heading to the line above). Sections 1 to 11, the sign-off record and the 2026-10-26 amendment are unchanged, so their hashes still hold.

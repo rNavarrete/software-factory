@@ -438,16 +438,16 @@ def check_dispatch(
 def _check_snapshot(
     view: LedgerView, now: datetime, limits: Limits, blocks: list[Notice], alerts: list[Notice]
 ) -> None:
+    """The 75% stop on a usage reading, when there is a current one.
+
+    A reading is optional (docs/limits.md, amendment 2026-10-27). One older than
+    ``snapshot_max_age`` describes a usage week that has since reset, so it counts
+    for nothing, and so does having none. Running out is still caught without one:
+    a launch refused for a usage limit sets the subscription-exhausted hold.
+    """
     snap = view.snapshot
-    if snap is None:
-        blocks.append(Notice("usage-snapshot-missing", "Record a usage snapshot first."))
+    if snap is None or now - snap.taken_at > limits.snapshot_max_age:
         return
-    if now - snap.taken_at > limits.snapshot_max_age:
-        blocks.append(
-            Notice(
-                "usage-snapshot-stale", f"Latest usage snapshot is from {snap.taken_at:%Y-%m-%d}."
-            )
-        )
     if snap.weekly_pct >= limits.usage_stop_pct:
         blocks.append(Notice("usage-high", f"Weekly usage is at {snap.weekly_pct:g}%."))
     elif snap.weekly_pct >= limits.usage_alert_pct:
@@ -602,8 +602,7 @@ NEXT_DECISION = {
         " (an exception under ADR 0001 section 4)."
     ),
     ev.SUBSCRIPTION_EXHAUSTED: (
-        "Check the usage page; once the window resets, record a fresh snapshot and run"
-        " `factory resume` with a note."
+        "Check the usage page; once the window resets, run `factory resume` with a note."
     ),
 }
 

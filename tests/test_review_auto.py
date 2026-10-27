@@ -723,12 +723,13 @@ class BudgetTests(Base):
         self.assertIs(r.check(ATTEMPT).state, ReviewState.BLOCKED)
         self.assertEqual(self.runtime.texts, [])
 
-    def test_a_stale_usage_reading_stops_review_jobs(self):
-        self.later(days=8)
+    def test_a_stale_high_usage_reading_no_longer_stops_review_jobs(self):
+        self.add(snapshot(T0, weekly=80))
+        self.later(days=7, seconds=1)
         r = self.reviewer()
         r.start(PR, "req-1")
-        self.assertIs(r.check(ATTEMPT).state, ReviewState.BLOCKED)
-        self.assertEqual(self.runtime.texts, [])
+        self.assertIsNot(r.check(ATTEMPT).state, ReviewState.BLOCKED)
+        self.assertEqual(len(self.runtime.texts), 1)
 
     def test_review_launches_count_in_the_weekly_fire_allowance(self):
         self.assertEqual(policy.REVIEW_JOB_INTENT, rev.REVIEW_JOB_INTENT)

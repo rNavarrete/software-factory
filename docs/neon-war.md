@@ -8,7 +8,7 @@ The factory works on two repositories: the pilot (`rNavarrete/factory-pilot-demo
 |---|---|---|
 | Worker routine | `factory-worker` (`trig_01CHWbQ267i1CMLGUym1kGd9`) | The same routine, with neon-war added to its repositories (Rolando's choice, 2026-10-26) |
 | Start key secret | `routine-token` | the same `routine-token` |
-| Linear project | Factory Pilot Demo | Neon War (Milestone 1 tickets ENG-496 to ENG-501, status ticket ENG-495) |
+| Linear project | Factory Pilot Demo (only its listed tickets) | Neon War: any ticket Rolando moves to Todo, except the status ticket ENG-495 and anything labelled `baseline` |
 | Starts per rolling 7 days (reviews included) | 12, alert at 9 | 24, alert at 18 ([limits.md amendment](limits.md#amendment-2026-10-26-a-weekly-cap-per-repository)) |
 | Workers running at once | one, shared | one, shared |
 | Plan-usage stop (75% weekly), hold, rate-limit wait | shared | shared |
@@ -30,6 +30,8 @@ The onboarding and drafting entries are already in `deploy/pilot/`. What is left
 
 ### Onboarding entry (as shipped)
 
+The entry has no `issues` list (removed 2026-10-27, so new game tickets need no factory change): Rolando's move to Todo is what approves a ticket, as for every project.
+
 ```json
 {
   "linear_project_id": "08057006-6d52-4743-a43c-dfc2370c7a12",
@@ -42,7 +44,6 @@ The onboarding and drafting entries are already in `deploy/pilot/`. What is left
   "repair_allowance": 1,
   "repair_allowance_since": "2026-10-26T06:00:00+00:00",
   "status_issue_id": "ab11b765-6762-4137-b4d4-257086103d88",
-  "issues": ["ENG-496", "ENG-497", "ENG-498", "ENG-499", "ENG-500", "ENG-501"],
   "skip_labels": ["baseline"],
   "protected_paths": [
     ".github/", ".claude/", "CLAUDE.md", "scripts/", "public/art/",
