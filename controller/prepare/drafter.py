@@ -39,6 +39,9 @@ _UI_RE = re.compile(
     re.I,
 )
 
+_UNIT_TESTS_RE = re.compile(r"\(unit tests?\)", re.I)
+"""The ticket says outright that unit tests prove it, as "(unit tests)"."""
+
 KIND_LOGIC, KIND_UI, KIND_DOCS = "logic", "ui", "docs"
 
 
@@ -61,7 +64,7 @@ class Drafter(Protocol):
 
 
 def kind_of(statement: str) -> str:
-    if _FUNCTION_RE.search(statement):
+    if _UNIT_TESTS_RE.search(statement) or _FUNCTION_RE.search(statement):
         return KIND_LOGIC
     if _DOCS_RE.search(statement):
         return KIND_DOCS
@@ -85,7 +88,7 @@ def evidence_for(kind: str, statement: str, policy: ProjectPolicy) -> dict[str, 
 
 
 class RuleDrafter:
-    name = "rules/v1"
+    name = "rules/v2"
 
     def draft(
         self, reading: Reading, policy: ProjectPolicy, project: Mapping[str, object]

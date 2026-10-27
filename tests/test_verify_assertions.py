@@ -788,6 +788,31 @@ class TestThatMayNotRunTest(unittest.TestCase):
         body = "    return;\n" + self.BODY
         self.assert_unknown(probe_test(body), why="returns before the assertion")
 
+    def test_a_helper_with_an_object_return_type_is_not_an_early_exit(self):
+        """ENG-502: `function f(): { a: T } {` opened its return type as the
+        body, so the helper's own `return` read as an exit before every test."""
+        for returns in ("{ book: Book; n: number }", "Book | { book: Book }", "Array<{ n: 1 }>"):
+            with self.subTest(returns=returns):
+                helper = (
+                    f"\nfunction pick(): {returns} {{\n"
+                    "  const n = 1;\n"
+                    "  return { book: { id: '1' } as Book, n } as never;\n"
+                    "}\n"
+                )
+                report = run(
+                    probe_file(probe_test(self.BODY), base=HEAD_TEST + helper),
+                    links=[link("ac1", test=PROBE, assertion=self.QUOTE), link("ac2")],
+                    proofs=[proof("ac1", test=PROBE), proof("ac2")],
+                )
+                self.assertEqual(cov(report).status, Coverage.COVERED, cov(report).reasons)
+        top_level = probe_file(probe_test(self.BODY), base=HEAD_TEST + "\nreturn;\n")
+        report = run(
+            top_level,
+            links=[link("ac1", test=PROBE, assertion=self.QUOTE), link("ac2")],
+            proofs=[proof("ac1", test=PROBE), proof("ac2")],
+        )
+        self.assertEqual(cov(report).status, Coverage.UNKNOWN)
+
     def test_conditional_return_before_the_assertion_is_flagged(self):
         for early in (
             "    if (shelf.length > 0) return;",
